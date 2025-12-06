@@ -81,3 +81,44 @@ class ErrorResponse(BaseModel):
     error: str = Field(..., description="Error message")
     error_type: str = Field("general", description="Error type")
     request_id: str | None = Field(None, description="Request identifier if available")
+
+
+# =============================================================================
+# ELICITATION MODELS
+# =============================================================================
+
+
+class ElicitationResponseRequest(BaseModel):
+    """Request body for submitting user response to elicitation."""
+
+    elicitation_id: str = Field(..., description="ID of the elicitation request")
+    value: Any = Field(..., description="User's response value")
+    cancelled: bool = Field(False, description="Whether user cancelled the request")
+
+
+class ElicitationResponseResult(BaseModel):
+    """Response for elicitation submission."""
+
+    success: bool = Field(..., description="Whether response was accepted")
+    elicitation_id: str = Field(..., description="ID of the elicitation request")
+    message: str = Field("", description="Additional information")
+
+
+class PendingElicitationResponse(BaseModel):
+    """Information about a pending elicitation."""
+
+    elicitation_id: str = Field(..., description="Unique elicitation identifier")
+    server_id: str = Field(..., description="MCP server ID")
+    tool_name: str = Field(..., description="Tool requesting input")
+    prompt: str = Field(..., description="Question for the user")
+    input_type: str = Field("text", description="Expected input type")
+    options: list[str] | None = Field(None, description="Options for choice input")
+    default: str | None = Field(None, description="Default value")
+    timeout_seconds: float = Field(60.0, description="Timeout for response")
+
+
+class PendingElicitationsResponse(BaseModel):
+    """Response listing all pending elicitations."""
+
+    elicitations: list[PendingElicitationResponse] = Field(default_factory=list)
+    count: int = Field(0, description="Number of pending elicitations")

@@ -5,6 +5,7 @@ from typing import Annotated
 from fastapi import Depends, Request
 
 from agentic_chatbot.config.settings import Settings, get_settings
+from agentic_chatbot.mcp.callbacks import ElicitationManager
 from agentic_chatbot.mcp.manager import MCPClientManager
 from agentic_chatbot.mcp.registry import MCPServerRegistry
 from agentic_chatbot.mcp.session import MCPSessionManager
@@ -35,8 +36,21 @@ async def get_mcp_session_manager(
     return None
 
 
+async def get_elicitation_manager(request: Request) -> ElicitationManager:
+    """
+    Get or create ElicitationManager from application state.
+
+    The ElicitationManager is shared across requests to allow
+    responses to be matched with pending elicitation requests.
+    """
+    if not hasattr(request.app.state, "elicitation_manager"):
+        request.app.state.elicitation_manager = ElicitationManager()
+    return request.app.state.elicitation_manager
+
+
 # Type aliases for dependency injection
 SettingsDep = Annotated[Settings, Depends(get_app_settings)]
 MCPRegistryDep = Annotated[MCPServerRegistry | None, Depends(get_mcp_registry)]
 MCPClientManagerDep = Annotated[MCPClientManager | None, Depends(get_mcp_client_manager)]
 MCPSessionManagerDep = Annotated[MCPSessionManager | None, Depends(get_mcp_session_manager)]
+ElicitationManagerDep = Annotated[ElicitationManager, Depends(get_elicitation_manager)]

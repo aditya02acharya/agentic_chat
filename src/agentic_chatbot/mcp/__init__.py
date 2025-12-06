@@ -19,6 +19,16 @@ from agentic_chatbot.mcp.callbacks import (
     MCPElicitationCallback,
     MCPContentCallback,
     MCPErrorCallback,
+    # Concrete implementations
+    MCPProgressHandler,
+    MCPContentHandler,
+    MCPErrorHandler,
+    MCPElicitationHandler,
+    # Elicitation management
+    ElicitationManager,
+    PendingElicitation,
+    # Factory
+    create_mcp_callbacks,
 )
 from agentic_chatbot.mcp.client import MCPClient
 from agentic_chatbot.mcp.manager import MCPClientManager
@@ -38,12 +48,21 @@ __all__ = [
     "ToolCall",
     "ElicitationRequest",
     "ElicitationResponse",
-    # Callbacks
+    # Callback Protocols
     "MCPCallbacks",
     "MCPProgressCallback",
     "MCPElicitationCallback",
     "MCPContentCallback",
     "MCPErrorCallback",
+    # Callback Implementations
+    "MCPProgressHandler",
+    "MCPContentHandler",
+    "MCPErrorHandler",
+    "MCPElicitationHandler",
+    # Elicitation Management
+    "ElicitationManager",
+    "PendingElicitation",
+    "create_mcp_callbacks",
     # Client
     "MCPClient",
     # Manager

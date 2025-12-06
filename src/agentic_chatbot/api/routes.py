@@ -14,14 +14,21 @@ from agentic_chatbot.api.models import (
     ToolsResponse,
     ToolSummaryResponse,
     ErrorResponse,
+    ElicitationResponseRequest,
+    ElicitationResponseResult,
+    PendingElicitationResponse,
+    PendingElicitationsResponse,
 )
 from agentic_chatbot.api.dependencies import (
     MCPRegistryDep,
     MCPSessionManagerDep,
+    ElicitationManagerDep,
 )
 from agentic_chatbot.api.sse import event_generator_with_task
+from agentic_chatbot.events.emitter import EventEmitter
 from agentic_chatbot.events.models import Event, ErrorEvent, ResponseDoneEvent
 from agentic_chatbot.flows.main_flow import create_main_chat_flow
+from agentic_chatbot.mcp.callbacks import create_mcp_callbacks
 from agentic_chatbot.operators.registry import OperatorRegistry
 from agentic_chatbot.utils.logging import get_logger
 
@@ -91,12 +98,28 @@ async def chat(
     chat_request: ChatRequest,
     mcp_registry: MCPRegistryDep,
     mcp_session_manager: MCPSessionManagerDep,
+    elicitation_manager: ElicitationManagerDep,
 ) -> StreamingResponse:
     """
     Main chat endpoint with SSE streaming.
 
     Returns Server-Sent Events stream with progress updates
     and response chunks.
+
+    Events include:
+    - supervisor.thinking: Agent is analyzing the query
+    - supervisor.decided: Agent made a decision
+    - tool.start/progress/complete/error: Tool execution status
+    - mcp.progress/content/elicitation/error: MCP-specific events
+    - workflow.*: Workflow execution events
+    - response.chunk/done: Response streaming
+    - clarify.request: Clarification needed from user
+    - error: General errors
+
+    For elicitation events (mcp.elicitation), the UI should:
+    1. Display the prompt to the user
+    2. Collect user input
+    3. Submit response via POST /elicitation/respond
     """
     # Check if shutdown is in progress
     if getattr(request.app.state, "is_shutting_down", False):
@@ -106,15 +129,28 @@ async def chat(
     event_queue: asyncio.Queue[Event] = asyncio.Queue()
     request_id = f"{chat_request.conversation_id}_{asyncio.get_event_loop().time()}"
 
+    # Create event emitter for this request
+    emitter = EventEmitter(event_queue)
+
+    # Create MCP callbacks wired to the event emitter
+    mcp_callbacks = create_mcp_callbacks(
+        emitter=emitter,
+        elicitation_manager=elicitation_manager,
+        request_id=request_id,
+    )
+
     # Build shared store
     shared: dict[str, Any] = {
         "user_query": chat_request.message,
         "conversation_id": chat_request.conversation_id,
         "request_id": request_id,
         "event_queue": event_queue,
+        "event_emitter": emitter,
         "mcp": {
             "server_registry": mcp_registry,
             "session_manager": mcp_session_manager,
+            "callbacks": mcp_callbacks,
+            "elicitation_manager": elicitation_manager,
         },
     }
 
@@ -172,12 +208,16 @@ async def chat_sync(
     chat_request: ChatRequest,
     mcp_registry: MCPRegistryDep,
     mcp_session_manager: MCPSessionManagerDep,
+    elicitation_manager: ElicitationManagerDep,
 ) -> ChatResponse:
     """
     Non-streaming chat endpoint.
 
     Alternative to SSE streaming for simpler integrations.
     Waits for complete response before returning.
+
+    Note: Elicitation requests cannot be handled in sync mode
+    as they require interactive user input.
     """
     # Check if shutdown is in progress
     if getattr(request.app.state, "is_shutting_down", False):
@@ -185,15 +225,29 @@ async def chat_sync(
 
     request_id = f"{chat_request.conversation_id}_{asyncio.get_event_loop().time()}"
 
+    # Create event emitter (events go to queue but aren't streamed)
+    event_queue: asyncio.Queue[Event] = asyncio.Queue()
+    emitter = EventEmitter(event_queue)
+
+    # Create MCP callbacks
+    mcp_callbacks = create_mcp_callbacks(
+        emitter=emitter,
+        elicitation_manager=elicitation_manager,
+        request_id=request_id,
+    )
+
     # Build shared store
     shared: dict[str, Any] = {
         "user_query": chat_request.message,
         "conversation_id": chat_request.conversation_id,
         "request_id": request_id,
-        "event_queue": asyncio.Queue(),
+        "event_queue": event_queue,
+        "event_emitter": emitter,
         "mcp": {
             "server_registry": mcp_registry,
             "session_manager": mcp_session_manager,
+            "callbacks": mcp_callbacks,
+            "elicitation_manager": elicitation_manager,
         },
     }
 
@@ -214,3 +268,109 @@ async def chat_sync(
     except Exception as e:
         logger.error(f"Chat error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# =============================================================================
+# ELICITATION ENDPOINTS
+# =============================================================================
+
+
+@router.post("/elicitation/respond", response_model=ElicitationResponseResult)
+async def submit_elicitation_response(
+    elicitation_request: ElicitationResponseRequest,
+    elicitation_manager: ElicitationManagerDep,
+) -> ElicitationResponseResult:
+    """
+    Submit user response to a pending elicitation request.
+
+    When an MCP tool needs user input, it emits an mcp.elicitation event
+    with an elicitation_id. The UI should:
+    1. Display the prompt to the user
+    2. Collect the user's input
+    3. Call this endpoint with the elicitation_id and value
+
+    This unblocks the waiting tool and allows it to continue execution.
+
+    Args:
+        elicitation_id: ID from the mcp.elicitation event
+        value: User's response (string, choice value, or boolean for confirm)
+        cancelled: Set to true if user cancelled/dismissed the prompt
+    """
+    success = await elicitation_manager.submit_response(
+        elicitation_id=elicitation_request.elicitation_id,
+        value=elicitation_request.value,
+        cancelled=elicitation_request.cancelled,
+    )
+
+    if success:
+        return ElicitationResponseResult(
+            success=True,
+            elicitation_id=elicitation_request.elicitation_id,
+            message="Response accepted",
+        )
+    else:
+        return ElicitationResponseResult(
+            success=False,
+            elicitation_id=elicitation_request.elicitation_id,
+            message="Elicitation not found or already responded",
+        )
+
+
+@router.get("/elicitation/pending", response_model=PendingElicitationsResponse)
+async def list_pending_elicitations(
+    elicitation_manager: ElicitationManagerDep,
+) -> PendingElicitationsResponse:
+    """
+    List all pending elicitation requests.
+
+    Useful for:
+    - Debugging to see what's waiting for user input
+    - Reconnecting after page refresh to see pending prompts
+    - Admin dashboards monitoring tool activity
+    """
+    pending = elicitation_manager.get_all_pending()
+    elicitations = [
+        PendingElicitationResponse(
+            elicitation_id=p.elicitation_id,
+            server_id=p.server_id,
+            tool_name=p.tool_name,
+            prompt=p.request.prompt,
+            input_type=p.request.input_type,
+            options=p.request.options,
+            default=p.request.default,
+            timeout_seconds=p.request.timeout_seconds,
+        )
+        for p in pending
+    ]
+    return PendingElicitationsResponse(
+        elicitations=elicitations,
+        count=len(elicitations),
+    )
+
+
+@router.delete("/elicitation/{elicitation_id}")
+async def cancel_elicitation(
+    elicitation_id: str,
+    elicitation_manager: ElicitationManagerDep,
+) -> ElicitationResponseResult:
+    """
+    Cancel a pending elicitation request.
+
+    The tool will receive a cancelled response and should
+    handle it gracefully (e.g., use a default value or skip
+    the operation).
+    """
+    success = await elicitation_manager.cancel_elicitation(elicitation_id)
+
+    if success:
+        return ElicitationResponseResult(
+            success=True,
+            elicitation_id=elicitation_id,
+            message="Elicitation cancelled",
+        )
+    else:
+        return ElicitationResponseResult(
+            success=False,
+            elicitation_id=elicitation_id,
+            message="Elicitation not found or already responded",
+        )

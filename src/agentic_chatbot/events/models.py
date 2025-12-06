@@ -231,6 +231,119 @@ class ClarifyRequestEvent(Event):
         return cls(data={"question": question}, request_id=request_id)
 
 
+# =============================================================================
+# MCP EVENTS
+# =============================================================================
+
+
+class MCPProgressEvent(Event):
+    """MCP tool reports progress."""
+
+    event_type: EventType = EventType.MCP_PROGRESS
+
+    @classmethod
+    def create(
+        cls,
+        server_id: str,
+        tool_name: str,
+        progress: float,
+        message: str = "",
+        request_id: str | None = None,
+    ) -> "MCPProgressEvent":
+        return cls(
+            data={
+                "server_id": server_id,
+                "tool": tool_name,
+                "progress": progress,
+                "message": message,
+            },
+            request_id=request_id,
+        )
+
+
+class MCPContentEvent(Event):
+    """MCP tool streams content."""
+
+    event_type: EventType = EventType.MCP_CONTENT
+
+    @classmethod
+    def create(
+        cls,
+        server_id: str,
+        tool_name: str,
+        content: Any,
+        content_type: str,
+        request_id: str | None = None,
+    ) -> "MCPContentEvent":
+        return cls(
+            data={
+                "server_id": server_id,
+                "tool": tool_name,
+                "content": content,
+                "content_type": content_type,
+            },
+            request_id=request_id,
+        )
+
+
+class MCPElicitationRequestEvent(Event):
+    """MCP tool requests user input."""
+
+    event_type: EventType = EventType.MCP_ELICITATION
+
+    @classmethod
+    def create(
+        cls,
+        server_id: str,
+        tool_name: str,
+        elicitation_id: str,
+        prompt: str,
+        input_type: str = "text",
+        options: list[str] | None = None,
+        default: str | None = None,
+        timeout_seconds: float = 60.0,
+        request_id: str | None = None,
+    ) -> "MCPElicitationRequestEvent":
+        return cls(
+            data={
+                "server_id": server_id,
+                "tool": tool_name,
+                "elicitation_id": elicitation_id,
+                "prompt": prompt,
+                "input_type": input_type,
+                "options": options,
+                "default": default,
+                "timeout_seconds": timeout_seconds,
+            },
+            request_id=request_id,
+        )
+
+
+class MCPErrorEvent(Event):
+    """MCP tool encountered an error."""
+
+    event_type: EventType = EventType.MCP_ERROR
+
+    @classmethod
+    def create(
+        cls,
+        server_id: str,
+        tool_name: str,
+        error: str,
+        error_type: str = "execution",
+        request_id: str | None = None,
+    ) -> "MCPErrorEvent":
+        return cls(
+            data={
+                "server_id": server_id,
+                "tool": tool_name,
+                "error": error,
+                "error_type": error_type,
+            },
+            request_id=request_id,
+        )
+
+
 class ErrorEvent(Event):
     """General error event."""
 
