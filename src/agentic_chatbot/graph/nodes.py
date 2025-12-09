@@ -47,12 +47,17 @@ from agentic_chatbot.graph.state import (
     ReflectionResult,
     ActionRecord,
     get_emitter,
+    generate_source_id,
+    get_summaries_text,
+    get_data_chunks,
 )
 from agentic_chatbot.operators.registry import OperatorRegistry
 from agentic_chatbot.operators.context import OperatorContext
 from agentic_chatbot.utils.structured_llm import StructuredLLMCaller, StructuredOutputError
 from agentic_chatbot.utils.llm import LLMClient
 from agentic_chatbot.utils.logging import get_logger
+from agentic_chatbot.context.models import DataChunk, DataSummary, TaskContext
+from agentic_chatbot.context.summarizer import summarize_tool_output
 from agentic_chatbot.core.workflow import (
     WorkflowDefinition,
     WorkflowDefinitionSchema,
@@ -155,9 +160,15 @@ async def supervisor_node(state: ChatState) -> dict[str, Any]:
     """
     Central decision-making agent using ReACT pattern.
 
-    Analyzes the query and decides:
-    - ANSWER: Direct response
-    - CALL_TOOL: Use a single tool
+    CONTEXT OPTIMIZATION:
+    - Uses SUMMARIES of tool outputs, not raw data (saves context)
+    - Conversation history for continuity
+    - Action history for tracking attempts
+    - Delegates tasks with TaskContext (reformulated task, goal, scope)
+
+    Decides:
+    - ANSWER: Direct response (has enough info)
+    - CALL_TOOL: Use a single tool (provides task_description for operator)
     - CREATE_WORKFLOW: Multi-step execution
     - CLARIFY: Ask for clarification
     """
@@ -184,10 +195,13 @@ async def supervisor_node(state: ChatState) -> dict[str, Any]:
             "iteration": iteration + 1,
         }
 
-    # Build context
+    # Build OPTIMIZED context - summaries only, not raw data
     tool_summaries = get_tool_summaries(state)
     conversation_context = format_conversation_context(state)
-    tool_results = format_tool_results(state)
+
+    # Use data summaries instead of raw tool_results for decision making
+    # This keeps supervisor context lean while having all decision-relevant info
+    data_summaries_text = get_summaries_text(state)
 
     # Format action history
     action_history = state.get("action_history", [])
@@ -196,12 +210,12 @@ async def supervisor_node(state: ChatState) -> dict[str, Any]:
         or "None"
     )
 
-    # Build prompts
+    # Build prompts with summaries
     system = SUPERVISOR_SYSTEM_PROMPT.format(tool_summaries=tool_summaries)
     prompt = SUPERVISOR_DECISION_PROMPT.format(
         query=state.get("user_query", ""),
         conversation_context=conversation_context,
-        tool_results=tool_results,
+        tool_results=data_summaries_text,  # Summaries, not raw data
         actions_this_turn=actions_text,
     )
 
@@ -240,6 +254,9 @@ async def supervisor_node(state: ChatState) -> dict[str, Any]:
             iteration=iteration,
         )
 
+        # Create task context for operators (focused, not full conversation)
+        task_context = decision.to_task_context(state.get("user_query", ""))
+
         return {
             "current_decision": decision,
             "current_tool": decision.operator,
@@ -247,6 +264,7 @@ async def supervisor_node(state: ChatState) -> dict[str, Any]:
             "workflow_goal": decision.goal,
             "iteration": iteration + 1,
             "action_history": [action_record],
+            "current_task_context": task_context,  # For operators
         }
 
     except StructuredOutputError as e:
@@ -268,9 +286,18 @@ async def supervisor_node(state: ChatState) -> dict[str, Any]:
 
 async def execute_tool_node(state: ChatState) -> dict[str, Any]:
     """
-    Execute a single tool/operator.
+    Execute a single tool/operator with context optimization.
 
-    Uses the operator registry to find and execute the appropriate operator.
+    CONTEXT OPTIMIZATION:
+    - Receives TaskContext from supervisor (focused task, not full conversation)
+    - Creates DataChunk with source tracking (for citations)
+    - Generates inline summary (using haiku for speed)
+    - Returns both raw data (for synthesizer) and summary (for supervisor)
+
+    Flow:
+    1. Execute tool with TaskContext
+    2. Store raw output as DataChunk (for synthesizer/writer citations)
+    3. Generate inline summary (for supervisor decisions)
     """
     decision = state.get("current_decision")
     if not decision or not decision.operator:
@@ -286,6 +313,7 @@ async def execute_tool_node(state: ChatState) -> dict[str, Any]:
 
     tool_name = decision.operator
     params = decision.params or {}
+    task_context = state.get("current_task_context")
 
     await emit_event(
         state,
@@ -304,12 +332,18 @@ async def execute_tool_node(state: ChatState) -> dict[str, Any]:
 
         operator = operator_cls()
 
-        # Create operator context
+        # Create operator context with TaskContext (focused, not full conversation)
+        # The operator receives the reformulated task, not the original query
         context = OperatorContext(
-            user_query=state.get("user_query", ""),
+            user_query=task_context.task_description if task_context else state.get("user_query", ""),
             params=params,
             conversation_id=state.get("conversation_id", ""),
             request_id=state.get("request_id", ""),
+            # Pass task context for operators that can use it
+            extra_context={
+                "task_goal": task_context.goal if task_context else "",
+                "task_scope": task_context.scope if task_context else "",
+            },
         )
 
         # Execute operator
@@ -324,6 +358,34 @@ async def execute_tool_node(state: ChatState) -> dict[str, Any]:
             ),
         )
 
+        # === CONTEXT OPTIMIZATION: Create DataChunk and Summary ===
+
+        # Generate unique source ID for citations
+        source_id, updated_counter = generate_source_id(state, tool_name)
+
+        # Create DataChunk with raw content (for synthesizer/writer)
+        data_chunk = DataChunk(
+            source_id=source_id,
+            source_type=tool_name,
+            content=result.content if result.success else f"Error: {result.error}",
+            query_used=task_context.task_description if task_context else state.get("user_query", ""),
+            metadata=result.metadata,
+        )
+
+        # Generate inline summary (for supervisor) - uses haiku for speed
+        task_desc = task_context.task_description if task_context else state.get("user_query", "")
+        data_summary = await summarize_tool_output(
+            chunk=data_chunk,
+            task_description=task_desc,
+        )
+
+        logger.info(
+            "Tool executed with context optimization",
+            tool=tool_name,
+            source_id=source_id,
+            has_summary=bool(data_summary.key_findings),
+        )
+
         return {
             "tool_results": [
                 ToolResult(
@@ -335,6 +397,10 @@ async def execute_tool_node(state: ChatState) -> dict[str, Any]:
                 )
             ],
             "current_tool": None,
+            # Context optimization outputs
+            "data_chunks": [data_chunk],
+            "data_summaries": [data_summary],
+            "source_counter": updated_counter,
         }
 
     except Exception as e:
@@ -349,6 +415,19 @@ async def execute_tool_node(state: ChatState) -> dict[str, Any]:
             ),
         )
 
+        # Generate source ID even for errors (for tracking)
+        source_id, updated_counter = generate_source_id(state, tool_name)
+
+        # Create error summary for supervisor
+        error_summary = DataSummary(
+            source_id=source_id,
+            source_type=tool_name,
+            key_findings=[],
+            executive_summary=f"Tool execution failed",
+            has_results=False,
+            error=str(e),
+        )
+
         return {
             "tool_results": [
                 ToolResult(
@@ -358,6 +437,8 @@ async def execute_tool_node(state: ChatState) -> dict[str, Any]:
                 )
             ],
             "current_tool": None,
+            "data_summaries": [error_summary],
+            "source_counter": updated_counter,
         }
 
 
@@ -584,23 +665,27 @@ async def execute_workflow_node(state: ChatState) -> dict[str, Any]:
 
 async def reflect_node(state: ChatState) -> dict[str, Any]:
     """
-    Analyze tool results and decide next action.
+    Analyze results and decide next action.
+
+    CONTEXT OPTIMIZATION:
+    - Uses SUMMARIES for reflection (not raw data)
+    - Fast assessment using haiku
+    - Summaries contain key findings relevant to the task
 
     Returns assessment:
     - satisfied: Have enough info to answer
     - need_more: Need additional tools/info
     - blocked: Cannot proceed
     """
-    tool_results = state.get("tool_results", [])
     user_query = state.get("user_query", "")
 
-    # Format results for reflection
-    results_text = format_tool_results(state)
+    # Use summaries for reflection (context optimization)
+    summaries_text = get_summaries_text(state)
 
     system = REFLECT_SYSTEM_PROMPT
     prompt = REFLECT_PROMPT.format(
         query=user_query,
-        tool_results=results_text,
+        tool_results=summaries_text,  # Summaries, not raw data
         iteration=state.get("iteration", 0),
         max_iterations=state.get("max_iterations", 5),
     )
@@ -636,23 +721,47 @@ async def reflect_node(state: ChatState) -> dict[str, Any]:
 
 async def synthesize_node(state: ChatState) -> dict[str, Any]:
     """
-    Synthesize tool results into a coherent response.
+    Synthesize data into a coherent response with citation support.
 
-    Combines multiple tool outputs into a unified answer.
+    CONTEXT OPTIMIZATION:
+    - Uses RAW DataChunks (verbatim data for accuracy)
+    - Formats with source IDs for citation tracking
+    - Produces content that writer can cite using [^source_id] markers
+
+    The synthesizer receives full data context, not summaries,
+    to ensure accurate information in the final response.
     """
-    tool_results = state.get("tool_results", [])
     user_query = state.get("user_query", "")
 
-    # Format results
-    results_text = "\n\n".join(
-        f"**{r.tool_name}**:\n{r.content}"
-        for r in tool_results
-        if r.success
-    )
+    # Get raw data chunks (full context, not summaries)
+    data_chunks = get_data_chunks(state)
+
+    if not data_chunks:
+        # Fallback to tool_results if no data chunks
+        tool_results = state.get("tool_results", [])
+        results_text = "\n\n".join(
+            f"**{r.tool_name}**:\n{r.content}"
+            for r in tool_results
+            if r.success
+        )
+    else:
+        # Format data chunks with source IDs for citation tracking
+        results_text = "\n\n".join(
+            f"[Source: {chunk.source_id}] ({chunk.source_type}):\n{chunk.content}"
+            for chunk in data_chunks
+            if chunk.content and not chunk.content.startswith("Error:")
+        )
+
+    # Build citation reference block for the writer
+    citation_block = ""
+    if data_chunks:
+        citation_block = "\n\n---\nAvailable Sources for Citations:\n"
+        for chunk in data_chunks:
+            citation_block += f"- [^{chunk.source_id}]: {chunk.source_type}\n"
 
     prompt = SYNTHESIZER_PROMPT.format(
         query=user_query,
-        tool_results=results_text,
+        tool_results=results_text + citation_block,
     )
 
     client = LLMClient()
@@ -668,12 +777,20 @@ async def synthesize_node(state: ChatState) -> dict[str, Any]:
 
 async def write_node(state: ChatState) -> dict[str, Any]:
     """
-    Format the final response for the user.
+    Format the final response with GitHub footnote citations.
 
-    Handles both direct answers and synthesized responses.
+    CONTEXT OPTIMIZATION:
+    - Uses synthesized content OR raw DataChunks
+    - Adds GitHub-style footnotes [^source_id] for citations
+    - Appends citation references at the end
+
+    Citation Format (GitHub Footnotes):
+    - In text: "The data shows X[^web_search_1]"
+    - At end: "[^web_search_1]: Source: web_search"
     """
     decision = state.get("current_decision")
     existing_response = state.get("final_response", "")
+    data_chunks = get_data_chunks(state)
 
     # If we already have a synthesized response, use it
     if existing_response:
@@ -681,13 +798,39 @@ async def write_node(state: ChatState) -> dict[str, Any]:
     elif decision and decision.action == "ANSWER" and decision.response:
         final = decision.response
     else:
-        # Generate response based on context
+        # Generate response with citation context
+        # Use raw data chunks for the writer
+        if data_chunks:
+            context_parts = []
+            for chunk in data_chunks:
+                if chunk.content and not chunk.content.startswith("Error:"):
+                    context_parts.append(
+                        f"[^{chunk.source_id}] ({chunk.source_type}):\n{chunk.content}"
+                    )
+            context = "\n\n".join(context_parts)
+        else:
+            context = format_tool_results(state)
+
         prompt = WRITER_PROMPT.format(
             query=state.get("user_query", ""),
-            context=format_tool_results(state),
+            context=context,
         )
         client = LLMClient()
         final = await client.generate(prompt, model="sonnet")
+
+    # Add footnote references if we have data chunks and citations were used
+    if data_chunks and "[^" in final:
+        footnotes = "\n\n---\n"
+        for chunk in data_chunks:
+            # Only add footnotes for sources that are actually cited
+            if f"[^{chunk.source_id}]" in final:
+                footnotes += f"\n[^{chunk.source_id}]: {chunk.source_type}"
+                if chunk.query_used:
+                    footnotes += f" (query: \"{chunk.query_used[:50]}...\")"
+
+        # Only append if we have any footnotes
+        if footnotes != "\n\n---\n":
+            final = final + footnotes
 
     # Add assistant message to conversation
     assistant_message = AIMessage(content=final)

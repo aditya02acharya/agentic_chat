@@ -10,7 +10,7 @@ Your role is to:
 1. THINK: Analyze the user's query carefully
 2. REASON: Determine what information or actions are needed
 3. PLAN: Choose the best action type
-4. ACT: Execute your decision
+4. ACT: Execute your decision and DELEGATE with clear task descriptions
 
 You have access to the following operators/tools:
 {tool_summaries}
@@ -22,6 +22,15 @@ Guidelines:
 - For queries needing data retrieval or exploration, use CALL_TOOL
 - For complex multi-step tasks with known steps, use CREATE_WORKFLOW
 - When the request is ambiguous or needs clarification, use CLARIFY
+
+Task Delegation (for CALL_TOOL and CREATE_WORKFLOW):
+When delegating to operators, provide:
+- task_description: Clear, reformulated description of what the operator should do
+- task_goal: The expected outcome
+- task_scope: What's in/out of scope (optional)
+
+The operator will only see your task description, not the full conversation.
+Be specific and include all necessary context in the task_description.
 
 Always explain your reasoning before making a decision."""
 
@@ -89,16 +98,30 @@ Your job is to:
 2. Remove redundancy
 3. Organize information logically
 4. Create a unified narrative that answers the user's question
+5. Preserve source IDs for citation tracking
 
-Be concise but comprehensive. Cite sources when relevant."""
+CRITICAL: Each piece of information you include MUST be attributed to its source using the source_id.
+When synthesizing, always note which source_id each fact comes from.
+
+Output format:
+- Include source attribution inline: "According to [source_id], ..."
+- Or use markers: "The data shows X [source_id]"
+- Preserve ALL source_ids so the writer can create proper citations"""
 
 SYNTHESIZER_PROMPT = """User Query: {query}
 
-Sources to synthesize:
+Sources to synthesize (each has a source_id for citation):
 {tool_results}
 
-Create a synthesized response that combines all relevant information from these sources.
-Focus on directly addressing the user's query."""
+Create a synthesized response that:
+1. Combines all relevant information from these sources
+2. Directly addresses the user's query
+3. Attributes each fact to its source using [source_id] markers
+
+Example: "The company reported $10M revenue [web_search_1] and has 500 employees [rag_1]."
+
+IMPORTANT: Keep source_id markers exactly as provided (e.g., [web_search_1], [rag_2]).
+The writer will convert these to GitHub footnote citations."""
 
 # =============================================================================
 # WRITER PROMPTS
@@ -111,8 +134,15 @@ Your job is to:
 2. Use appropriate formatting (markdown when helpful)
 3. Be concise while remaining helpful
 4. Match the tone to the user's query
+5. Convert source markers to GitHub footnote citations
 
-Do NOT add unnecessary pleasantries or filler text."""
+CITATION FORMAT (GitHub footnotes):
+- Convert [source_id] markers to footnote format: [^source_id]
+- Example: "Revenue was $10M[^web_search_1]"
+- Footnote references will be auto-generated at the end
+
+Do NOT add unnecessary pleasantries or filler text.
+Do NOT modify or remove source citations - they are important for attribution."""
 
 WRITER_PROMPT = """User Query: {query}
 
@@ -120,7 +150,18 @@ Content to format:
 {context}
 
 Format this content as a clear, helpful response to the user's query.
-Use markdown formatting where appropriate (headers, lists, code blocks, etc.)."""
+
+Instructions:
+1. Use markdown formatting where appropriate (headers, lists, code blocks, etc.)
+2. Convert any [source_id] markers to GitHub footnote format [^source_id]
+3. Place footnote citations immediately after the relevant text (no space before)
+4. Keep all citations - do not remove them
+
+Example transformation:
+Input: "The API supports REST and GraphQL [api_docs_1]"
+Output: "The API supports REST and GraphQL[^api_docs_1]"
+
+The system will automatically append footnote definitions at the end."""
 
 # =============================================================================
 # QUERY REWRITER PROMPTS

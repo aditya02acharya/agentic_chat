@@ -22,6 +22,7 @@ from langchain_core.messages import BaseMessage, AnyMessage
 from agentic_chatbot.events.emitter import EventEmitter
 from agentic_chatbot.mcp.callbacks import MCPCallbacks, ElicitationManager
 from agentic_chatbot.core.workflow import WorkflowDefinition, WorkflowResult
+from agentic_chatbot.context.models import TaskContext, DataChunk, DataSummary, DataStore
 
 
 # =============================================================================
@@ -38,9 +39,16 @@ class SupervisorDecision(BaseModel):
     # For ANSWER
     response: str | None = Field(None, description="Direct response for ANSWER action")
 
-    # For CALL_TOOL
+    # For CALL_TOOL - includes task context for the operator
     operator: str | None = Field(None, description="Operator name for CALL_TOOL action")
     params: dict[str, Any] | None = Field(None, description="Parameters for the operator")
+
+    # Task delegation context (for CALL_TOOL and CREATE_WORKFLOW)
+    task_description: str | None = Field(
+        None, description="Reformulated task description for the operator"
+    )
+    task_goal: str | None = Field(None, description="Expected outcome from this action")
+    task_scope: str | None = Field(None, description="What's in/out of scope")
 
     # For CREATE_WORKFLOW
     goal: str | None = Field(None, description="Workflow goal for CREATE_WORKFLOW action")
@@ -50,6 +58,15 @@ class SupervisorDecision(BaseModel):
 
     # For CLARIFY
     question: str | None = Field(None, description="Clarification question for CLARIFY action")
+
+    def to_task_context(self, original_query: str = "") -> TaskContext:
+        """Convert decision to TaskContext for operator."""
+        return TaskContext(
+            task_description=self.task_description or self.reasoning,
+            goal=self.task_goal or "Complete the requested operation",
+            scope=self.task_scope or "",
+            original_query_summary=original_query[:200] if original_query else "",
+        )
 
 
 class ToolResult(BaseModel):
@@ -155,6 +172,30 @@ def reduce_workflow_steps(
     return list(steps_by_id.values())
 
 
+def reduce_data_chunks(
+    left: list[DataChunk] | None,
+    right: list[DataChunk] | None,
+) -> list[DataChunk]:
+    """Reducer for data chunks - appends new chunks."""
+    if not left:
+        left = []
+    if not right:
+        right = []
+    return left + right
+
+
+def reduce_data_summaries(
+    left: list[DataSummary] | None,
+    right: list[DataSummary] | None,
+) -> list[DataSummary]:
+    """Reducer for data summaries - appends new summaries."""
+    if not left:
+        left = []
+    if not right:
+        right = []
+    return left + right
+
+
 # =============================================================================
 # MAIN STATE DEFINITION
 # =============================================================================
@@ -213,6 +254,23 @@ class ChatState(TypedDict, total=False):
 
     # Reflection
     reflection: ReflectionResult | None
+
+    # -------------------------------------------------------------------------
+    # CONTEXT OPTIMIZATION (new)
+    # Separates supervisor context (summaries) from synthesizer context (raw data)
+    # -------------------------------------------------------------------------
+
+    # Task context for operators (reformulated task, not full conversation)
+    current_task_context: TaskContext | None
+
+    # Raw data chunks with source tracking (for synthesizer/writer citations)
+    data_chunks: Annotated[list[DataChunk], reduce_data_chunks]
+
+    # LLM-generated summaries (for supervisor decision-making)
+    data_summaries: Annotated[list[DataSummary], reduce_data_summaries]
+
+    # Source counter for generating unique citation IDs
+    source_counter: dict[str, int]
 
     # -------------------------------------------------------------------------
     # OUTPUT
@@ -298,6 +356,12 @@ def create_initial_state(
         workflow_result=None,
         reflection=None,
 
+        # Context optimization
+        current_task_context=None,
+        data_chunks=[],
+        data_summaries=[],
+        source_counter={},
+
         # Output
         final_response="",
         clarify_question=None,
@@ -328,3 +392,35 @@ def get_emitter(state: ChatState) -> EventEmitter | None:
         return EventEmitter(queue)
 
     return None
+
+
+def generate_source_id(state: ChatState, source_type: str) -> tuple[str, dict[str, int]]:
+    """
+    Generate unique source ID for citations.
+
+    Args:
+        state: Current chat state
+        source_type: Type of source (e.g., "web_search", "rag")
+
+    Returns:
+        Tuple of (source_id, updated_counter)
+    """
+    counter = state.get("source_counter", {}).copy()
+    count = counter.get(source_type, 0) + 1
+    counter[source_type] = count
+    source_id = f"{source_type}_{count}"
+    return source_id, counter
+
+
+def get_summaries_text(state: ChatState) -> str:
+    """Get formatted summaries for supervisor context."""
+    summaries = state.get("data_summaries", [])
+    if not summaries:
+        return "No data collected yet."
+
+    return "\n\n".join(s.to_supervisor_text() for s in summaries)
+
+
+def get_data_chunks(state: ChatState) -> list[DataChunk]:
+    """Get all data chunks for synthesizer/writer."""
+    return state.get("data_chunks", [])
