@@ -23,6 +23,8 @@ from agentic_chatbot.config.prompts import (
     SYNTHESIZER_PROMPT,
     WRITER_PROMPT,
     BLOCKED_HANDLER_PROMPT,
+    WORKFLOW_PLANNER_SYSTEM_PROMPT,
+    WORKFLOW_PLANNER_PROMPT,
 )
 from agentic_chatbot.events.models import (
     SupervisorThinkingEvent,
@@ -33,6 +35,10 @@ from agentic_chatbot.events.models import (
     ResponseChunkEvent,
     ResponseDoneEvent,
     ClarifyRequestEvent,
+    WorkflowCreatedEvent,
+    WorkflowStepStartEvent,
+    WorkflowStepCompleteEvent,
+    WorkflowCompleteEvent,
 )
 from agentic_chatbot.graph.state import (
     ChatState,
@@ -47,6 +53,14 @@ from agentic_chatbot.operators.context import OperatorContext
 from agentic_chatbot.utils.structured_llm import StructuredLLMCaller, StructuredOutputError
 from agentic_chatbot.utils.llm import LLMClient
 from agentic_chatbot.utils.logging import get_logger
+from agentic_chatbot.core.workflow import (
+    WorkflowDefinition,
+    WorkflowDefinitionSchema,
+    WorkflowResult,
+    WorkflowStatus,
+)
+from agentic_chatbot.core.workflow_executor import WorkflowExecutor
+from agentic_chatbot.events.emitter import EventEmitter
 
 
 logger = get_logger(__name__)
@@ -344,6 +358,222 @@ async def execute_tool_node(state: ChatState) -> dict[str, Any]:
                 )
             ],
             "current_tool": None,
+        }
+
+
+# =============================================================================
+# WORKFLOW PLANNING NODE
+# =============================================================================
+
+
+async def plan_workflow_node(state: ChatState) -> dict[str, Any]:
+    """
+    Plan a multi-step workflow for complex tasks.
+
+    Uses the supervisor's goal and hints to create a detailed
+    WorkflowDefinition with steps, dependencies, and input mappings.
+
+    This enables:
+    - Multi-step execution with dependency handling
+    - Parallel execution of independent steps
+    - Template-based input resolution between steps
+    """
+    decision = state.get("current_decision")
+    user_query = state.get("user_query", "")
+
+    # Get goal from supervisor decision
+    goal = decision.goal if decision else user_query
+    supervisor_hints = decision.steps if decision and decision.steps else []
+
+    await emit_event(
+        state,
+        SupervisorThinkingEvent.create(
+            "Creating execution plan...",
+            request_id=state.get("request_id"),
+        ),
+    )
+
+    logger.info("Planning workflow", goal=goal)
+
+    # Build context from existing results and conversation
+    context_parts = []
+    context_parts.append(f"User Query: {user_query}")
+
+    if supervisor_hints:
+        context_parts.append(f"Supervisor hints: {supervisor_hints}")
+
+    tool_results = state.get("tool_results", [])
+    if tool_results:
+        results_text = format_tool_results(state)
+        context_parts.append(f"Available context:\n{results_text}")
+
+    context = "\n\n".join(context_parts)
+
+    # Get operator summaries for the planner
+    operator_summaries = get_tool_summaries(state)
+
+    # Build prompts
+    system = WORKFLOW_PLANNER_SYSTEM_PROMPT.format(operator_summaries=operator_summaries)
+    prompt = WORKFLOW_PLANNER_PROMPT.format(
+        query=goal,
+        context=context,
+    )
+
+    caller = StructuredLLMCaller(max_retries=3)
+
+    try:
+        workflow_schema = await caller.call(
+            prompt=prompt,
+            response_model=WorkflowDefinitionSchema,
+            system=system,
+            model="sonnet",
+        )
+
+        # Convert to runtime WorkflowDefinition
+        workflow = WorkflowDefinition.from_schema(workflow_schema)
+
+        # Emit workflow created event
+        await emit_event(
+            state,
+            WorkflowCreatedEvent.create(
+                goal=workflow.goal,
+                steps=len(workflow.steps),
+                request_id=state.get("request_id"),
+            ),
+        )
+
+        logger.info(
+            "Workflow planned",
+            goal=workflow.goal,
+            steps=len(workflow.steps),
+            step_names=[s.name for s in workflow.steps],
+        )
+
+        # Store workflow definition in state for execution
+        return {
+            "workflow_definition": workflow,
+            "workflow_goal": workflow.goal,
+        }
+
+    except StructuredOutputError as e:
+        logger.error(f"Workflow planning failed: {e}")
+        # Fall back to treating as single tool call
+        return {
+            "workflow_definition": None,
+            "error": f"Failed to plan workflow: {e}",
+            "error_type": "planning",
+        }
+
+
+# =============================================================================
+# WORKFLOW EXECUTION NODE
+# =============================================================================
+
+
+async def execute_workflow_node(state: ChatState) -> dict[str, Any]:
+    """
+    Execute a planned workflow using the WorkflowExecutor.
+
+    Features:
+    - Parallel execution of independent steps (via topological batching)
+    - Dependency resolution with input template substitution
+    - Per-step event emission for progress tracking
+    - Error handling with partial result collection
+
+    The workflow executor uses a DAG approach:
+    1. Group steps into batches based on dependencies
+    2. Execute each batch (parallel within batch)
+    3. Pass outputs to dependent steps via input_mapping templates
+    """
+    workflow = state.get("workflow_definition")
+
+    if not workflow:
+        logger.warning("No workflow definition found, skipping execution")
+        return {
+            "tool_results": [
+                ToolResult(
+                    tool_name="workflow",
+                    success=False,
+                    error="No workflow definition to execute",
+                )
+            ],
+        }
+
+    # Create event emitter
+    emitter = get_emitter(state)
+
+    # Create workflow executor with MCP session manager if available
+    executor = WorkflowExecutor(
+        session_manager=state.get("mcp_session_manager"),
+        emitter=emitter,
+        request_id=state.get("request_id"),
+    )
+
+    logger.info(
+        "Executing workflow",
+        goal=workflow.goal,
+        steps=len(workflow.steps),
+    )
+
+    try:
+        # Execute the workflow with parallel optimization
+        result: WorkflowResult = await executor.execute(
+            workflow,
+            initial_context={
+                "user_query": state.get("user_query", ""),
+                "conversation_id": state.get("conversation_id", ""),
+            },
+        )
+
+        # Convert workflow results to tool results for reflection
+        tool_results = []
+        for step_id, step_result in result.steps.items():
+            tool_results.append(
+                ToolResult(
+                    tool_name=f"workflow.{step_id}",
+                    success=step_result.status == WorkflowStatus.COMPLETED,
+                    content=str(step_result.output) if step_result.output else "",
+                    error=step_result.error,
+                    metadata={
+                        "step_id": step_id,
+                        "duration_ms": step_result.duration_ms,
+                    },
+                )
+            )
+
+        logger.info(
+            "Workflow execution complete",
+            goal=workflow.goal,
+            status=result.status.value,
+            failed_steps=result.failed_steps,
+        )
+
+        return {
+            "tool_results": tool_results,
+            "workflow_result": result,
+            "workflow_completed": result.is_complete,
+        }
+
+    except Exception as e:
+        logger.error(f"Workflow execution failed: {e}", exc_info=True)
+
+        # Emit error event
+        await emit_event(
+            state,
+            WorkflowCompleteEvent.create(
+                request_id=state.get("request_id"),
+            ),
+        )
+
+        return {
+            "tool_results": [
+                ToolResult(
+                    tool_name="workflow",
+                    success=False,
+                    error=str(e),
+                )
+            ],
+            "workflow_completed": False,
         }
 
 

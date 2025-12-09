@@ -9,8 +9,8 @@ from __future__ import annotations
 from typing import Any
 
 from langgraph.graph import StateGraph, START, END
+from langgraph.graph.state import CompiledStateGraph
 from langgraph.checkpoint.memory import MemorySaver
-from langgraph.graph.graph import CompiledGraph
 
 from agentic_chatbot.graph.state import ChatState
 from agentic_chatbot.graph.nodes import (
@@ -18,6 +18,8 @@ from agentic_chatbot.graph.nodes import (
     initialize_node,
     supervisor_node,
     execute_tool_node,
+    plan_workflow_node,
+    execute_workflow_node,
     reflect_node,
     synthesize_node,
     write_node,
@@ -38,7 +40,7 @@ def create_chat_graph(
     checkpointer: Any | None = None,
     interrupt_before: list[str] | None = None,
     interrupt_after: list[str] | None = None,
-) -> CompiledGraph:
+) -> CompiledStateGraph:
     """
     Create the main chat graph.
 
@@ -52,8 +54,18 @@ def create_chat_graph(
             │                   ├── "satisfied" → synthesize → write → stream → END
             │                   ├── "need_more" → supervisor (loop)
             │                   └── "blocked" → handle_blocked → write → stream → END
-            ├── "create_workflow" → [workflow nodes] → reflect → ...
+            ├── "create_workflow" → plan_workflow → execute_workflow → reflect
+            │                   ├── "satisfied" → synthesize → write → stream → END
+            │                   ├── "need_more" → supervisor (loop)
+            │                   └── "blocked" → handle_blocked → write → stream → END
             └── "clarify" → clarify → stream → END
+
+    Workflow Execution Features:
+        - plan_workflow: LLM creates WorkflowDefinition with steps & dependencies
+        - execute_workflow: WorkflowExecutor runs steps with parallel batching
+        - Dependency resolution via topological sort
+        - Input mapping with {{step_id.output}} templates
+        - Per-step event emission for progress tracking
 
     Args:
         checkpointer: Optional checkpointer for persistence (MemorySaver, SqliteSaver, etc.)
@@ -76,8 +88,12 @@ def create_chat_graph(
     # Orchestration
     builder.add_node("supervisor", supervisor_node)
 
-    # Execution
+    # Execution - Single tool
     builder.add_node("execute_tool", execute_tool_node)
+
+    # Execution - Multi-step workflow
+    builder.add_node("plan_workflow", plan_workflow_node)
+    builder.add_node("execute_workflow", execute_workflow_node)
 
     # Reflection & Synthesis
     builder.add_node("reflect", reflect_node)
@@ -104,13 +120,17 @@ def create_chat_graph(
         {
             "answer": "write",
             "call_tool": "execute_tool",
-            "create_workflow": "execute_tool",  # Simplified: treat workflow as tool for now
+            "create_workflow": "plan_workflow",  # Multi-step workflow planning
             "clarify": "clarify",
         },
     )
 
     # After tool execution -> reflect
     builder.add_edge("execute_tool", "reflect")
+
+    # Workflow: plan -> execute -> reflect
+    builder.add_edge("plan_workflow", "execute_workflow")
+    builder.add_edge("execute_workflow", "reflect")
 
     # Reflection conditional routing
     builder.add_conditional_edges(
@@ -158,7 +178,7 @@ def create_chat_graph(
     return graph
 
 
-def create_chat_graph_with_memory() -> CompiledGraph:
+def create_chat_graph_with_memory() -> CompiledStateGraph:
     """
     Create chat graph with in-memory checkpointer.
 
@@ -168,7 +188,7 @@ def create_chat_graph_with_memory() -> CompiledGraph:
     return create_chat_graph(checkpointer=checkpointer)
 
 
-async def create_chat_graph_with_sqlite(db_path: str = ":memory:") -> CompiledGraph:
+async def create_chat_graph_with_sqlite(db_path: str = ":memory:") -> CompiledStateGraph:
     """
     Create chat graph with SQLite checkpointer.
 

@@ -21,6 +21,7 @@ from langchain_core.messages import BaseMessage, AnyMessage
 
 from agentic_chatbot.events.emitter import EventEmitter
 from agentic_chatbot.mcp.callbacks import MCPCallbacks, ElicitationManager
+from agentic_chatbot.core.workflow import WorkflowDefinition, WorkflowResult
 
 
 # =============================================================================
@@ -207,6 +208,8 @@ class ChatState(TypedDict, total=False):
     workflow_goal: str | None
     workflow_steps: Annotated[list[WorkflowStep], reduce_workflow_steps]
     workflow_completed: bool
+    workflow_definition: WorkflowDefinition | None  # Planned workflow
+    workflow_result: WorkflowResult | None  # Execution result
 
     # Reflection
     reflection: ReflectionResult | None
@@ -291,6 +294,8 @@ def create_initial_state(
         workflow_goal=None,
         workflow_steps=[],
         workflow_completed=False,
+        workflow_definition=None,
+        workflow_result=None,
         reflection=None,
 
         # Output
