@@ -45,21 +45,57 @@ pip install -e .
 
 # Install with development dependencies
 pip install -e ".[dev]"
+
+# Install with AWS Bedrock support
+pip install -e ".[bedrock]"
+
+# Install everything
+pip install -e ".[all]"
 ```
 
 ## Configuration
 
 Copy `.env.example` to `.env` and configure:
 
-```bash
-# Required
-ANTHROPIC_API_KEY=your-api-key-here
+### Option 1: Anthropic Direct API (Default)
 
+```bash
+LLM_PROVIDER=anthropic
+ANTHROPIC_API_KEY=your-api-key-here
+```
+
+### Option 2: AWS Bedrock
+
+```bash
+LLM_PROVIDER=bedrock
+BEDROCK_REGION=us-east-1
+
+# Authentication (choose one):
+# 1. IAM Role (recommended for AWS deployments) - no additional config needed
+# 2. AWS Profile
+BEDROCK_PROFILE=your-profile-name
+# 3. Explicit credentials
+AWS_ACCESS_KEY_ID=your-access-key
+AWS_SECRET_ACCESS_KEY=your-secret-key
+```
+
+### Other Settings
+
+```bash
 # MCP (optional)
 MCP_DISCOVERY_URL=http://localhost:8080/servers
 
 # Other settings (see .env.example for full list)
 ```
+
+### LLM Provider Details
+
+| Provider | Model Aliases | Notes |
+|----------|---------------|-------|
+| `anthropic` | haiku, sonnet, opus | Direct Anthropic API |
+| `bedrock` | haiku, sonnet, opus | AWS Bedrock (requires IAM permissions) |
+
+Both providers support the same model aliases which map to the appropriate model IDs for each platform.
 
 ## Usage
 

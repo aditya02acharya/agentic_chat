@@ -1,68 +1,83 @@
-"""Async LLM client wrapper for Anthropic Claude API."""
+"""Async LLM client wrapper with multi-provider support.
+
+Supports:
+- Anthropic direct API (default)
+- AWS Bedrock
+
+The provider is selected based on the LLM_PROVIDER environment variable.
+"""
 
 from dataclasses import dataclass
 from typing import AsyncIterator
 
-from anthropic import AsyncAnthropic
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-
 from agentic_chatbot.config.settings import get_settings
 from agentic_chatbot.utils.logging import get_logger
+from agentic_chatbot.utils.providers import (
+    BaseLLMProvider,
+    LLMResponse,
+    create_provider,
+)
 
 
 logger = get_logger(__name__)
 
 
-# Model aliases for convenience
-MODEL_ALIASES = {
-    "haiku": "claude-3-haiku-20240307",
-    "sonnet": "claude-3-5-sonnet-20241022",
-    "opus": "claude-3-opus-20240229",
-}
-
-
-@dataclass
-class LLMResponse:
-    """Response from LLM call."""
-
-    content: str
-    model: str
-    input_tokens: int
-    output_tokens: int
-    stop_reason: str
+# Re-export LLMResponse for backwards compatibility
+# (it's now defined in providers.base)
+__all__ = ["LLMClient", "LLMResponse", "call_llm"]
 
 
 class LLMClient:
     """
-    Async wrapper for Anthropic Claude API.
+    Async LLM client with multi-provider support.
 
     Features:
+    - Multiple providers (Anthropic direct, AWS Bedrock)
     - Model aliases ("haiku", "sonnet", "opus")
     - Automatic retry with exponential backoff
-    - Usage tracking (tokens, duration)
+    - Usage tracking (tokens)
     - Streaming support
+
+    The provider is automatically selected based on settings,
+    or can be explicitly specified.
+
+    Example:
+        # Use default provider from settings
+        client = LLMClient()
+
+        # Explicit Anthropic
+        client = LLMClient(provider="anthropic", api_key="sk-...")
+
+        # Explicit Bedrock
+        client = LLMClient(provider="bedrock", region_name="us-west-2")
     """
 
-    def __init__(self, api_key: str | None = None):
+    def __init__(
+        self,
+        provider: str | None = None,
+        **provider_kwargs,
+    ):
         """
         Initialize LLM client.
 
         Args:
-            api_key: Anthropic API key (defaults to settings)
+            provider: Provider name ("anthropic" or "bedrock"). Uses settings if not specified.
+            **provider_kwargs: Provider-specific arguments (api_key, region_name, etc.)
         """
         settings = get_settings()
-        self._client = AsyncAnthropic(api_key=api_key or settings.anthropic_api_key)
+        self._provider: BaseLLMProvider = create_provider(provider, **provider_kwargs)
         self._default_model = settings.default_model
 
-    def _resolve_model(self, model: str) -> str:
-        """Resolve model alias to full model ID."""
-        return MODEL_ALIASES.get(model, model)
+        logger.info(
+            "LLM client initialized",
+            provider=self._provider.provider_name,
+        )
 
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=1, max=10),
-        retry=retry_if_exception_type((TimeoutError, ConnectionError)),
-    )
+    @property
+    def provider_name(self) -> str:
+        """Get the name of the current provider."""
+        return self._provider.provider_name
+
     async def complete(
         self,
         prompt: str,
@@ -77,50 +92,19 @@ class LLMClient:
         Args:
             prompt: User prompt
             system: System prompt
-            model: Model name or alias
+            model: Model name or alias ("haiku", "sonnet", "opus")
             max_tokens: Maximum tokens to generate
             temperature: Sampling temperature
 
         Returns:
             LLMResponse with content and metadata
         """
-        resolved_model = self._resolve_model(model)
-
-        logger.debug(
-            "Calling LLM",
-            model=resolved_model,
-            prompt_length=len(prompt),
-            system_length=len(system),
-        )
-
-        messages = [{"role": "user", "content": prompt}]
-
-        response = await self._client.messages.create(
-            model=resolved_model,
+        return await self._provider.complete(
+            prompt=prompt,
+            system=system,
+            model=model,
             max_tokens=max_tokens,
             temperature=temperature,
-            system=system if system else None,
-            messages=messages,
-        )
-
-        content = ""
-        if response.content and len(response.content) > 0:
-            content = response.content[0].text
-
-        logger.debug(
-            "LLM response received",
-            model=resolved_model,
-            input_tokens=response.usage.input_tokens,
-            output_tokens=response.usage.output_tokens,
-            stop_reason=response.stop_reason,
-        )
-
-        return LLMResponse(
-            content=content,
-            model=resolved_model,
-            input_tokens=response.usage.input_tokens,
-            output_tokens=response.usage.output_tokens,
-            stop_reason=response.stop_reason,
         )
 
     async def stream(
@@ -144,25 +128,45 @@ class LLMClient:
         Yields:
             Response text chunks
         """
-        resolved_model = self._resolve_model(model)
-
-        logger.debug(
-            "Starting LLM stream",
-            model=resolved_model,
-            prompt_length=len(prompt),
-        )
-
-        messages = [{"role": "user", "content": prompt}]
-
-        async with self._client.messages.stream(
-            model=resolved_model,
+        async for chunk in self._provider.stream(
+            prompt=prompt,
+            system=system,
+            model=model,
             max_tokens=max_tokens,
             temperature=temperature,
-            system=system if system else None,
-            messages=messages,
-        ) as stream:
-            async for text in stream.text_stream:
-                yield text
+        ):
+            yield chunk
+
+    # Backwards compatibility - expose generate as alias for complete
+    async def generate(
+        self,
+        prompt: str,
+        system: str = "",
+        model: str = "sonnet",
+        max_tokens: int = 4096,
+        temperature: float = 0.0,
+    ) -> str:
+        """
+        Generate response from LLM (backwards compatibility).
+
+        Args:
+            prompt: User prompt
+            system: System prompt
+            model: Model name or alias
+            max_tokens: Maximum tokens
+            temperature: Sampling temperature
+
+        Returns:
+            Response content string
+        """
+        response = await self.complete(
+            prompt=prompt,
+            system=system,
+            model=model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+        return response.content
 
 
 # Convenience function
