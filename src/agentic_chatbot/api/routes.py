@@ -27,7 +27,8 @@ from agentic_chatbot.api.dependencies import (
 from agentic_chatbot.api.sse import event_generator_with_task
 from agentic_chatbot.events.emitter import EventEmitter
 from agentic_chatbot.events.models import Event, ErrorEvent, ResponseDoneEvent
-from agentic_chatbot.flows.main_flow import create_main_chat_flow
+from agentic_chatbot.graph import create_chat_graph
+from agentic_chatbot.graph.state import create_initial_state
 from agentic_chatbot.mcp.callbacks import create_mcp_callbacks
 from agentic_chatbot.operators.registry import OperatorRegistry
 from agentic_chatbot.utils.logging import get_logger
@@ -139,57 +140,59 @@ async def chat(
         request_id=request_id,
     )
 
-    # Build shared store
-    shared: dict[str, Any] = {
-        "user_query": chat_request.message,
-        "conversation_id": chat_request.conversation_id,
-        "request_id": request_id,
-        "event_queue": event_queue,
-        "event_emitter": emitter,
-        "mcp": {
-            "server_registry": mcp_registry,
-            "session_manager": mcp_session_manager,
-            "callbacks": mcp_callbacks,
-            "elicitation_manager": elicitation_manager,
-        },
-    }
-
-    # Add context if provided
-    if chat_request.context:
-        shared["user_context"] = chat_request.context
+    # Create initial state for LangGraph
+    initial_state = create_initial_state(
+        user_query=chat_request.message,
+        conversation_id=chat_request.conversation_id,
+        request_id=request_id,
+        event_emitter=emitter,
+        event_queue=event_queue,
+        mcp_registry=mcp_registry,
+        mcp_session_manager=mcp_session_manager,
+        mcp_callbacks=mcp_callbacks,
+        elicitation_manager=elicitation_manager,
+        user_context=chat_request.context,
+    )
 
     # Track request
     active_requests = getattr(request.app.state, "active_requests", set())
     active_requests.add(request_id)
 
-    async def run_flow() -> None:
-        """Run the chat flow in background."""
+    async def run_graph() -> None:
+        """Run the LangGraph in background."""
         try:
-            flow = create_main_chat_flow()
-            await flow.run_async(shared)
+            # Create the chat graph
+            graph = create_chat_graph()
+
+            # Configuration for LangGraph
+            config = {
+                "configurable": {
+                    "thread_id": chat_request.conversation_id,
+                }
+            }
+
+            # Run the graph
+            await graph.ainvoke(initial_state, config)
+
         except Exception as e:
-            logger.error(f"Flow execution error: {e}", exc_info=True)
+            logger.error(f"Graph execution error: {e}", exc_info=True)
             await event_queue.put(
                 ErrorEvent.create(
                     error=str(e),
-                    error_type="flow_error",
+                    error_type="graph_error",
                     request_id=request_id,
                 )
             )
         finally:
             # Ensure done event is sent
-            if event_queue.empty() or not any(
-                isinstance(e, (ResponseDoneEvent, ErrorEvent))
-                for e in list(event_queue._queue)  # type: ignore
-            ):
-                await event_queue.put(
-                    ResponseDoneEvent.create(request_id=request_id)
-                )
+            await event_queue.put(
+                ResponseDoneEvent.create(request_id=request_id)
+            )
             # Untrack request
             active_requests.discard(request_id)
 
-    # Start flow execution
-    task = asyncio.create_task(run_flow())
+    # Start graph execution
+    task = asyncio.create_task(run_graph())
 
     return StreamingResponse(
         event_generator_with_task(event_queue, task),
@@ -236,28 +239,33 @@ async def chat_sync(
         request_id=request_id,
     )
 
-    # Build shared store
-    shared: dict[str, Any] = {
-        "user_query": chat_request.message,
-        "conversation_id": chat_request.conversation_id,
-        "request_id": request_id,
-        "event_queue": event_queue,
-        "event_emitter": emitter,
-        "mcp": {
-            "server_registry": mcp_registry,
-            "session_manager": mcp_session_manager,
-            "callbacks": mcp_callbacks,
-            "elicitation_manager": elicitation_manager,
-        },
-    }
+    # Create initial state
+    initial_state = create_initial_state(
+        user_query=chat_request.message,
+        conversation_id=chat_request.conversation_id,
+        request_id=request_id,
+        event_emitter=emitter,
+        event_queue=event_queue,
+        mcp_registry=mcp_registry,
+        mcp_session_manager=mcp_session_manager,
+        mcp_callbacks=mcp_callbacks,
+        elicitation_manager=elicitation_manager,
+        user_context=chat_request.context,
+    )
 
     try:
-        flow = create_main_chat_flow()
-        await flow.run_async(shared)
+        # Create and run graph
+        graph = create_chat_graph()
+        config = {
+            "configurable": {
+                "thread_id": chat_request.conversation_id,
+            }
+        }
 
-        # Get response from results
-        results = shared.get("results", {})
-        response = results.get("final_response", "")
+        final_state = await graph.ainvoke(initial_state, config)
+
+        # Get response from final state
+        response = final_state.get("final_response", "")
 
         return ChatResponse(
             conversation_id=chat_request.conversation_id,

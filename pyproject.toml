@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "agentic-chatbot"
 version = "0.1.0"
-description = "Agentic Chatbot Backend with PocketFlow"
+description = "Agentic Chatbot Backend with LangGraph"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"
@@ -27,10 +27,16 @@ dependencies = [
     "pydantic-settings>=2.1.0",
     "httpx>=0.26.0",
     "anthropic>=0.18.0",
-    "pocketflow>=0.0.1",
+    # LangGraph and LangChain
+    "langgraph>=1.0.0",
+    "langchain-core>=0.3.0",
+    "langchain-anthropic>=0.3.0",
+    "langgraph-checkpoint>=2.0.0",
+    # Utilities
     "structlog>=24.1.0",
     "tenacity>=8.2.0",
     "sse-starlette>=1.8.0",
+    "aiosqlite>=0.20.0",
 ]
 
 [project.optional-dependencies]

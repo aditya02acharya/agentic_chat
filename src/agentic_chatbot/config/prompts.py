@@ -30,6 +30,9 @@ SUPERVISOR_DECISION_PROMPT = """User Query: {query}
 Conversation Context:
 {conversation_context}
 
+Tool Results So Far:
+{tool_results}
+
 Actions taken this turn:
 {actions_this_turn}
 
@@ -61,13 +64,15 @@ You MUST respond with valid JSON matching the ReflectionResult schema."""
 REFLECT_PROMPT = """Original Query: {query}
 
 Collected Results:
-{results}
+{tool_results}
+
+Current Iteration: {iteration} of {max_iterations}
 
 Evaluate these results and determine:
-1. quality_score (0.0-1.0): How well do the results address the query?
-2. is_complete (bool): Is there enough information?
-3. issues (list[str]): Any problems with the results
-4. recommendation: One of "satisfied", "need_more", or "blocked"
+1. assessment: One of "satisfied", "need_more", or "blocked"
+2. reasoning: Explain your assessment
+3. suggested_action (optional): What action to take next if need_more
+4. missing_info (list[str]): What information is still missing
 
 "satisfied" - Results are good enough, proceed to response
 "need_more" - Need additional information, continue the loop
@@ -90,7 +95,7 @@ Be concise but comprehensive. Cite sources when relevant."""
 SYNTHESIZER_PROMPT = """User Query: {query}
 
 Sources to synthesize:
-{sources}
+{tool_results}
 
 Create a synthesized response that combines all relevant information from these sources.
 Focus on directly addressing the user's query."""
@@ -112,7 +117,7 @@ Do NOT add unnecessary pleasantries or filler text."""
 WRITER_PROMPT = """User Query: {query}
 
 Content to format:
-{content}
+{context}
 
 Format this content as a clear, helpful response to the user's query.
 Use markdown formatting where appropriate (headers, lists, code blocks, etc.)."""
@@ -246,9 +251,9 @@ BLOCKED_HANDLER_PROMPT = """The system encountered an issue while processing you
 Original Query: {query}
 
 What we tried:
-{actions_attempted}
+{attempts}
 
-Issue: {issue}
+Issue: {reason}
 
 Please provide a helpful, apologetic response that:
 1. Acknowledges the limitation

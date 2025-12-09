@@ -1,6 +1,6 @@
 # Agentic Chatbot Backend
 
-A ReACT-based agentic chatbot backend built with PocketFlow and MCP integration.
+A ReACT-based agentic chatbot backend built with **LangGraph v1.x** and MCP integration.
 
 ## Features
 
@@ -10,6 +10,10 @@ A ReACT-based agentic chatbot backend built with PocketFlow and MCP integration.
   - `CALL_TOOL`: Single tool execution for data retrieval
   - `CREATE_WORKFLOW`: Multi-step plans for complex tasks
   - `CLARIFY`: Request clarification for ambiguous queries
+- **LangGraph v1.0**: Production-ready stateful agent framework with:
+  - Durable state persistence
+  - Built-in checkpointing
+  - Human-in-the-loop patterns via `interrupt()`
 - **MCP Integration**: Full Model Context Protocol support for external tools
 - **SSE Streaming**: Real-time progress updates via Server-Sent Events
 - **Extensible Operators**: Easy to add new operators via Registry pattern
@@ -19,13 +23,17 @@ A ReACT-based agentic chatbot backend built with PocketFlow and MCP integration.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                         MAIN CHAT FLOW                                       │
+│                         LANGGRAPH STATE FLOW                                 │
 ├─────────────────────────────────────────────────────────────────────────────┤
-│  Init → FetchTools → Supervisor                                             │
-│      ├── "answer" → Write → Stream                                          │
-│      ├── "call_tool" → ToolSubFlow → Observe → Reflect                     │
-│      ├── "workflow" → WorkflowSubFlow → Observe → Reflect                  │
-│      └── "clarify" → Clarify → Stream                                       │
+│  START → initialize → supervisor                                             │
+│      ├── "answer" ─────────────────────────────────┐                        │
+│      ├── "call_tool" → execute_tool → reflect      │                        │
+│      │                    ├── "satisfied" → synthesize                       │
+│      │                    ├── "need_more" → supervisor (loop)                │
+│      │                    └── "blocked" → handle_blocked                     │
+│      └── "clarify" → clarify                       │                        │
+│                        │                           │                        │
+│                        └───────────────────────────┼──→ write → stream → END │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -94,6 +102,15 @@ Health check endpoint.
 #### GET /api/v1/tools
 List available tools.
 
+#### POST /api/v1/elicitation/respond
+Submit user response to a tool's input request.
+
+```bash
+curl -X POST http://localhost:8000/api/v1/elicitation/respond \
+  -H "Content-Type: application/json" \
+  -d '{"elicitation_id": "xxx", "value": "user input"}'
+```
+
 ## Project Structure
 
 ```
@@ -103,19 +120,66 @@ src/agentic_chatbot/
 ├── context/                # Context management (memory, results, actions)
 ├── core/                   # Core domain (supervisor, workflow, exceptions)
 ├── events/                 # Event system for SSE
-├── flows/                  # PocketFlow flow definitions
+├── graph/                  # LangGraph implementation
+│   ├── state.py           # State definitions with TypedDict + reducers
+│   ├── nodes.py           # Node functions for the graph
+│   └── builder.py         # StateGraph construction
+├── flows/                  # Legacy flow definitions (deprecated)
 ├── mcp/                    # MCP protocol integration
-├── nodes/                  # PocketFlow nodes
-│   ├── context/           # Context preparation nodes
-│   ├── execution/         # Work execution nodes
-│   ├── orchestration/     # Control flow nodes
-│   ├── output/            # Response generation nodes
-│   └── workflow/          # Multi-step workflow nodes
+│   ├── callbacks.py       # Callback handlers with elicitation support
+│   ├── client.py          # MCP client
+│   ├── manager.py         # Connection management
+│   └── session.py         # Session management
+├── nodes/                  # Legacy PocketFlow nodes (deprecated)
 ├── operators/             # Operators (Strategy pattern)
 │   ├── hybrid/            # LLM + MCP operators
 │   ├── llm/               # Pure LLM operators
 │   └── mcp/               # MCP-backed operators
 └── utils/                 # Utilities (LLM, logging)
+```
+
+## LangGraph Integration
+
+The chatbot uses LangGraph v1.0 for orchestration. Key concepts:
+
+### State Management
+
+```python
+from agentic_chatbot.graph.state import ChatState, create_initial_state
+
+# State is defined with TypedDict + Annotated reducers
+class ChatState(TypedDict, total=False):
+    messages: Annotated[list[BaseMessage], reduce_messages]  # Appends
+    tool_results: Annotated[list[ToolResult], reduce_tool_results]
+    # ... other fields
+```
+
+### Creating the Graph
+
+```python
+from agentic_chatbot.graph import create_chat_graph
+
+# Create compiled graph
+graph = create_chat_graph()
+
+# With checkpointer for persistence
+from langgraph.checkpoint.memory import MemorySaver
+graph = create_chat_graph(checkpointer=MemorySaver())
+
+# With human-in-the-loop interrupts
+graph = create_chat_graph(interrupt_before=["execute_tool"])
+```
+
+### Running the Graph
+
+```python
+# Async execution
+config = {"configurable": {"thread_id": "conversation-123"}}
+result = await graph.ainvoke(initial_state, config)
+
+# Streaming execution
+async for event in graph.astream(initial_state, config, stream_mode="updates"):
+    print(event)
 ```
 
 ## Development
@@ -142,8 +206,23 @@ make typecheck
 - **Builder Pattern**: Context assembly and workflow construction
 - **Chain of Responsibility**: Error handling layers
 - **Mediator Pattern**: Supervisor coordinates all components
-- **Template Method**: Base node with extension points
-- **Composite Pattern**: Flows containing sub-flows
+- **State Pattern**: LangGraph state management with reducers
+- **Composite Pattern**: Graph with conditional edges
+
+## Migration from PocketFlow
+
+The codebase has been migrated from PocketFlow to LangGraph v1.x:
+
+| PocketFlow | LangGraph |
+|------------|-----------|
+| `AsyncNode.prep_async()` | Node function receives state |
+| `AsyncNode.exec_async()` | Node function logic |
+| `AsyncNode.post_async()` | Node function returns state updates |
+| `node1 >> node2` | `builder.add_edge("node1", "node2")` |
+| `node - "action" >> next` | `builder.add_conditional_edges(...)` |
+| `AsyncFlow(start=node)` | `builder.compile()` |
+
+Legacy `flows/` and `nodes/` modules are kept for backwards compatibility but are deprecated.
 
 ## License
 
