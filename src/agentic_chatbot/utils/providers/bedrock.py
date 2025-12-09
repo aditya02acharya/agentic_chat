@@ -1,6 +1,5 @@
-"""AWS Bedrock provider for Claude models."""
+"""AWS Bedrock provider for Claude models using Converse API."""
 
-import json
 from typing import AsyncIterator
 
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
@@ -14,16 +13,17 @@ logger = get_logger(__name__)
 
 class BedrockProvider(BaseLLMProvider):
     """
-    AWS Bedrock provider for Claude models.
+    AWS Bedrock provider for Claude models using the Converse API.
 
-    Uses boto3 bedrock-runtime client to call Claude models via AWS Bedrock.
+    Uses the Bedrock Converse API which provides a unified interface
+    for conversational AI models across different providers.
 
     Features:
     - Model aliases mapped to Bedrock model IDs
     - Cross-region inference support
     - Automatic retry with exponential backoff
     - Usage tracking (tokens)
-    - Streaming support
+    - Streaming support via converse_stream
 
     Note: Requires AWS credentials configured via:
     - Environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)
@@ -85,6 +85,21 @@ class BedrockProvider(BaseLLMProvider):
         """Create a new aioboto3 session."""
         return self._aioboto3.Session(**self._session_kwargs)
 
+    def _build_messages(self, prompt: str) -> list[dict]:
+        """Build messages in Converse API format."""
+        return [
+            {
+                "role": "user",
+                "content": [{"text": prompt}],
+            }
+        ]
+
+    def _build_system(self, system: str) -> list[dict] | None:
+        """Build system prompt in Converse API format."""
+        if not system:
+            return None
+        return [{"text": system}]
+
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=1, max=10),
@@ -98,60 +113,61 @@ class BedrockProvider(BaseLLMProvider):
         max_tokens: int = 4096,
         temperature: float = 0.0,
     ) -> LLMResponse:
-        """Call Bedrock API and get complete response."""
+        """Call Bedrock Converse API and get complete response."""
         resolved_model = self.resolve_model(model)
 
         logger.debug(
-            "Calling Bedrock API",
+            "Calling Bedrock Converse API",
             model=resolved_model,
             region=self._region_name,
             prompt_length=len(prompt),
             system_length=len(system),
         )
 
-        # Build Anthropic messages format (Bedrock uses same format)
-        messages = [{"role": "user", "content": prompt}]
-
-        # Build request body
-        body = {
-            "anthropic_version": "bedrock-2023-05-31",
-            "max_tokens": max_tokens,
+        # Build request parameters
+        messages = self._build_messages(prompt)
+        inference_config = {
+            "maxTokens": max_tokens,
             "temperature": temperature,
-            "messages": messages,
         }
 
-        if system:
-            body["system"] = system
+        # Build request kwargs
+        request_kwargs = {
+            "modelId": resolved_model,
+            "messages": messages,
+            "inferenceConfig": inference_config,
+        }
+
+        # Add system prompt if provided
+        system_prompt = self._build_system(system)
+        if system_prompt:
+            request_kwargs["system"] = system_prompt
 
         session = self._create_session()
         async with session.client(
             "bedrock-runtime",
             region_name=self._region_name,
         ) as client:
-            response = await client.invoke_model(
-                modelId=resolved_model,
-                contentType="application/json",
-                accept="application/json",
-                body=json.dumps(body),
-            )
-
-            # Read response body
-            response_body = await response["body"].read()
-            result = json.loads(response_body)
+            response = await client.converse(**request_kwargs)
 
         # Extract content from response
         content = ""
-        if result.get("content") and len(result["content"]) > 0:
-            content = result["content"][0].get("text", "")
+        output = response.get("output", {})
+        message = output.get("message", {})
+        content_blocks = message.get("content", [])
+
+        for block in content_blocks:
+            if "text" in block:
+                content += block["text"]
 
         # Extract usage info
-        usage = result.get("usage", {})
-        input_tokens = usage.get("input_tokens", 0)
-        output_tokens = usage.get("output_tokens", 0)
-        stop_reason = result.get("stop_reason", "unknown")
+        usage = response.get("usage", {})
+        input_tokens = usage.get("inputTokens", 0)
+        output_tokens = usage.get("outputTokens", 0)
+        stop_reason = response.get("stopReason", "unknown")
 
         logger.debug(
-            "Bedrock response received",
+            "Bedrock Converse response received",
             model=resolved_model,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
@@ -175,58 +191,57 @@ class BedrockProvider(BaseLLMProvider):
         max_tokens: int = 4096,
         temperature: float = 0.0,
     ) -> AsyncIterator[str]:
-        """Stream response from Bedrock API."""
+        """Stream response from Bedrock Converse API."""
         resolved_model = self.resolve_model(model)
 
         logger.debug(
-            "Starting Bedrock stream",
+            "Starting Bedrock Converse stream",
             model=resolved_model,
             region=self._region_name,
             prompt_length=len(prompt),
         )
 
-        # Build Anthropic messages format
-        messages = [{"role": "user", "content": prompt}]
-
-        # Build request body
-        body = {
-            "anthropic_version": "bedrock-2023-05-31",
-            "max_tokens": max_tokens,
+        # Build request parameters
+        messages = self._build_messages(prompt)
+        inference_config = {
+            "maxTokens": max_tokens,
             "temperature": temperature,
-            "messages": messages,
         }
 
-        if system:
-            body["system"] = system
+        # Build request kwargs
+        request_kwargs = {
+            "modelId": resolved_model,
+            "messages": messages,
+            "inferenceConfig": inference_config,
+        }
+
+        # Add system prompt if provided
+        system_prompt = self._build_system(system)
+        if system_prompt:
+            request_kwargs["system"] = system_prompt
 
         session = self._create_session()
         async with session.client(
             "bedrock-runtime",
             region_name=self._region_name,
         ) as client:
-            response = await client.invoke_model_with_response_stream(
-                modelId=resolved_model,
-                contentType="application/json",
-                accept="application/json",
-                body=json.dumps(body),
-            )
+            response = await client.converse_stream(**request_kwargs)
 
             # Process event stream
-            async for event in response["body"]:
-                chunk = event.get("chunk")
-                if chunk:
-                    chunk_data = json.loads(chunk["bytes"])
+            async for event in response["stream"]:
+                # Handle content block delta events
+                if "contentBlockDelta" in event:
+                    delta = event["contentBlockDelta"].get("delta", {})
+                    if "text" in delta:
+                        text = delta["text"]
+                        if text:
+                            yield text
 
-                    # Handle different event types
-                    event_type = chunk_data.get("type")
-
-                    if event_type == "content_block_delta":
-                        delta = chunk_data.get("delta", {})
-                        if delta.get("type") == "text_delta":
-                            text = delta.get("text", "")
-                            if text:
-                                yield text
-
-                    elif event_type == "message_delta":
-                        # End of message, could extract stop_reason here
-                        pass
+                # messageStop and metadata events can be used for
+                # stop_reason and usage tracking if needed
+                elif "messageStop" in event:
+                    # Could extract stopReason here
+                    pass
+                elif "metadata" in event:
+                    # Could extract usage here
+                    pass
