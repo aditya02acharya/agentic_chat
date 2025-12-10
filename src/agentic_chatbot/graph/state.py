@@ -279,6 +279,10 @@ class ChatState(TypedDict, total=False):
     clarify_question: str | None  # Question for clarification
     response_chunks: Annotated[list[str], operator.add]  # For streaming
 
+    # Direct response tracking (operator/tool bypassed writer)
+    sent_direct_response: bool  # Whether operator sent response directly to user
+    direct_response_contents: list[Any]  # Content items sent directly
+
     # -------------------------------------------------------------------------
     # RUNTIME CONTEXT (not persisted to checkpointer)
     # -------------------------------------------------------------------------
@@ -366,6 +370,10 @@ def create_initial_state(
         final_response="",
         clarify_question=None,
         response_chunks=[],
+
+        # Direct response tracking
+        sent_direct_response=False,
+        direct_response_contents=[],
 
         # Runtime context
         event_emitter=event_emitter,

@@ -53,11 +53,13 @@ def create_chat_graph(
             ├── "call_tool" → execute_tool → reflect
             │                   ├── "satisfied" → synthesize → write → stream → END
             │                   ├── "need_more" → supervisor (loop)
-            │                   └── "blocked" → handle_blocked → write → stream → END
+            │                   ├── "blocked" → handle_blocked → write → stream → END
+            │                   └── "direct_response" → stream → END (operator bypassed writer)
             ├── "create_workflow" → plan_workflow → execute_workflow → reflect
             │                   ├── "satisfied" → synthesize → write → stream → END
             │                   ├── "need_more" → supervisor (loop)
-            │                   └── "blocked" → handle_blocked → write → stream → END
+            │                   ├── "blocked" → handle_blocked → write → stream → END
+            │                   └── "direct_response" → stream → END (operator bypassed writer)
             └── "clarify" → clarify → stream → END
 
     Workflow Execution Features:
@@ -66,6 +68,12 @@ def create_chat_graph(
         - Dependency resolution via topological sort
         - Input mapping with {{step_id.output}} templates
         - Per-step event emission for progress tracking
+
+    Direct Response Feature:
+        - Operators/tools can send content directly to users (bypass writer)
+        - Used for widgets, images, and other rich content
+        - When direct response is sent, flow skips synthesize/write nodes
+        - Operators set supports_direct_response=True in their capabilities
 
     Args:
         checkpointer: Optional checkpointer for persistence (MemorySaver, SqliteSaver, etc.)
@@ -133,6 +141,8 @@ def create_chat_graph(
     builder.add_edge("execute_workflow", "reflect")
 
     # Reflection conditional routing
+    # Note: "direct_response" route is for operators that already sent content
+    # directly to the user (bypassing the writer), so we skip to stream
     builder.add_conditional_edges(
         "reflect",
         route_reflection,
@@ -140,6 +150,7 @@ def create_chat_graph(
             "satisfied": "synthesize",
             "need_more": "supervisor",  # Loop back
             "blocked": "handle_blocked",
+            "direct_response": "stream",  # Skip synthesis/write, response already sent
         },
     )
 

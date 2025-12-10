@@ -52,7 +52,7 @@ from agentic_chatbot.graph.state import (
     get_data_chunks,
 )
 from agentic_chatbot.operators.registry import OperatorRegistry
-from agentic_chatbot.operators.context import OperatorContext
+from agentic_chatbot.operators.context import OperatorContext, MessagingContext
 from agentic_chatbot.utils.structured_llm import StructuredLLMCaller, StructuredOutputError
 from agentic_chatbot.utils.llm import LLMClient
 from agentic_chatbot.utils.logging import get_logger
@@ -286,7 +286,7 @@ async def supervisor_node(state: ChatState) -> dict[str, Any]:
 
 async def execute_tool_node(state: ChatState) -> dict[str, Any]:
     """
-    Execute a single tool/operator with context optimization.
+    Execute a single tool/operator with context optimization and messaging support.
 
     CONTEXT OPTIMIZATION:
     - Receives TaskContext from supervisor (focused task, not full conversation)
@@ -294,10 +294,18 @@ async def execute_tool_node(state: ChatState) -> dict[str, Any]:
     - Generates inline summary (using haiku for speed)
     - Returns both raw data (for synthesizer) and summary (for supervisor)
 
+    MESSAGING CAPABILITIES:
+    - Wires MessagingContext for operators that support:
+      - Progress updates
+      - Direct responses (bypass writer)
+      - User elicitation
+      - Rich content (images, widgets)
+
     Flow:
-    1. Execute tool with TaskContext
+    1. Execute tool with TaskContext and MessagingContext
     2. Store raw output as DataChunk (for synthesizer/writer citations)
     3. Generate inline summary (for supervisor decisions)
+    4. Track if operator sent direct response (skip writer if so)
     """
     decision = state.get("current_decision")
     if not decision or not decision.operator:
@@ -332,19 +340,40 @@ async def execute_tool_node(state: ChatState) -> dict[str, Any]:
 
         operator = operator_cls()
 
+        # Create MessagingContext for operators that support messaging capabilities
+        # This allows operators to send progress, direct responses, elicit input, etc.
+        emitter = get_emitter(state)
+        elicitation_manager = state.get("elicitation_manager")
+
+        messaging_context = MessagingContext(
+            emitter=emitter,
+            elicitation_manager=elicitation_manager,
+            request_id=state.get("request_id"),
+            operator_name=tool_name,
+        )
+
         # Create operator context with TaskContext (focused, not full conversation)
         # The operator receives the reformulated task, not the original query
+        query = task_context.task_description if task_context else state.get("user_query", "")
+
         context = OperatorContext(
-            user_query=task_context.task_description if task_context else state.get("user_query", ""),
-            params=params,
-            conversation_id=state.get("conversation_id", ""),
-            request_id=state.get("request_id", ""),
-            # Pass task context for operators that can use it
-            extra_context={
+            query=query,
+            recent_messages=[],  # Could be populated from state["messages"] if needed
+            conversation_summary="",
+            tool_schemas={},
+            step_results={},
+            extra={
+                "params": params,
                 "task_goal": task_context.goal if task_context else "",
                 "task_scope": task_context.scope if task_context else "",
+                "conversation_id": state.get("conversation_id", ""),
+                "request_id": state.get("request_id", ""),
             },
+            shared_store={},
         )
+
+        # Wire the messaging context to the operator context
+        context.set_messaging(messaging_context)
 
         # Execute operator
         result = await operator.execute(context)
@@ -363,13 +392,33 @@ async def execute_tool_node(state: ChatState) -> dict[str, Any]:
         # Generate unique source ID for citations
         source_id, updated_counter = generate_source_id(state, tool_name)
 
+        # Get result content - handle both old and new result formats
+        result_content = ""
+        result_success = True
+        result_error = None
+        result_metadata = {}
+
+        # Check if result is new OperatorResult with direct response support
+        if hasattr(result, "output"):
+            # New OperatorResult format
+            result_content = result.text_output if hasattr(result, "text_output") else str(result.output)
+            result_success = result.success
+            result_error = result.error
+            result_metadata = result.metadata if hasattr(result, "metadata") else {}
+        elif hasattr(result, "content"):
+            # Old format
+            result_content = result.content
+            result_success = getattr(result, "success", True)
+            result_error = getattr(result, "error", None)
+            result_metadata = getattr(result, "metadata", {})
+
         # Create DataChunk with raw content (for synthesizer/writer)
         data_chunk = DataChunk(
             source_id=source_id,
             source_type=tool_name,
-            content=result.content if result.success else f"Error: {result.error}",
+            content=result_content if result_success else f"Error: {result_error}",
             query_used=task_context.task_description if task_context else state.get("user_query", ""),
-            metadata=result.metadata,
+            metadata=result_metadata,
         )
 
         # Generate inline summary (for supervisor) - uses haiku for speed
@@ -379,21 +428,38 @@ async def execute_tool_node(state: ChatState) -> dict[str, Any]:
             task_description=task_desc,
         )
 
+        # === MESSAGING: Check for direct responses ===
+        # If the operator sent content directly to the user, track it
+        sent_direct_response = False
+        direct_response_contents = []
+
+        # Check if operator result indicates direct response was sent
+        if hasattr(result, "sent_direct_response") and result.sent_direct_response:
+            sent_direct_response = True
+            if hasattr(result, "direct_responses"):
+                direct_response_contents = result.direct_responses
+
+        # Also check the messaging context for direct responses
+        if messaging_context.has_direct_responses:
+            sent_direct_response = True
+            direct_response_contents.extend(messaging_context.direct_responses)
+
         logger.info(
             "Tool executed with context optimization",
             tool=tool_name,
             source_id=source_id,
             has_summary=bool(data_summary.key_findings),
+            sent_direct_response=sent_direct_response,
         )
 
         return {
             "tool_results": [
                 ToolResult(
                     tool_name=tool_name,
-                    success=result.success,
-                    content=result.content,
-                    error=result.error,
-                    metadata=result.metadata,
+                    success=result_success,
+                    content=result_content,
+                    error=result_error,
+                    metadata=result_metadata,
                 )
             ],
             "current_tool": None,
@@ -401,6 +467,9 @@ async def execute_tool_node(state: ChatState) -> dict[str, Any]:
             "data_chunks": [data_chunk],
             "data_summaries": [data_summary],
             "source_counter": updated_counter,
+            # Direct response tracking
+            "sent_direct_response": sent_direct_response,
+            "direct_response_contents": direct_response_contents,
         }
 
     except Exception as e:
@@ -850,10 +919,30 @@ async def stream_node(state: ChatState) -> dict[str, Any]:
     """
     Stream the final response to the user via SSE.
 
+    Handles two scenarios:
+    1. Normal flow: Stream the final_response in chunks
+    2. Direct response: Operator already sent content directly, just emit completion
+
     Emits response chunks and completion event.
     """
-    response = state.get("final_response", "")
     request_id = state.get("request_id")
+
+    # Check if direct response was already sent
+    if state.get("sent_direct_response"):
+        # Operator already sent content directly to user
+        # Just emit completion event
+        logger.info(
+            "Direct response was sent by operator, skipping response streaming",
+            request_id=request_id,
+        )
+        await emit_event(
+            state,
+            ResponseDoneEvent.create(request_id=request_id),
+        )
+        return {"response_chunks": ["[Direct response sent by operator]"]}
+
+    # Normal flow: stream the final response
+    response = state.get("final_response", "")
 
     # Stream response in chunks
     chunk_size = 50
@@ -947,8 +1036,17 @@ def route_supervisor_decision(state: ChatState) -> Literal["answer", "call_tool"
     return action_map.get(decision.action, "clarify")
 
 
-def route_reflection(state: ChatState) -> Literal["satisfied", "need_more", "blocked"]:
-    """Route based on reflection result."""
+def route_reflection(state: ChatState) -> Literal["satisfied", "need_more", "blocked", "direct_response"]:
+    """
+    Route based on reflection result.
+
+    If a direct response was already sent to the user (operator bypassed writer),
+    route to 'direct_response' which skips synthesis and write nodes.
+    """
+    # Check if direct response was already sent
+    if state.get("sent_direct_response"):
+        return "direct_response"
+
     reflection = state.get("reflection")
     if not reflection:
         return "satisfied"
