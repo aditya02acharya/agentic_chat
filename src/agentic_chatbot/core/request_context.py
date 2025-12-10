@@ -4,8 +4,9 @@ import asyncio
 from typing import Any, Callable, Awaitable
 from uuid import uuid4
 
-from ..events.models import Event
-from ..utils.logging import get_logger
+from agentic_chatbot.events.models import Event
+from agentic_chatbot.utils.logging import get_logger
+
 
 logger = get_logger(__name__)
 
@@ -18,6 +19,8 @@ class RequestContext:
     - __slots__ prevents accidental attribute addition
     - Cleanup callbacks for resource management
     - Context manager support
+
+    Design Pattern: Context Manager for resource lifecycle
     """
 
     __slots__ = (
@@ -30,9 +33,22 @@ class RequestContext:
         "_closed",
     )
 
-    def __init__(self, conversation_id: str, user_query: str):
+    def __init__(
+        self,
+        conversation_id: str,
+        user_query: str,
+        request_id: str | None = None,
+    ):
+        """
+        Initialize request context.
+
+        Args:
+            conversation_id: Conversation identifier
+            user_query: User's query text
+            request_id: Optional request ID (generated if not provided)
+        """
         self.conversation_id = conversation_id
-        self.request_id = str(uuid4())
+        self.request_id = request_id or str(uuid4())
         self.user_query = user_query
         self.event_queue: asyncio.Queue[Event] = asyncio.Queue()
         self.shared_store: dict[str, Any] = {}
@@ -40,15 +56,15 @@ class RequestContext:
         self._closed = False
 
     def register_cleanup(self, callback: Callable[[], Awaitable[None]]) -> None:
-        """Register cleanup callback."""
+        """
+        Register cleanup callback.
+
+        Args:
+            callback: Async function to call during cleanup
+        """
         if self._closed:
             raise RuntimeError("Context already closed")
         self._cleanup_callbacks.append(callback)
-
-    async def emit_event(self, event: Event) -> None:
-        """Emit event to the queue."""
-        event.request_id = self.request_id
-        await self.event_queue.put(event)
 
     async def cleanup(self) -> None:
         """Run all cleanup callbacks. Idempotent."""
@@ -56,6 +72,9 @@ class RequestContext:
             return
         self._closed = True
 
+        logger.debug("Cleaning up request context", request_id=self.request_id)
+
+        # Run callbacks in reverse order (LIFO)
         for callback in reversed(self._cleanup_callbacks):
             try:
                 await callback()
@@ -65,6 +84,7 @@ class RequestContext:
         self._cleanup_callbacks.clear()
         self.shared_store.clear()
 
+        # Drain event queue
         while not self.event_queue.empty():
             try:
                 self.event_queue.get_nowait()
@@ -72,7 +92,26 @@ class RequestContext:
                 break
 
     async def __aenter__(self) -> "RequestContext":
+        """Enter async context."""
         return self
 
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        """Exit async context with cleanup."""
         await self.cleanup()
+
+    @property
+    def is_closed(self) -> bool:
+        """Check if context is closed."""
+        return self._closed
+
+    def get(self, key: str, default: Any = None) -> Any:
+        """Get value from shared store."""
+        return self.shared_store.get(key, default)
+
+    def set(self, key: str, value: Any) -> None:
+        """Set value in shared store."""
+        self.shared_store[key] = value
+
+    def update(self, data: dict[str, Any]) -> None:
+        """Update shared store with multiple values."""
+        self.shared_store.update(data)

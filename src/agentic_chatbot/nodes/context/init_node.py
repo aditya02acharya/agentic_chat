@@ -2,41 +2,88 @@
 
 from typing import Any
 
-from ..base import AsyncBaseNode
-from ...events.types import EventType
-from ...utils.logging import get_logger
+from agentic_chatbot.context.memory import ConversationMemory
+from agentic_chatbot.context.results import ResultStore
+from agentic_chatbot.context.actions import ActionHistory
+from agentic_chatbot.core.supervisor import SupervisorState
+from agentic_chatbot.nodes.base import AsyncBaseNode
+from agentic_chatbot.utils.logging import get_logger
+
 
 logger = get_logger(__name__)
 
 
 class InitializeNode(AsyncBaseNode):
     """
-    Initializes the shared state for a chat request.
+    Initialize request context and shared store.
+
+    Type: Context Node
+
+    Sets up all required components in the shared store
+    for the chat flow to operate.
     """
 
-    name = "initialize"
+    node_name = "initialize"
+    description = "Initialize request context"
 
-    async def execute(self, shared: dict[str, Any]) -> str:
-        shared["query"] = self.ctx.user_query
-        shared["conversation_id"] = self.ctx.conversation_id
-        shared["request_id"] = self.ctx.request_id
-        shared["iteration"] = 0
-        shared["max_iterations"] = 5
-        shared["previous_results"] = []
-        shared["action_history"] = ""
-        shared["decision"] = None
-        shared["reflection"] = None
-        shared["synthesized_content"] = None
-        shared["final_response"] = None
+    async def prep_async(self, shared: dict[str, Any]) -> dict[str, Any]:
+        """Get initialization parameters."""
+        return {
+            "conversation_id": shared.get("conversation_id", ""),
+            "request_id": shared.get("request_id", ""),
+            "user_query": shared.get("user_query", ""),
+        }
 
-        await self.emit_event(
-            EventType.THINKING_START,
-            {"phase": "initialization", "query": self.ctx.user_query[:100]},
-        )
+    async def exec_async(self, prep_res: dict[str, Any]) -> dict[str, Any]:
+        """Create context components."""
+        # Create fresh components for this request
+        return {
+            "memory": ConversationMemory(window_size=5),
+            "result_store": ResultStore(),
+            "action_history": ActionHistory(),
+            "supervisor_state": SupervisorState(max_iterations=5),
+        }
+
+    async def post_async(
+        self,
+        shared: dict[str, Any],
+        prep_res: dict[str, Any],
+        exec_res: dict[str, Any],
+    ) -> str | None:
+        """Store components in shared."""
+        # Initialize memory (may already exist from previous turns)
+        if "memory" not in shared:
+            shared["memory"] = exec_res["memory"]
+
+        # Always create fresh for new request
+        shared["result_store"] = exec_res["result_store"]
+        shared["action_history"] = exec_res["action_history"]
+
+        # Supervisor state
+        shared.setdefault("supervisor", {})
+        shared["supervisor"]["state"] = exec_res["supervisor_state"]
+        shared["supervisor"]["current_decision"] = None
+
+        # Results container
+        shared["results"] = {
+            "tool_outputs": [],
+            "workflow_output": None,
+            "synthesis": None,
+            "final_response": None,
+        }
+
+        # Reflection container
+        shared["reflection"] = {}
+
+        # Add user message to memory
+        memory = shared["memory"]
+        if hasattr(memory, "add_message"):
+            memory.add_message("user", prep_res["user_query"])
 
         logger.info(
-            f"Initialized request {self.ctx.request_id}",
-            query=self.ctx.user_query[:50],
+            "Request initialized",
+            conversation_id=prep_res["conversation_id"],
+            request_id=prep_res["request_id"],
         )
 
-        return "fetch_tools"
+        return "default"

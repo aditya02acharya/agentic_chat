@@ -1,68 +1,111 @@
 """FastAPI application entry point."""
 
-import asyncio
-import signal
 from contextlib import asynccontextmanager
+from typing import AsyncIterator
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from .api.routes import router
-from .api.dependencies import set_app_instance
-from .app import Application
-from .config.settings import get_settings
-from .utils.logging import setup_logging, get_logger
+from agentic_chatbot import __version__
+from agentic_chatbot.api.routes import router
+from agentic_chatbot.app import app_instance, setup_signal_handlers
+from agentic_chatbot.config.settings import get_settings
+from agentic_chatbot.utils.logging import configure_logging, get_logger
 
-application = Application()
+# Import operators to trigger registration
+from agentic_chatbot.operators.llm import (  # noqa: F401
+    QueryRewriterOperator,
+    SynthesizerOperator,
+    WriterOperator,
+    AnalyzerOperator,
+)
+from agentic_chatbot.operators.mcp import (  # noqa: F401
+    RAGRetrieverOperator,
+    WebSearcherOperator,
+)
+from agentic_chatbot.operators.hybrid import CoderOperator  # noqa: F401
+
+
 logger = get_logger(__name__)
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Application lifespan manager."""
-    settings = get_settings()
-    setup_logging(settings.log_level)
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """
+    Application lifespan manager.
 
-    set_app_instance(application)
-    await application.startup()
+    Handles startup and shutdown events.
+    """
+    # Startup
+    await app_instance.startup()
+
+    # Store references in app state
+    app.state.mcp_server_registry = app_instance.mcp_server_registry
+    app.state.mcp_client_manager = app_instance.mcp_client_manager
+    app.state.active_requests = app_instance.active_requests
+    app.state.is_shutting_down = False
+
+    # Setup signal handlers
+    setup_signal_handlers(app_instance)
 
     yield
 
-    await application.shutdown()
+    # Shutdown
+    app.state.is_shutting_down = True
+    await app_instance.shutdown()
 
 
 def create_app() -> FastAPI:
-    """Create and configure the FastAPI application."""
+    """
+    Create and configure FastAPI application.
+
+    Returns:
+        Configured FastAPI application
+    """
     settings = get_settings()
+    configure_logging(settings.log_level)
 
     app = FastAPI(
-        title="Agentic Chatbot Backend",
-        description="A ReACT-based supervisor with MCP integration",
-        version="0.1.0",
+        title="Agentic Chatbot API",
+        description="ReACT-based agentic chatbot with MCP integration",
+        version=__version__,
         lifespan=lifespan,
     )
 
+    # Add CORS middleware
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
+        allow_origins=["*"],  # Configure appropriately for production
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
     )
 
-    app.include_router(router)
+    # Include routes
+    app.include_router(router, prefix="/api/v1")
+
+    # Root endpoint
+    @app.get("/")
+    async def root():
+        return {
+            "name": "Agentic Chatbot API",
+            "version": __version__,
+            "docs": "/docs",
+        }
 
     return app
 
 
+# Create application instance
 app = create_app()
 
 
-def main():
-    """Run the application."""
+def main() -> None:
+    """Entry point for running the application."""
     import uvicorn
 
     settings = get_settings()
+
     uvicorn.run(
         "agentic_chatbot.main:app",
         host=settings.host,

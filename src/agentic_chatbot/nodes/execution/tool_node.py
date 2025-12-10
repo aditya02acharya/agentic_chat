@@ -1,92 +1,206 @@
-"""Execute tool node."""
+"""Execute tool node for running single operators."""
 
 from typing import Any
 
-from ..base import AsyncBaseNode
-from ...operators.registry import OperatorRegistry
-from ...operators.context import OperatorContext
-from ...context.assembler import ContextAssembler
-from ...mcp.session import MCPSessionManager
-from ...events.types import EventType
-from ...utils.logging import get_logger
+from agentic_chatbot.core.exceptions import OperatorError
+from agentic_chatbot.events.models import ToolStartEvent, ToolCompleteEvent, ToolErrorEvent
+from agentic_chatbot.mcp.callbacks import MCPCallbacks
+from agentic_chatbot.nodes.base import AsyncBaseNode
+from agentic_chatbot.operators.base import OperatorType
+from agentic_chatbot.operators.registry import OperatorRegistry
+from agentic_chatbot.operators.context import OperatorContext, OperatorResult
+from agentic_chatbot.utils.logging import get_logger
+
 
 logger = get_logger(__name__)
 
 
 class ExecuteToolNode(AsyncBaseNode):
     """
-    Executes a single operator/tool.
+    Execute single operator with focused context.
 
-    Handles context building and operator invocation.
+    Type: Execution Node (with retry via PocketFlow)
+
+    Runs the operator specified in the supervisor's decision,
+    handling both pure LLM and MCP-backed operators.
     """
 
-    name = "execute_tool"
+    node_name = "execute_tool"
+    description = "Execute a single operator"
 
-    async def execute(self, shared: dict[str, Any]) -> str:
-        decision = shared.get("decision")
-        if not decision or not decision.operator:
-            logger.warning("No operator specified in decision")
-            return "observe"
+    def __init__(self, max_retries: int = 2, **kwargs: Any):
+        """Initialize with retry config."""
+        super().__init__(max_retries=max_retries, **kwargs)
+
+    async def prep_async(self, shared: dict[str, Any]) -> dict[str, Any]:
+        """Prepare operator context."""
+        decision = shared.get("supervisor", {}).get("current_decision")
+        if not decision:
+            raise OperatorError("No decision available")
 
         operator_name = decision.operator
-        params = decision.params or {}
+        if not operator_name:
+            raise OperatorError("No operator specified in decision")
 
-        await self.emit_event(
-            EventType.TOOL_START,
-            {"operator": operator_name, "params": params},
+        # Get operator
+        try:
+            operator = OperatorRegistry.create(operator_name)
+        except KeyError:
+            raise OperatorError(f"Unknown operator: {operator_name}")
+
+        # Build context for operator
+        context = OperatorContext(
+            query=shared.get("user_query", ""),
+            recent_messages=shared.get("recent_messages", []),
+            conversation_summary=shared.get("memory", {}).get("summary", "")
+            if isinstance(shared.get("memory"), dict)
+            else "",
+            shared_store=shared,
         )
 
-        try:
-            operator = OperatorRegistry.get(operator_name)
-        except ValueError as e:
-            logger.error(f"Unknown operator: {operator_name}")
-            shared["latest_result"] = f"Error: Unknown operator {operator_name}"
-            return "observe"
+        # Add params from decision
+        if decision.params:
+            context.extra.update(decision.params)
 
-        assembler = ContextAssembler(
-            query=shared.get("query", self.ctx.user_query),
-        ).with_params(params)
+        # Emit start event
+        await self.emit_event(
+            shared,
+            ToolStartEvent.create(
+                tool=operator_name,
+                message=f"Running {operator.description}",
+                request_id=shared.get("request_id"),
+            ),
+        )
 
-        context = assembler.build(operator.context_requirements)
+        return {
+            "operator": operator,
+            "operator_name": operator_name,
+            "context": context,
+            "shared": shared,
+        }
 
+    async def exec_async(self, prep_res: dict[str, Any]) -> OperatorResult:
+        """Execute the operator."""
+        operator = prep_res["operator"]
+        context = prep_res["context"]
+        shared = prep_res["shared"]
+
+        # Get MCP session if needed
         mcp_session = None
         if operator.requires_mcp:
-            session_manager = shared.get("mcp_session_manager")
+            session_manager = shared.get("mcp", {}).get("session_manager")
             if session_manager:
-                mcp_session = session_manager.create_session()
+                # Create callbacks for event streaming
+                callbacks = self._create_callbacks(shared)
 
-        try:
-            result = await operator.execute(context, mcp_session)
-            shared["latest_result"] = result.output if result.success else result.error
+                # Get session for operator's tools
+                if operator.mcp_tools:
+                    tool_name = operator.mcp_tools[0]
+                    async with session_manager.session_for_tool(
+                        tool_name, callbacks
+                    ) as session:
+                        return await operator.execute(context, session)
+                else:
+                    logger.warning("Operator requires MCP but no tools specified")
 
-            if result.success:
-                await self.emit_event(
-                    EventType.TOOL_RESULT,
-                    {
-                        "operator": operator_name,
-                        "success": True,
-                        "duration_ms": result.duration_ms,
-                    },
-                )
-            else:
-                await self.emit_event(
-                    EventType.TOOL_ERROR,
-                    {
-                        "operator": operator_name,
-                        "error": result.error,
-                    },
-                )
+        # Execute operator (may be pure LLM)
+        return await operator.execute(context, mcp_session)
 
-        except Exception as e:
-            logger.error(f"Operator {operator_name} failed: {e}", exc_info=True)
-            shared["latest_result"] = f"Error: {str(e)}"
+    async def post_async(
+        self,
+        shared: dict[str, Any],
+        prep_res: dict[str, Any],
+        exec_res: OperatorResult,
+    ) -> str | None:
+        """Store result and emit completion event."""
+        operator_name = prep_res["operator_name"]
+
+        # Store result
+        shared.setdefault("results", {})
+        shared["results"].setdefault("tool_outputs", []).append(exec_res)
+
+        # Emit completion or error event
+        if exec_res.success:
             await self.emit_event(
-                EventType.TOOL_ERROR,
-                {"operator": operator_name, "error": str(e)},
+                shared,
+                ToolCompleteEvent.create(
+                    tool=operator_name,
+                    content_count=len(exec_res.contents) + (1 if exec_res.output else 0),
+                    request_id=shared.get("request_id"),
+                ),
+            )
+        else:
+            await self.emit_event(
+                shared,
+                ToolErrorEvent.create(
+                    tool=operator_name,
+                    error=exec_res.error or "Unknown error",
+                    request_id=shared.get("request_id"),
+                ),
             )
 
-        finally:
-            if mcp_session:
-                await mcp_session.close()
+        logger.info(
+            "Tool execution complete",
+            operator=operator_name,
+            success=exec_res.success,
+        )
 
-        return "observe"
+        return "default"
+
+    async def exec_fallback_async(self, prep_res: Any, exc: Exception) -> OperatorResult:
+        """Handle execution failure."""
+        operator_name = prep_res.get("operator_name", "unknown")
+        logger.error(f"Tool execution failed: {operator_name}", error=str(exc))
+
+        return OperatorResult.error_result(
+            error=f"Operator {operator_name} failed: {str(exc)}"
+        )
+
+    def _create_callbacks(self, shared: dict[str, Any]) -> MCPCallbacks:
+        """Create MCP callbacks for event streaming."""
+        from agentic_chatbot.events.models import ToolProgressEvent, ToolContentEvent
+
+        async def on_progress(
+            server_id: str, tool_name: str, progress: float, message: str
+        ) -> None:
+            await self.emit_event(
+                shared,
+                ToolProgressEvent.create(
+                    tool=tool_name,
+                    progress=progress,
+                    message=message,
+                    request_id=shared.get("request_id"),
+                ),
+            )
+
+        async def on_content(
+            server_id: str, tool_name: str, content: Any, content_type: str
+        ) -> None:
+            await self.emit_event(
+                shared,
+                ToolContentEvent.create(
+                    tool=tool_name,
+                    content_type=content_type,
+                    data=content,
+                    request_id=shared.get("request_id"),
+                ),
+            )
+
+        async def on_error(
+            server_id: str, tool_name: str, error: str, error_type: str
+        ) -> None:
+            await self.emit_event(
+                shared,
+                ToolErrorEvent.create(
+                    tool=tool_name,
+                    error=error,
+                    error_type=error_type,
+                    request_id=shared.get("request_id"),
+                ),
+            )
+
+        return MCPCallbacks(
+            on_progress=on_progress,
+            on_content=on_content,
+            on_error=on_error,
+        )

@@ -1,16 +1,20 @@
-"""Event bus implementations."""
+"""Event bus for application-wide event handling."""
 
 import asyncio
+import fnmatch
+import uuid
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from typing import Callable, Any
+from typing import Callable, Awaitable
 
-from .models import Event
-from ..utils.logging import get_logger
+from agentic_chatbot.events.models import Event
+from agentic_chatbot.utils.logging import get_logger
+
 
 logger = get_logger(__name__)
 
-EventHandler = Callable[[Event], Any]
+
+EventHandler = Callable[[Event], Awaitable[None]] | Callable[[Event], None]
 
 
 class EventBus(ABC):
@@ -18,22 +22,25 @@ class EventBus(ABC):
     Event bus interface.
 
     Design Pattern: Observer + Strategy
+
+    Current implementation: In-memory (AsyncIOEventBus)
+    Future option: Redis-backed for multi-instance deployment
     """
 
     @abstractmethod
     async def publish(self, event: Event) -> None:
         """Publish event to all subscribers."""
-        pass
+        ...
 
     @abstractmethod
     def subscribe(self, pattern: str, handler: EventHandler) -> str:
         """Subscribe to events matching pattern. Returns subscription ID."""
-        pass
+        ...
 
     @abstractmethod
     def unsubscribe(self, subscription_id: str) -> bool:
         """Unsubscribe handler."""
-        pass
+        ...
 
 
 class AsyncIOEventBus(EventBus):
@@ -45,43 +52,54 @@ class AsyncIOEventBus(EventBus):
     """
 
     def __init__(self):
+        # pattern -> list of (subscription_id, handler)
         self._handlers: dict[str, list[tuple[str, EventHandler]]] = defaultdict(list)
+        self._subscription_map: dict[str, str] = {}  # subscription_id -> pattern
         self._lock = asyncio.Lock()
-        self._counter = 0
 
     async def publish(self, event: Event) -> None:
         """Publish to matching handlers."""
         handlers = await self._get_matching_handlers(event.event_type.value)
 
+        # Fire-and-forget for non-blocking
         for _, handler in handlers:
             asyncio.create_task(self._safe_call(handler, event))
 
     def subscribe(self, pattern: str, handler: EventHandler) -> str:
-        """Subscribe to events matching pattern."""
-        self._counter += 1
-        sub_id = f"bus_sub_{self._counter}"
-        self._handlers[pattern].append((sub_id, handler))
-        return sub_id
+        """
+        Subscribe to events matching pattern.
+
+        Pattern supports wildcards:
+        - "supervisor.*" matches supervisor.thinking, supervisor.decided
+        - "tool.*" matches tool.start, tool.complete, etc.
+        - "*" matches all events
+
+        Returns subscription ID for unsubscribing.
+        """
+        subscription_id = str(uuid.uuid4())
+        self._handlers[pattern].append((subscription_id, handler))
+        self._subscription_map[subscription_id] = pattern
+        return subscription_id
 
     def unsubscribe(self, subscription_id: str) -> bool:
-        """Remove handler by subscription ID."""
-        for pattern, handlers in self._handlers.items():
-            for i, (sub_id, _) in enumerate(handlers):
-                if sub_id == subscription_id:
-                    handlers.pop(i)
-                    return True
-        return False
+        """Unsubscribe handler by ID."""
+        if subscription_id not in self._subscription_map:
+            return False
 
-    async def _get_matching_handlers(
-        self, event_type: str
-    ) -> list[tuple[str, EventHandler]]:
-        """Get handlers matching event type."""
+        pattern = self._subscription_map.pop(subscription_id)
+        self._handlers[pattern] = [
+            (sid, h) for sid, h in self._handlers[pattern] if sid != subscription_id
+        ]
+        return True
+
+    async def _get_matching_handlers(self, event_type: str) -> list[tuple[str, EventHandler]]:
+        """Get all handlers matching the event type."""
         async with self._lock:
-            matching = []
-            for pattern, handlers in self._handlers.items():
-                if self._pattern_matches(pattern, event_type):
-                    matching.extend(handlers)
-            return matching
+            handlers = []
+            for pattern, pattern_handlers in self._handlers.items():
+                if fnmatch.fnmatch(event_type, pattern):
+                    handlers.extend(pattern_handlers)
+            return handlers
 
     async def _safe_call(self, handler: EventHandler, event: Event) -> None:
         """Call handler with error isolation."""
@@ -92,14 +110,3 @@ class AsyncIOEventBus(EventBus):
                 handler(event)
         except Exception as e:
             logger.error(f"Event handler error: {e}", exc_info=True)
-
-    def _pattern_matches(self, pattern: str, event_type: str) -> bool:
-        """Check if pattern matches event type."""
-        if pattern == "*":
-            return True
-        if pattern == event_type:
-            return True
-        if pattern.endswith(".*"):
-            prefix = pattern[:-2]
-            return event_type.startswith(prefix + ".")
-        return False

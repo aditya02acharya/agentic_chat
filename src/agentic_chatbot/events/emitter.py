@@ -1,102 +1,74 @@
 """Event emitter for publishing events."""
 
 import asyncio
-from typing import Callable, Any
+from typing import Callable, Awaitable
 
-from .models import Event
-from .types import EventType
-from ..utils.logging import get_logger
+from agentic_chatbot.events.models import Event
 
-logger = get_logger(__name__)
 
-EventHandler = Callable[[Event], Any]
+EventHandler = Callable[[Event], Awaitable[None]] | Callable[[Event], None]
 
 
 class EventEmitter:
     """
-    Publish events to subscribers.
+    Simple event emitter for request-scoped event handling.
 
     Design Pattern: Observer Pattern
 
-    Used to emit SSE events for real-time progress updates.
+    Each request gets its own EventEmitter instance that routes
+    events to the SSE queue and any registered handlers.
     """
 
-    def __init__(self):
-        self._handlers: dict[str, list[tuple[str, EventHandler]]] = {}
-        self._handler_counter = 0
-
-    def subscribe(self, pattern: str, handler: EventHandler) -> str:
+    def __init__(self, event_queue: asyncio.Queue[Event] | None = None):
         """
-        Subscribe to events matching pattern.
+        Initialize event emitter.
 
         Args:
-            pattern: Event type pattern (e.g., "tool.*", "response.chunk")
-            handler: Callback function to handle events
-
-        Returns:
-            Subscription ID for unsubscribing
+            event_queue: Optional queue for SSE streaming
         """
-        self._handler_counter += 1
-        sub_id = f"sub_{self._handler_counter}"
+        self._queue = event_queue
+        self._handlers: list[EventHandler] = []
 
-        if pattern not in self._handlers:
-            self._handlers[pattern] = []
-        self._handlers[pattern].append((sub_id, handler))
+    def subscribe(self, handler: EventHandler) -> None:
+        """Subscribe a handler to receive all events."""
+        self._handlers.append(handler)
 
-        return sub_id
+    def unsubscribe(self, handler: EventHandler) -> None:
+        """Unsubscribe a handler."""
+        if handler in self._handlers:
+            self._handlers.remove(handler)
 
-    def unsubscribe(self, subscription_id: str) -> bool:
-        """Unsubscribe a handler by subscription ID."""
-        for pattern, handlers in self._handlers.items():
-            for i, (sub_id, _) in enumerate(handlers):
-                if sub_id == subscription_id:
-                    handlers.pop(i)
-                    return True
-        return False
+    async def emit(self, event: Event) -> None:
+        """
+        Emit an event to the queue and all handlers.
 
-    def emit(self, event: Event) -> None:
-        """Emit event synchronously to all matching handlers."""
-        handlers = self._get_matching_handlers(event.event_type)
-        for _, handler in handlers:
-            try:
-                result = handler(event)
-                if asyncio.iscoroutine(result):
-                    asyncio.create_task(result)
-            except Exception as e:
-                logger.error(f"Event handler error: {e}", exc_info=True)
+        Args:
+            event: Event to emit
+        """
+        # Send to SSE queue if configured
+        if self._queue is not None:
+            await self._queue.put(event)
 
-    async def emit_async(self, event: Event) -> None:
-        """Emit event asynchronously to all matching handlers."""
-        handlers = self._get_matching_handlers(event.event_type)
-        for _, handler in handlers:
+        # Notify all handlers
+        for handler in self._handlers:
             try:
                 if asyncio.iscoroutinefunction(handler):
                     await handler(event)
                 else:
                     handler(event)
-            except Exception as e:
-                logger.error(f"Event handler error: {e}", exc_info=True)
+            except Exception:
+                # Don't let handler errors break event flow
+                pass
 
-    def _get_matching_handlers(
-        self, event_type: EventType
-    ) -> list[tuple[str, EventHandler]]:
-        """Get handlers matching the event type."""
-        matching = []
-        event_str = event_type.value
+    def emit_sync(self, event: Event) -> None:
+        """
+        Emit an event synchronously (non-blocking).
 
-        for pattern, handlers in self._handlers.items():
-            if self._pattern_matches(pattern, event_str):
-                matching.extend(handlers)
-
-        return matching
-
-    def _pattern_matches(self, pattern: str, event_type: str) -> bool:
-        """Check if pattern matches event type."""
-        if pattern == "*":
-            return True
-        if pattern == event_type:
-            return True
-        if pattern.endswith(".*"):
-            prefix = pattern[:-2]
-            return event_type.startswith(prefix + ".")
-        return False
+        Creates a task to handle async emission.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self.emit(event))
+        except RuntimeError:
+            # No running loop, skip emission
+            pass

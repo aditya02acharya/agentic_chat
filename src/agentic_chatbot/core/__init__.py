@@ -1,26 +1,29 @@
-"""Core domain module."""
+"""Core domain modules."""
 
-from .exceptions import (
+from agentic_chatbot.core.exceptions import (
     AgenticChatbotError,
     OperatorError,
     WorkflowError,
     MCPError,
+    ContextError,
     SupervisorError,
+    ValidationError,
 )
-from .request_context import RequestContext
-from .supervisor import SupervisorDecision, SupervisorAction
-from .workflow import WorkflowDefinition, WorkflowStep, StepResult
+from agentic_chatbot.core.request_context import RequestContext
+from agentic_chatbot.core.supervisor import SupervisorDecision, SupervisorAction
 
 __all__ = [
+    # Exceptions
     "AgenticChatbotError",
     "OperatorError",
     "WorkflowError",
     "MCPError",
+    "ContextError",
     "SupervisorError",
+    "ValidationError",
+    # Context
     "RequestContext",
+    # Supervisor
     "SupervisorDecision",
     "SupervisorAction",
-    "WorkflowDefinition",
-    "WorkflowStep",
-    "StepResult",
 ]

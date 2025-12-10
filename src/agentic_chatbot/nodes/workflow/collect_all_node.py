@@ -1,44 +1,112 @@
-"""Collect all results node."""
+"""Collect all results node for gathering workflow outputs."""
 
 from typing import Any
 
-from ..base import AsyncBaseNode
-from ...core.workflow import WorkflowResult
-from ...events.types import EventType
-from ...utils.logging import get_logger
+from agentic_chatbot.core.workflow import WorkflowStatus, WorkflowResult
+from agentic_chatbot.events.models import WorkflowCompleteEvent
+from agentic_chatbot.nodes.base import AsyncBaseNode
+from agentic_chatbot.utils.logging import get_logger
+
 
 logger = get_logger(__name__)
 
 
 class CollectAllResultsNode(AsyncBaseNode):
     """
-    Collects all workflow step results.
+    Gather all step outputs into workflow result.
+
+    Type: Workflow Node
+
+    Collects results from all completed steps and
+    builds the final WorkflowResult.
     """
 
-    name = "collect_all"
+    node_name = "collect_all_results"
+    description = "Collect all workflow step results"
 
-    async def execute(self, shared: dict[str, Any]) -> str:
-        workflow = shared.get("workflow")
-        step_results = shared.get("step_results", {})
+    async def prep_async(self, shared: dict[str, Any]) -> dict[str, Any]:
+        """Get workflow state with results."""
+        workflow = shared.get("workflow", {})
+        definition = workflow.get("definition")
+        state = workflow.get("state")
 
-        if workflow:
-            workflow_result = WorkflowResult(
-                definition=workflow,
-                step_results=step_results,
-                status="completed",
-            )
-            shared["workflow_result"] = workflow_result
+        if not definition or not state:
+            return {"error": "No workflow state"}
 
-            outputs = []
-            for result in step_results.values():
-                if result.output:
-                    outputs.append(str(result.output))
+        return {
+            "goal": definition.goal,
+            "step_results": state.step_results,
+            "expected_steps": [s.id for s in definition.steps],
+        }
 
-            shared["previous_results"] = outputs
+    async def exec_async(self, prep_res: dict[str, Any]) -> dict[str, Any]:
+        """Build workflow result."""
+        if "error" in prep_res:
+            return prep_res
 
-        await self.emit_event(
-            EventType.WORKFLOW_COMPLETE,
-            {"step_count": len(step_results)},
+        goal = prep_res["goal"]
+        step_results = prep_res["step_results"]
+        expected_steps = prep_res["expected_steps"]
+
+        # Check completion
+        completed_steps = set(step_results.keys())
+        missing_steps = set(expected_steps) - completed_steps
+
+        # Check for failures
+        failed_steps = [
+            step_id
+            for step_id, result in step_results.items()
+            if result.status == WorkflowStatus.FAILED
+        ]
+
+        # Determine overall status
+        if missing_steps:
+            status = WorkflowStatus.FAILED
+            error = f"Missing steps: {', '.join(missing_steps)}"
+        elif failed_steps:
+            status = WorkflowStatus.FAILED
+            error = f"Failed steps: {', '.join(failed_steps)}"
+        else:
+            status = WorkflowStatus.COMPLETED
+            error = None
+
+        result = WorkflowResult(
+            goal=goal,
+            status=status,
+            steps=step_results,
+            error=error,
         )
 
-        return "observe"
+        return {"result": result}
+
+    async def post_async(
+        self,
+        shared: dict[str, Any],
+        prep_res: dict[str, Any],
+        exec_res: dict[str, Any],
+    ) -> str | None:
+        """Store workflow result."""
+        if "error" in exec_res:
+            logger.warning("Workflow collection failed", error=exec_res["error"])
+            return "error"
+
+        result: WorkflowResult = exec_res["result"]
+
+        # Store in results
+        shared.setdefault("results", {})
+        shared["results"]["workflow_output"] = result
+
+        # Emit completion event
+        await self.emit_event(
+            shared,
+            WorkflowCompleteEvent.create(request_id=shared.get("request_id")),
+        )
+
+        logger.info(
+            "Workflow complete",
+            status=result.status.value,
+            steps=len(result.steps),
+            failed=len(result.failed_steps),
+        )
+
+        return "default"

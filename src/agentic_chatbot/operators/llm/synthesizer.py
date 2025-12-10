@@ -1,70 +1,96 @@
-"""Synthesizer operator for combining information."""
+"""Synthesizer operator for combining multiple sources."""
 
-import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
-from ..base import BaseOperator, OperatorType
-from ..context import OperatorContext, OperatorResult
-from ..registry import OperatorRegistry
-from ...config.prompts import SYNTHESIZER_SYSTEM_PROMPT
-from ...utils.llm import LLMClient
+from agentic_chatbot.config.prompts import SYNTHESIZER_SYSTEM_PROMPT, SYNTHESIZER_PROMPT
+from agentic_chatbot.operators.base import BaseOperator, OperatorType
+from agentic_chatbot.operators.context import OperatorContext, OperatorResult
+from agentic_chatbot.operators.registry import OperatorRegistry
+from agentic_chatbot.utils.llm import LLMClient
 
 if TYPE_CHECKING:
-    from ...mcp.session import MCPSession
+    from agentic_chatbot.mcp.session import MCPSession
 
 
 @OperatorRegistry.register("synthesizer")
 class SynthesizerOperator(BaseOperator):
-    """Synthesizes information from multiple sources."""
+    """
+    Combines information from multiple sources into coherent content.
+
+    Type: PURE_LLM
+    Model: Sonnet (needs good reasoning for synthesis)
+
+    Takes multiple source results and produces a unified response
+    that addresses the user's original query.
+    """
 
     name = "synthesizer"
-    description = "Combines multiple sources into a coherent response"
+    description = "Combines information from multiple sources"
     operator_type = OperatorType.PURE_LLM
     model = "sonnet"
-    context_requirements = ["query", "previous_results"]
-
-    def __init__(self):
-        self._llm = LLMClient()
+    context_requirements = ["query", "results.all"]
 
     async def execute(
         self,
         context: OperatorContext,
         mcp_session: "MCPSession | None" = None,
     ) -> OperatorResult:
-        start_time = time.time()
+        """
+        Execute synthesis of multiple sources.
+
+        Args:
+            context: Operator context with query and source results
+            mcp_session: Not used (pure LLM operator)
+
+        Returns:
+            OperatorResult with synthesized content
+        """
+        client = LLMClient()
+
+        # Format sources for the prompt
+        sources = context.step_results or context.extra.get("sources", {})
+        sources_text = self._format_sources(sources)
+
+        prompt = SYNTHESIZER_PROMPT.format(
+            query=context.query,
+            sources=sources_text,
+        )
 
         try:
-            sources_text = "\n\n---\n\n".join(
-                str(r) for r in context.previous_results
-            )
-
-            prompt = f"""User Query: {context.query}
-
-Information from multiple sources:
-
-{sources_text}
-
-Please synthesize this information into a comprehensive, coherent response."""
-
-            response = await self._llm.complete(
+            response = await client.complete(
                 prompt=prompt,
                 system=SYNTHESIZER_SYSTEM_PROMPT,
                 model=self.model or "sonnet",
             )
 
-            return OperatorResult(
-                success=True,
+            return OperatorResult.success_result(
                 output=response.content,
+                input_tokens=response.input_tokens,
+                output_tokens=response.output_tokens,
                 metadata={
-                    "sources_count": len(context.previous_results),
-                    "tokens_used": response.input_tokens + response.output_tokens,
+                    "source_count": len(sources),
+                    "model": response.model,
                 },
-                duration_ms=(time.time() - start_time) * 1000,
             )
 
         except Exception as e:
-            return OperatorResult(
-                success=False,
-                error=str(e),
-                duration_ms=(time.time() - start_time) * 1000,
+            return OperatorResult.error_result(
+                error=f"Synthesis failed: {str(e)}",
             )
+
+    def _format_sources(self, sources: dict[str, Any]) -> str:
+        """Format sources for the prompt."""
+        if not sources:
+            return "No sources available."
+
+        formatted = []
+        for i, (source_id, content) in enumerate(sources.items(), 1):
+            if isinstance(content, dict):
+                # Handle structured results
+                text = content.get("output", content.get("text", str(content)))
+            else:
+                text = str(content)
+
+            formatted.append(f"### Source {i} ({source_id})\n{text}")
+
+        return "\n\n".join(formatted)

@@ -1,159 +1,309 @@
 """MCP client for communicating with MCP servers."""
 
+import asyncio
 import time
-from typing import Any
+from contextlib import asynccontextmanager
+from typing import Any, AsyncIterator
 
 import httpx
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
-from .models import ServerInfo, ToolSummary, ToolSchema, ToolResult, ToolContent
-from ..core.exceptions import MCPError
-from ..utils.logging import get_logger
+from agentic_chatbot.core.exceptions import MCPError, TransientError
+from agentic_chatbot.mcp.models import (
+    ToolResult,
+    ToolResultStatus,
+    ToolContent,
+    ToolSchema,
+    ToolSummary,
+)
+from agentic_chatbot.utils.logging import get_logger
+
 
 logger = get_logger(__name__)
 
 
+class MCPStreamEvent:
+    """Event from MCP streaming response."""
+
+    def __init__(self, event_type: str, data: dict[str, Any]):
+        self.type = event_type
+        self.data = data
+
+    @property
+    def is_progress(self) -> bool:
+        return self.type == "progress"
+
+    @property
+    def is_content(self) -> bool:
+        return self.type == "content"
+
+    @property
+    def is_elicitation(self) -> bool:
+        return self.type == "elicitation"
+
+    @property
+    def is_result(self) -> bool:
+        return self.type == "result"
+
+    @property
+    def is_error(self) -> bool:
+        return self.type == "error"
+
+    @property
+    def result(self) -> ToolResult | None:
+        """Get result if this is a result event."""
+        if not self.is_result:
+            return None
+        return ToolResult(**self.data.get("result", {}))
+
+
 class MCPClient:
     """
-    Async HTTP client for MCP servers.
+    Async HTTP client for MCP server communication.
 
     Features:
-    - Connection pooling via httpx
-    - Timeout handling
-    - Error normalization
+    - Automatic retry with exponential backoff for transient errors
+    - Streaming support via SSE
+    - Connection lifecycle management
     """
 
-    def __init__(self, timeout_seconds: int = 30):
-        self.timeout = httpx.Timeout(timeout_seconds)
+    def __init__(
+        self,
+        base_url: str,
+        timeout: float = 30.0,
+    ):
+        """
+        Initialize MCP client.
+
+        Args:
+            base_url: Base URL of the MCP server
+            timeout: Request timeout in seconds
+        """
+        self._base_url = base_url.rstrip("/")
+        self._timeout = timeout
         self._client: httpx.AsyncClient | None = None
 
     async def _get_client(self) -> httpx.AsyncClient:
         """Get or create HTTP client."""
-        if self._client is None or self._client.is_closed:
-            self._client = httpx.AsyncClient(timeout=self.timeout)
+        if self._client is None:
+            self._client = httpx.AsyncClient(
+                base_url=self._base_url,
+                timeout=httpx.Timeout(self._timeout),
+            )
         return self._client
 
     async def close(self) -> None:
         """Close the HTTP client."""
-        if self._client and not self._client.is_closed:
+        if self._client is not None:
             await self._client.aclose()
             self._client = None
 
-    async def discover_servers(self, discovery_url: str) -> list[ServerInfo]:
-        """Fetch list of available MCP servers."""
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        retry=retry_if_exception_type(TransientError),
+    )
+    async def list_tools(self) -> list[ToolSummary]:
+        """
+        Get list of tools from the server.
+
+        Returns:
+            List of tool summaries
+        """
+        client = await self._get_client()
+
         try:
-            client = await self._get_client()
-            response = await client.get(discovery_url)
+            response = await client.get("/tools")
             response.raise_for_status()
             data = response.json()
 
-            servers = []
-            for item in data.get("servers", []):
-                servers.append(ServerInfo(
-                    id=item["id"],
-                    name=item["name"],
-                    url=item["url"],
-                    description=item.get("description"),
-                ))
-            return servers
+            return [
+                ToolSummary(
+                    name=tool["name"],
+                    description=tool.get("description", ""),
+                    server_id=data.get("server_id", "unknown"),
+                )
+                for tool in data.get("tools", [])
+            ]
+        except httpx.TimeoutException as e:
+            raise TransientError(f"Timeout listing tools: {e}") from e
+        except httpx.ConnectError as e:
+            raise TransientError(f"Connection error: {e}") from e
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code >= 500:
+                raise TransientError(f"Server error: {e}") from e
+            raise MCPError(f"Failed to list tools: {e}") from e
 
-        except httpx.RequestError as e:
-            logger.warning(f"MCP discovery failed: {e}")
-            return []
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        retry=retry_if_exception_type(TransientError),
+    )
+    async def get_tool_schema(self, tool_name: str) -> ToolSchema:
+        """
+        Get full schema for a tool.
 
-    async def list_tools(self, server: ServerInfo) -> list[ToolSummary]:
-        """Get tool summaries from a server."""
+        Args:
+            tool_name: Name of the tool
+
+        Returns:
+            Full tool schema with input schema
+        """
+        client = await self._get_client()
+
         try:
-            client = await self._get_client()
-            response = await client.get(f"{server.url}/tools")
-            response.raise_for_status()
-            data = response.json()
-
-            tools = []
-            for item in data.get("tools", []):
-                tools.append(ToolSummary(
-                    name=item["name"],
-                    description=item.get("description", ""),
-                    server_id=server.id,
-                ))
-            return tools
-
-        except httpx.RequestError as e:
-            logger.warning(f"Failed to list tools from {server.id}: {e}")
-            return []
-
-    async def get_tool_schema(
-        self, server: ServerInfo, tool_name: str
-    ) -> ToolSchema | None:
-        """Get full schema for a specific tool."""
-        try:
-            client = await self._get_client()
-            response = await client.get(f"{server.url}/tools/{tool_name}")
+            response = await client.get(f"/tools/{tool_name}/schema")
             response.raise_for_status()
             data = response.json()
 
             return ToolSchema(
                 name=data["name"],
                 description=data.get("description", ""),
-                server_id=server.id,
-                input_schema=data.get("inputSchema", {}),
+                server_id=data.get("server_id", "unknown"),
+                input_schema=data.get("input_schema", {}),
             )
+        except httpx.TimeoutException as e:
+            raise TransientError(f"Timeout getting tool schema: {e}") from e
+        except httpx.ConnectError as e:
+            raise TransientError(f"Connection error: {e}") from e
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code >= 500:
+                raise TransientError(f"Server error: {e}") from e
+            raise MCPError(f"Failed to get tool schema: {e}", tool_name=tool_name) from e
 
-        except httpx.RequestError as e:
-            logger.warning(f"Failed to get schema for {tool_name}: {e}")
-            return None
-
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        retry=retry_if_exception_type(TransientError),
+    )
     async def call_tool(
         self,
-        server: ServerInfo,
         tool_name: str,
         params: dict[str, Any],
     ) -> ToolResult:
-        """Execute a tool on the server."""
+        """
+        Call a tool and get the result (non-streaming).
+
+        Args:
+            tool_name: Name of the tool
+            params: Tool parameters
+
+        Returns:
+            Tool execution result
+        """
+        client = await self._get_client()
         start_time = time.time()
 
         try:
-            client = await self._get_client()
             response = await client.post(
-                f"{server.url}/tools/{tool_name}/call",
-                json={"arguments": params},
+                f"/tools/{tool_name}/call",
+                json={"params": params},
             )
             response.raise_for_status()
             data = response.json()
 
             duration_ms = (time.time() - start_time) * 1000
 
-            content = []
-            for item in data.get("content", []):
-                content.append(ToolContent(
-                    content_type=item.get("type", "text/plain"),
-                    data=item.get("text") or item.get("data"),
-                    is_error=item.get("isError", False),
-                ))
+            # Parse contents
+            contents = []
+            for content_data in data.get("contents", []):
+                contents.append(ToolContent(**content_data))
+
+            # Handle simple text response
+            if not contents and "result" in data:
+                result_data = data["result"]
+                if isinstance(result_data, str):
+                    contents.append(ToolContent.text(result_data))
+                else:
+                    contents.append(
+                        ToolContent(content_type="application/json", data=result_data)
+                    )
 
             return ToolResult(
                 tool_name=tool_name,
-                server_id=server.id,
-                success=not data.get("isError", False),
-                content=content,
+                status=ToolResultStatus.SUCCESS,
+                contents=contents,
                 duration_ms=duration_ms,
+                metadata=data.get("metadata", {}),
             )
 
-        except httpx.RequestError as e:
+        except httpx.TimeoutException as e:
+            raise TransientError(f"Timeout calling tool: {e}") from e
+        except httpx.ConnectError as e:
+            raise TransientError(f"Connection error: {e}") from e
+        except httpx.HTTPStatusError as e:
             duration_ms = (time.time() - start_time) * 1000
+            if e.response.status_code >= 500:
+                raise TransientError(f"Server error: {e}") from e
             return ToolResult(
                 tool_name=tool_name,
-                server_id=server.id,
-                success=False,
+                status=ToolResultStatus.ERROR,
                 error=str(e),
                 duration_ms=duration_ms,
             )
 
-        except httpx.HTTPStatusError as e:
-            duration_ms = (time.time() - start_time) * 1000
-            return ToolResult(
-                tool_name=tool_name,
-                server_id=server.id,
-                success=False,
-                error=f"HTTP {e.response.status_code}: {e.response.text[:200]}",
-                duration_ms=duration_ms,
-            )
+    @asynccontextmanager
+    async def stream_tool_call(
+        self,
+        tool_name: str,
+        params: dict[str, Any],
+    ) -> AsyncIterator[AsyncIterator[MCPStreamEvent]]:
+        """
+        Call a tool with streaming response.
+
+        Args:
+            tool_name: Name of the tool
+            params: Tool parameters
+
+        Yields:
+            Async iterator of stream events
+        """
+        client = await self._get_client()
+
+        async def event_generator() -> AsyncIterator[MCPStreamEvent]:
+            try:
+                async with client.stream(
+                    "POST",
+                    f"/tools/{tool_name}/stream",
+                    json={"params": params},
+                ) as response:
+                    response.raise_for_status()
+
+                    async for line in response.aiter_lines():
+                        if not line.startswith("data: "):
+                            continue
+
+                        import json
+
+                        data = json.loads(line[6:])
+                        yield MCPStreamEvent(
+                            event_type=data.get("type", "unknown"),
+                            data=data,
+                        )
+
+            except httpx.TimeoutException as e:
+                yield MCPStreamEvent("error", {"error": f"Timeout: {e}", "error_type": "timeout"})
+            except httpx.ConnectError as e:
+                yield MCPStreamEvent(
+                    "error", {"error": f"Connection: {e}", "error_type": "connection"}
+                )
+            except Exception as e:
+                yield MCPStreamEvent(
+                    "error", {"error": str(e), "error_type": "execution"}
+                )
+
+        yield event_generator()
+
+    async def health_check(self) -> bool:
+        """
+        Check if the server is healthy.
+
+        Returns:
+            True if healthy, False otherwise
+        """
+        try:
+            client = await self._get_client()
+            response = await client.get("/health", timeout=5.0)
+            return response.status_code == 200
+        except Exception:
+            return False

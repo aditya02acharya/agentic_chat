@@ -1,46 +1,83 @@
-"""SSE streaming helpers."""
+"""SSE stream helpers."""
 
 import asyncio
 from typing import AsyncIterator
 
-from ..core.request_context import RequestContext
-from ..events.types import EventType
-from ..utils.logging import get_logger
-
-logger = get_logger(__name__)
+from agentic_chatbot.events.models import Event
+from agentic_chatbot.events.types import EventType
 
 
-async def event_stream(ctx: RequestContext, timeout: float = 60.0) -> AsyncIterator[str]:
+async def event_generator(
+    event_queue: asyncio.Queue[Event],
+    timeout: float = 60.0,
+) -> AsyncIterator[str]:
     """
-    Generate SSE events from request context.
+    Generate SSE events from queue.
 
     Args:
-        ctx: Request context with event queue
-        timeout: Timeout for waiting on events
+        event_queue: Queue of events to stream
+        timeout: Timeout for waiting on queue (seconds)
+
+    Yields:
+        SSE formatted event strings
+    """
+    while True:
+        try:
+            event = await asyncio.wait_for(event_queue.get(), timeout=timeout)
+            yield event.to_sse()
+
+            # Check for terminal events
+            if event.event_type in (EventType.RESPONSE_DONE, EventType.ERROR):
+                break
+
+        except asyncio.TimeoutError:
+            # Send keepalive comment
+            yield ": keepalive\n\n"
+
+
+async def event_generator_with_task(
+    event_queue: asyncio.Queue[Event],
+    task: asyncio.Task,
+    timeout: float = 60.0,
+) -> AsyncIterator[str]:
+    """
+    Generate SSE events while running a background task.
+
+    Args:
+        event_queue: Queue of events to stream
+        task: Background task running the flow
+        timeout: Timeout between events
 
     Yields:
         SSE formatted event strings
     """
     try:
-        while True:
+        while not task.done():
             try:
-                event = await asyncio.wait_for(
-                    ctx.event_queue.get(),
-                    timeout=timeout,
-                )
+                event = await asyncio.wait_for(event_queue.get(), timeout=timeout)
                 yield event.to_sse()
 
-                if event.event_type == EventType.RESPONSE_DONE:
+                if event.event_type in (EventType.RESPONSE_DONE, EventType.ERROR):
                     break
 
             except asyncio.TimeoutError:
-                yield ": keepalive\n\n"
+                # Send keepalive if task is still running
+                if not task.done():
+                    yield ": keepalive\n\n"
 
-    except asyncio.CancelledError:
-        logger.debug(f"Event stream cancelled for request {ctx.request_id}")
-        raise
+        # Drain any remaining events
+        while not event_queue.empty():
+            try:
+                event = event_queue.get_nowait()
+                yield event.to_sse()
+            except asyncio.QueueEmpty:
+                break
 
-
-async def format_sse_event(event_type: str, data: str) -> str:
-    """Format a single SSE event."""
-    return f"event: {event_type}\ndata: {data}\n\n"
+    finally:
+        # Ensure task is cancelled if we exit early
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass

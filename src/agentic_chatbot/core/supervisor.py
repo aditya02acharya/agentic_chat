@@ -1,5 +1,6 @@
-"""ReACT supervisor logic and decision models."""
+"""Supervisor models and decision structures."""
 
+from datetime import datetime
 from enum import Enum
 from typing import Any, Literal
 
@@ -16,41 +17,78 @@ class SupervisorAction(str, Enum):
 
 
 class SupervisorDecision(BaseModel):
-    """Schema for Supervisor's action decision."""
+    """
+    Schema for Supervisor's action decision.
+
+    Used by StructuredLLMCaller to validate LLM output.
+    """
 
     action: Literal["ANSWER", "CALL_TOOL", "CREATE_WORKFLOW", "CLARIFY"]
-    reasoning: str = Field(description="Explanation of why this action was chosen")
+    reasoning: str = Field(..., description="Explanation of the decision")
 
-    response: str | None = Field(
-        default=None, description="Direct response for ANSWER action"
-    )
+    # For ANSWER
+    response: str | None = Field(None, description="Direct response for ANSWER action")
 
-    operator: str | None = Field(
-        default=None, description="Operator name for CALL_TOOL action"
-    )
-    params: dict[str, Any] | None = Field(
-        default=None, description="Parameters for the operator"
-    )
+    # For CALL_TOOL
+    operator: str | None = Field(None, description="Operator name for CALL_TOOL action")
+    params: dict[str, Any] | None = Field(None, description="Parameters for the operator")
 
-    goal: str | None = Field(
-        default=None, description="Goal description for CREATE_WORKFLOW"
-    )
+    # For CREATE_WORKFLOW
+    goal: str | None = Field(None, description="Workflow goal for CREATE_WORKFLOW action")
     steps: list[dict[str, Any]] | None = Field(
-        default=None, description="Workflow steps for CREATE_WORKFLOW"
+        None, description="Workflow steps for CREATE_WORKFLOW action"
     )
 
-    question: str | None = Field(
-        default=None, description="Clarification question for CLARIFY action"
-    )
+    # For CLARIFY
+    question: str | None = Field(None, description="Clarification question for CLARIFY action")
 
 
-class ReflectionResult(BaseModel):
-    """Result of quality evaluation."""
+class SupervisorActionRecord(BaseModel):
+    """Record of an action taken by the supervisor."""
 
-    quality_score: float = Field(ge=0.0, le=1.0, description="Quality score 0.0-1.0")
-    is_complete: bool = Field(description="Whether the response is complete")
-    issues: list[str] = Field(default_factory=list, description="List of issues found")
-    recommendation: Literal["satisfied", "need_more", "blocked"] = Field(
-        description="Next action recommendation"
-    )
-    reasoning: str = Field(description="Explanation of the evaluation")
+    action: SupervisorAction
+    decision: SupervisorDecision
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    iteration: int
+    result: dict[str, Any] | None = None
+    error: str | None = None
+
+
+class SupervisorState(BaseModel):
+    """State of the supervisor during a turn."""
+
+    iteration: int = 0
+    max_iterations: int = 5
+    action_history: list[SupervisorActionRecord] = Field(default_factory=list)
+    current_decision: SupervisorDecision | None = None
+    is_complete: bool = False
+
+    @property
+    def actions_this_turn(self) -> list[str]:
+        """Get list of action names taken this turn."""
+        return [
+            f"{record.action.value}: {record.decision.reasoning[:50]}..."
+            for record in self.action_history
+        ]
+
+    def can_continue(self) -> bool:
+        """Check if supervisor can continue iterating."""
+        return self.iteration < self.max_iterations and not self.is_complete
+
+    def record_action(
+        self,
+        decision: SupervisorDecision,
+        result: dict[str, Any] | None = None,
+        error: str | None = None,
+    ) -> None:
+        """Record an action taken."""
+        self.action_history.append(
+            SupervisorActionRecord(
+                action=SupervisorAction(decision.action),
+                decision=decision,
+                iteration=self.iteration,
+                result=result,
+                error=error,
+            )
+        )
+        self.iteration += 1

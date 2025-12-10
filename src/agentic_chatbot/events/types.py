@@ -1,30 +1,38 @@
-"""Event type definitions."""
+"""Event type enumerations."""
 
 from enum import Enum
 
 
 class EventType(str, Enum):
-    """Types of events emitted during chat processing."""
+    """All event types for SSE streaming."""
 
-    THINKING_START = "thinking.start"
-    THINKING_UPDATE = "thinking.update"
-    THINKING_END = "thinking.end"
+    # Supervisor events
+    SUPERVISOR_THINKING = "supervisor.thinking"
+    SUPERVISOR_DECIDED = "supervisor.decided"
 
+    # Tool/Operator events
     TOOL_START = "tool.start"
     TOOL_PROGRESS = "tool.progress"
-    TOOL_RESULT = "tool.result"
+    TOOL_CONTENT = "tool.content"  # Multi-modal content (images, widgets)
+    TOOL_COMPLETE = "tool.complete"
     TOOL_ERROR = "tool.error"
 
-    WORKFLOW_START = "workflow.start"
+    # MCP events (internal, mapped to tool events)
+    MCP_PROGRESS = "mcp.progress"
+    MCP_CONTENT = "mcp.content"
+    MCP_ELICITATION = "mcp.elicitation"
+    MCP_ERROR = "mcp.error"
+
+    # Workflow events
+    WORKFLOW_CREATED = "workflow.created"
     WORKFLOW_STEP_START = "workflow.step.start"
     WORKFLOW_STEP_COMPLETE = "workflow.step.complete"
     WORKFLOW_COMPLETE = "workflow.complete"
-    WORKFLOW_ERROR = "workflow.error"
 
-    RESPONSE_START = "response.start"
+    # Response events
     RESPONSE_CHUNK = "response.chunk"
     RESPONSE_DONE = "response.done"
 
+    # User interaction events
     CLARIFY_REQUEST = "clarify.request"
-
     ERROR = "error"

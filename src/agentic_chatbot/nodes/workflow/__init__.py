@@ -1,10 +1,10 @@
-"""Workflow nodes."""
+"""Workflow nodes for multi-step execution."""
 
-from .parse_node import ParseWorkflowNode
-from .schedule_node import ScheduleStepsNode
-from .step_node import ExecuteStepNode
-from .parallel_node import ExecuteParallelNode
-from .collect_all_node import CollectAllResultsNode
+from agentic_chatbot.nodes.workflow.parse_node import ParseWorkflowNode
+from agentic_chatbot.nodes.workflow.schedule_node import ScheduleStepsNode
+from agentic_chatbot.nodes.workflow.step_node import ExecuteStepNode
+from agentic_chatbot.nodes.workflow.parallel_node import ExecuteParallelNode
+from agentic_chatbot.nodes.workflow.collect_all_node import CollectAllResultsNode
 
 __all__ = [
     "ParseWorkflowNode",

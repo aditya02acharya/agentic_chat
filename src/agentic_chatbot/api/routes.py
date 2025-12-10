@@ -1,109 +1,384 @@
-"""API routes."""
+"""FastAPI routes for the chat API."""
 
 import asyncio
-from uuid import uuid4
+from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
-from starlette.responses import StreamingResponse
+from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import StreamingResponse
 
-from .models import ChatRequest, HealthResponse, ToolInfo, ToolsResponse
-from .sse import event_stream
-from .dependencies import get_app, get_settings_dep
-from ..core.request_context import RequestContext
-from ..flows.main_flow import execute_chat_flow
-from ..operators.registry import OperatorRegistry
-from ..operators.llm import QueryRewriterOperator, SynthesizerOperator, WriterOperator, AnalyzerOperator
-from ..operators.mcp import RAGRetrieverOperator, WebSearcherOperator
-from ..operators.hybrid import CoderOperator
-from ..config.settings import Settings
-from .. import __version__
-from ..utils.logging import get_logger
+from agentic_chatbot import __version__
+from agentic_chatbot.api.models import (
+    ChatRequest,
+    ChatResponse,
+    HealthResponse,
+    ToolsResponse,
+    ToolSummaryResponse,
+    ErrorResponse,
+    ElicitationResponseRequest,
+    ElicitationResponseResult,
+    PendingElicitationResponse,
+    PendingElicitationsResponse,
+)
+from agentic_chatbot.api.dependencies import (
+    MCPRegistryDep,
+    MCPSessionManagerDep,
+    ElicitationManagerDep,
+)
+from agentic_chatbot.api.sse import event_generator_with_task
+from agentic_chatbot.events.emitter import EventEmitter
+from agentic_chatbot.events.models import Event, ErrorEvent, ResponseDoneEvent
+from agentic_chatbot.graph import create_chat_graph
+from agentic_chatbot.graph.state import create_initial_state
+from agentic_chatbot.mcp.callbacks import create_mcp_callbacks
+from agentic_chatbot.operators.registry import OperatorRegistry
+from agentic_chatbot.utils.logging import get_logger
+
 
 logger = get_logger(__name__)
-
 router = APIRouter()
+
+
+@router.get("/health", response_model=HealthResponse)
+async def health_check() -> HealthResponse:
+    """
+    Health check endpoint.
+
+    Returns application status and version.
+    """
+    return HealthResponse(
+        status="ok",
+        version=__version__,
+    )
+
+
+@router.get("/tools", response_model=ToolsResponse)
+async def list_tools(
+    mcp_registry: MCPRegistryDep,
+) -> ToolsResponse:
+    """
+    List available tools.
+
+    Returns summaries of all registered tools from both
+    MCP servers and internal operators.
+    """
+    tools = []
+
+    # Get MCP tools
+    if mcp_registry:
+        try:
+            mcp_summaries = await mcp_registry.get_all_tool_summaries()
+            for summary in mcp_summaries:
+                tools.append(
+                    ToolSummaryResponse(
+                        name=summary.name,
+                        description=summary.description,
+                        server_id=summary.server_id,
+                    )
+                )
+        except Exception as e:
+            logger.warning(f"Failed to get MCP tools: {e}")
+
+    # Get operator summaries
+    operator_summaries = OperatorRegistry.get_all_summaries()
+    for summary in operator_summaries:
+        # Avoid duplicates
+        if not any(t.name == summary["name"] for t in tools):
+            tools.append(
+                ToolSummaryResponse(
+                    name=summary["name"],
+                    description=summary["description"],
+                )
+            )
+
+    return ToolsResponse(tools=tools, count=len(tools))
 
 
 @router.post("/chat")
 async def chat(
-    request: ChatRequest,
-    settings: Settings = Depends(get_settings_dep),
-):
+    request: Request,
+    chat_request: ChatRequest,
+    mcp_registry: MCPRegistryDep,
+    mcp_session_manager: MCPSessionManagerDep,
+    elicitation_manager: ElicitationManagerDep,
+) -> StreamingResponse:
     """
     Main chat endpoint with SSE streaming.
 
     Returns Server-Sent Events stream with progress updates
     and response chunks.
+
+    Events include:
+    - supervisor.thinking: Agent is analyzing the query
+    - supervisor.decided: Agent made a decision
+    - tool.start/progress/complete/error: Tool execution status
+    - mcp.progress/content/elicitation/error: MCP-specific events
+    - workflow.*: Workflow execution events
+    - response.chunk/done: Response streaming
+    - clarify.request: Clarification needed from user
+    - error: General errors
+
+    For elicitation events (mcp.elicitation), the UI should:
+    1. Display the prompt to the user
+    2. Collect user input
+    3. Submit response via POST /elicitation/respond
     """
-    ctx = RequestContext(
-        conversation_id=request.conversation_id,
-        user_query=request.message,
+    # Check if shutdown is in progress
+    if getattr(request.app.state, "is_shutting_down", False):
+        raise HTTPException(status_code=503, detail="Service is shutting down")
+
+    # Create request context
+    event_queue: asyncio.Queue[Event] = asyncio.Queue()
+    request_id = f"{chat_request.conversation_id}_{asyncio.get_event_loop().time()}"
+
+    # Create event emitter for this request
+    emitter = EventEmitter(event_queue)
+
+    # Create MCP callbacks wired to the event emitter
+    mcp_callbacks = create_mcp_callbacks(
+        emitter=emitter,
+        elicitation_manager=elicitation_manager,
+        request_id=request_id,
     )
 
-    shared = {}
-    if request.context:
-        shared.update(request.context)
+    # Create initial state for LangGraph
+    initial_state = create_initial_state(
+        user_query=chat_request.message,
+        conversation_id=chat_request.conversation_id,
+        request_id=request_id,
+        event_emitter=emitter,
+        event_queue=event_queue,
+        mcp_registry=mcp_registry,
+        mcp_session_manager=mcp_session_manager,
+        mcp_callbacks=mcp_callbacks,
+        elicitation_manager=elicitation_manager,
+        user_context=chat_request.context,
+    )
 
-    try:
-        app = get_app()
-        if app.mcp_registry:
-            shared["mcp_registry"] = app.mcp_registry
-        if app.mcp_session_manager:
-            shared["mcp_session_manager"] = app.mcp_session_manager
-    except RuntimeError:
-        pass
+    # Track request
+    active_requests = getattr(request.app.state, "active_requests", set())
+    active_requests.add(request_id)
 
-    async def run_and_stream():
-        task = asyncio.create_task(execute_chat_flow(ctx, shared))
-
+    async def run_graph() -> None:
+        """Run the LangGraph in background."""
         try:
-            async for event_data in event_stream(ctx):
-                yield event_data
-        except asyncio.CancelledError:
-            task.cancel()
-            raise
+            # Create the chat graph
+            graph = create_chat_graph()
+
+            # Configuration for LangGraph
+            config = {
+                "configurable": {
+                    "thread_id": chat_request.conversation_id,
+                }
+            }
+
+            # Run the graph
+            await graph.ainvoke(initial_state, config)
+
+        except Exception as e:
+            logger.error(f"Graph execution error: {e}", exc_info=True)
+            await event_queue.put(
+                ErrorEvent.create(
+                    error=str(e),
+                    error_type="graph_error",
+                    request_id=request_id,
+                )
+            )
         finally:
-            if not task.done():
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-            await ctx.cleanup()
+            # Ensure done event is sent
+            await event_queue.put(
+                ResponseDoneEvent.create(request_id=request_id)
+            )
+            # Untrack request
+            active_requests.discard(request_id)
+
+    # Start graph execution
+    task = asyncio.create_task(run_graph())
 
     return StreamingResponse(
-        run_and_stream(),
+        event_generator_with_task(event_queue, task),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
-            "X-Request-ID": ctx.request_id,
+            "X-Request-ID": request_id,
         },
     )
 
 
-@router.get("/chat/{conversation_id}/history")
-async def get_history(conversation_id: str):
-    """Get conversation history."""
-    return {"messages": [], "conversation_id": conversation_id}
+@router.post("/chat/sync", response_model=ChatResponse)
+async def chat_sync(
+    request: Request,
+    chat_request: ChatRequest,
+    mcp_registry: MCPRegistryDep,
+    mcp_session_manager: MCPSessionManagerDep,
+    elicitation_manager: ElicitationManagerDep,
+) -> ChatResponse:
+    """
+    Non-streaming chat endpoint.
 
+    Alternative to SSE streaming for simpler integrations.
+    Waits for complete response before returning.
 
-@router.get("/health", response_model=HealthResponse)
-async def health():
-    """Health check endpoint."""
-    return HealthResponse(status="ok", version=__version__)
+    Note: Elicitation requests cannot be handled in sync mode
+    as they require interactive user input.
+    """
+    # Check if shutdown is in progress
+    if getattr(request.app.state, "is_shutting_down", False):
+        raise HTTPException(status_code=503, detail="Service is shutting down")
 
+    request_id = f"{chat_request.conversation_id}_{asyncio.get_event_loop().time()}"
 
-@router.get("/tools", response_model=ToolsResponse)
-async def list_tools():
-    """List available tools/operators."""
-    operators = OperatorRegistry.list_operators()
-    tools = [
-        ToolInfo(
-            name=op["name"],
-            description=op["description"],
-            type=op["type"],
+    # Create event emitter (events go to queue but aren't streamed)
+    event_queue: asyncio.Queue[Event] = asyncio.Queue()
+    emitter = EventEmitter(event_queue)
+
+    # Create MCP callbacks
+    mcp_callbacks = create_mcp_callbacks(
+        emitter=emitter,
+        elicitation_manager=elicitation_manager,
+        request_id=request_id,
+    )
+
+    # Create initial state
+    initial_state = create_initial_state(
+        user_query=chat_request.message,
+        conversation_id=chat_request.conversation_id,
+        request_id=request_id,
+        event_emitter=emitter,
+        event_queue=event_queue,
+        mcp_registry=mcp_registry,
+        mcp_session_manager=mcp_session_manager,
+        mcp_callbacks=mcp_callbacks,
+        elicitation_manager=elicitation_manager,
+        user_context=chat_request.context,
+    )
+
+    try:
+        # Create and run graph
+        graph = create_chat_graph()
+        config = {
+            "configurable": {
+                "thread_id": chat_request.conversation_id,
+            }
+        }
+
+        final_state = await graph.ainvoke(initial_state, config)
+
+        # Get response from final state
+        response = final_state.get("final_response", "")
+
+        return ChatResponse(
+            conversation_id=chat_request.conversation_id,
+            response=response,
+            request_id=request_id,
         )
-        for op in operators
+
+    except Exception as e:
+        logger.error(f"Chat error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# =============================================================================
+# ELICITATION ENDPOINTS
+# =============================================================================
+
+
+@router.post("/elicitation/respond", response_model=ElicitationResponseResult)
+async def submit_elicitation_response(
+    elicitation_request: ElicitationResponseRequest,
+    elicitation_manager: ElicitationManagerDep,
+) -> ElicitationResponseResult:
+    """
+    Submit user response to a pending elicitation request.
+
+    When an MCP tool needs user input, it emits an mcp.elicitation event
+    with an elicitation_id. The UI should:
+    1. Display the prompt to the user
+    2. Collect the user's input
+    3. Call this endpoint with the elicitation_id and value
+
+    This unblocks the waiting tool and allows it to continue execution.
+
+    Args:
+        elicitation_id: ID from the mcp.elicitation event
+        value: User's response (string, choice value, or boolean for confirm)
+        cancelled: Set to true if user cancelled/dismissed the prompt
+    """
+    success = await elicitation_manager.submit_response(
+        elicitation_id=elicitation_request.elicitation_id,
+        value=elicitation_request.value,
+        cancelled=elicitation_request.cancelled,
+    )
+
+    if success:
+        return ElicitationResponseResult(
+            success=True,
+            elicitation_id=elicitation_request.elicitation_id,
+            message="Response accepted",
+        )
+    else:
+        return ElicitationResponseResult(
+            success=False,
+            elicitation_id=elicitation_request.elicitation_id,
+            message="Elicitation not found or already responded",
+        )
+
+
+@router.get("/elicitation/pending", response_model=PendingElicitationsResponse)
+async def list_pending_elicitations(
+    elicitation_manager: ElicitationManagerDep,
+) -> PendingElicitationsResponse:
+    """
+    List all pending elicitation requests.
+
+    Useful for:
+    - Debugging to see what's waiting for user input
+    - Reconnecting after page refresh to see pending prompts
+    - Admin dashboards monitoring tool activity
+    """
+    pending = elicitation_manager.get_all_pending()
+    elicitations = [
+        PendingElicitationResponse(
+            elicitation_id=p.elicitation_id,
+            server_id=p.server_id,
+            tool_name=p.tool_name,
+            prompt=p.request.prompt,
+            input_type=p.request.input_type,
+            options=p.request.options,
+            default=p.request.default,
+            timeout_seconds=p.request.timeout_seconds,
+        )
+        for p in pending
     ]
-    return ToolsResponse(tools=tools)
+    return PendingElicitationsResponse(
+        elicitations=elicitations,
+        count=len(elicitations),
+    )
+
+
+@router.delete("/elicitation/{elicitation_id}")
+async def cancel_elicitation(
+    elicitation_id: str,
+    elicitation_manager: ElicitationManagerDep,
+) -> ElicitationResponseResult:
+    """
+    Cancel a pending elicitation request.
+
+    The tool will receive a cancelled response and should
+    handle it gracefully (e.g., use a default value or skip
+    the operation).
+    """
+    success = await elicitation_manager.cancel_elicitation(elicitation_id)
+
+    if success:
+        return ElicitationResponseResult(
+            success=True,
+            elicitation_id=elicitation_id,
+            message="Elicitation cancelled",
+        )
+    else:
+        return ElicitationResponseResult(
+            success=False,
+            elicitation_id=elicitation_id,
+            message="Elicitation not found or already responded",
+        )

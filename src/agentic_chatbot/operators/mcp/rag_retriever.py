@@ -1,68 +1,92 @@
-"""RAG retriever operator."""
+"""RAG retriever operator for searching internal documents."""
 
-import time
 from typing import TYPE_CHECKING
 
-from ..base import BaseOperator, OperatorType
-from ..context import OperatorContext, OperatorResult
-from ..registry import OperatorRegistry
-from ...core.exceptions import OperatorError
+from agentic_chatbot.core.exceptions import OperatorError
+from agentic_chatbot.operators.base import BaseOperator, OperatorType
+from agentic_chatbot.operators.context import OperatorContext, OperatorResult
+from agentic_chatbot.operators.registry import OperatorRegistry
 
 if TYPE_CHECKING:
-    from ...mcp.session import MCPSession
+    from agentic_chatbot.mcp.session import MCPSession
 
 
 @OperatorRegistry.register("rag_retriever")
 class RAGRetrieverOperator(BaseOperator):
-    """Searches internal documents via RAG."""
+    """
+    Searches internal documents via RAG.
+
+    Type: MCP_BACKED (no LLM, just MCP tool calls)
+    MCP Tools: rag_search, rag_get_document
+
+    Retrieves relevant documents from the internal knowledge base
+    based on the search query.
+    """
 
     name = "rag_retriever"
-    description = "Search internal knowledge base using RAG"
+    description = "Search internal knowledge base"
     operator_type = OperatorType.MCP_BACKED
     mcp_tools = ["rag_search", "rag_get_document"]
-    context_requirements = ["query"]
+    context_requirements = ["query", "tools.schema(rag_search)"]
+
+    # Fallback to web search if RAG fails
+    fallback_operator = "web_searcher"
 
     async def execute(
         self,
         context: OperatorContext,
         mcp_session: "MCPSession | None" = None,
     ) -> OperatorResult:
-        start_time = time.time()
+        """
+        Execute RAG search.
 
+        Args:
+            context: Operator context with query
+            mcp_session: Required MCP session
+
+        Returns:
+            OperatorResult with search results
+
+        Raises:
+            OperatorError: If MCP session not provided
+        """
         if not mcp_session:
-            return OperatorResult(
-                success=False,
-                error="MCP session required for RAG retrieval",
-                duration_ms=(time.time() - start_time) * 1000,
-            )
+            raise OperatorError("MCP session required", operator_name=self.name)
 
         try:
-            top_k = context.get_param("top_k", 5)
+            # Call the RAG search tool
             result = await mcp_session.call_tool(
                 "rag_search",
-                {"query": context.query, "top_k": top_k},
+                {
+                    "query": context.query,
+                    "top_k": context.extra.get("top_k", 5),
+                },
             )
 
-            if not result.success:
-                return OperatorResult(
-                    success=False,
+            if not result.status.value == "success":
+                return OperatorResult.error_result(
                     error=result.error or "RAG search failed",
-                    duration_ms=(time.time() - start_time) * 1000,
                 )
 
-            return OperatorResult(
-                success=True,
-                output=result.text,
+            # Extract text content
+            output = result.combined_text
+            if not output and result.contents:
+                # Handle JSON response
+                for content in result.contents:
+                    if content.content_type == "application/json":
+                        output = content.data
+                        break
+
+            return OperatorResult.success_result(
+                output=output,
+                contents=result.contents,
                 metadata={
                     "tool": "rag_search",
-                    "top_k": top_k,
+                    "duration_ms": result.duration_ms,
                 },
-                duration_ms=(time.time() - start_time) * 1000,
             )
 
         except Exception as e:
-            return OperatorResult(
-                success=False,
-                error=str(e),
-                duration_ms=(time.time() - start_time) * 1000,
+            return OperatorResult.error_result(
+                error=f"RAG retrieval failed: {str(e)}",
             )

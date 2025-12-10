@@ -1,35 +1,31 @@
-"""Tool subflow for executing single tools."""
+"""Tool subflow for executing single tool calls."""
 
-from typing import Any
+from pocketflow import AsyncFlow
 
-from ..core.request_context import RequestContext
-from ..nodes.context.build_context_node import BuildContextNode
-from ..nodes.execution.tool_node import ExecuteToolNode
-from ..nodes.context.collect_node import CollectResultNode
-from ..utils.logging import get_logger
-
-logger = get_logger(__name__)
+from agentic_chatbot.nodes.context.build_context_node import BuildContextNode
+from agentic_chatbot.nodes.execution.tool_node import ExecuteToolNode
+from agentic_chatbot.nodes.context.collect_node import CollectResultNode
 
 
-class ToolSubFlow:
+def create_tool_subflow() -> AsyncFlow:
     """
-    Subflow for executing a single tool/operator.
+    Create tool execution subflow.
 
-    Handles context building, execution, and result collection.
+    Flow:
+        BuildContext → ExecuteTool → CollectResult
+
+    Returns:
+        Configured AsyncFlow for tool execution
     """
+    # Create nodes
+    build_context = BuildContextNode()
+    execute_tool = ExecuteToolNode(max_retries=2)
+    collect_result = CollectResultNode()
 
-    def __init__(self, ctx: RequestContext):
-        self.ctx = ctx
-        self._nodes = {
-            "build_context": BuildContextNode(ctx),
-            "execute_tool": ExecuteToolNode(ctx),
-            "collect": CollectResultNode(ctx),
-        }
+    # Wire nodes
+    build_context >> execute_tool >> collect_result
 
-    async def run(self, shared: dict[str, Any]) -> dict[str, Any]:
-        """Execute the tool subflow."""
-        await self._nodes["build_context"].run(shared)
-        await self._nodes["execute_tool"].run(shared)
-        await self._nodes["collect"].run(shared)
+    # Create flow
+    flow = AsyncFlow(start=build_context)
 
-        return shared
+    return flow

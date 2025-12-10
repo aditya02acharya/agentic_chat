@@ -3,70 +3,354 @@
 import json
 from datetime import datetime
 from typing import Any
-from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
-from .types import EventType
+from agentic_chatbot.events.types import EventType
 
 
 class Event(BaseModel):
-    """Base event model."""
+    """Base event model for SSE streaming."""
 
-    id: str = Field(default_factory=lambda: str(uuid4()))
-    event_type: EventType
+    event_type: EventType = Field(..., alias="type")
+    data: dict[str, Any] = Field(default_factory=dict)
     timestamp: datetime = Field(default_factory=datetime.utcnow)
     request_id: str | None = None
-    data: dict[str, Any] = Field(default_factory=dict)
 
-    def to_json(self) -> str:
-        """Serialize event to JSON string."""
-        return json.dumps({
-            "id": self.id,
-            "type": self.event_type.value,
-            "timestamp": self.timestamp.isoformat(),
-            "request_id": self.request_id,
-            "data": self.data,
-        })
+    model_config = {"populate_by_name": True}
 
     def to_sse(self) -> str:
-        """Format event for SSE stream."""
-        return f"event: {self.event_type.value}\ndata: {self.to_json()}\n\n"
+        """Format event for SSE streaming."""
+        payload = {"type": self.event_type.value, **self.data}
+        return f"data: {json.dumps(payload)}\n\n"
+
+    def to_json(self) -> str:
+        """Convert to JSON string."""
+        return json.dumps({"type": self.event_type.value, **self.data})
 
 
-class ProgressEvent(Event):
-    """Event for progress updates."""
+# =============================================================================
+# SUPERVISOR EVENTS
+# =============================================================================
+
+
+class SupervisorThinkingEvent(Event):
+    """Supervisor is analyzing the query."""
+
+    event_type: EventType = EventType.SUPERVISOR_THINKING
+
+    @classmethod
+    def create(cls, message: str, request_id: str | None = None) -> "SupervisorThinkingEvent":
+        return cls(data={"message": message}, request_id=request_id)
+
+
+class SupervisorDecidedEvent(Event):
+    """Supervisor has made a decision."""
+
+    event_type: EventType = EventType.SUPERVISOR_DECIDED
+
+    @classmethod
+    def create(
+        cls, action: str, message: str, request_id: str | None = None
+    ) -> "SupervisorDecidedEvent":
+        return cls(data={"action": action, "message": message}, request_id=request_id)
+
+
+# =============================================================================
+# TOOL EVENTS
+# =============================================================================
+
+
+class ToolStartEvent(Event):
+    """Tool execution started."""
+
+    event_type: EventType = EventType.TOOL_START
+
+    @classmethod
+    def create(
+        cls, tool: str, message: str = "", request_id: str | None = None
+    ) -> "ToolStartEvent":
+        return cls(data={"tool": tool, "message": message}, request_id=request_id)
+
+
+class ToolProgressEvent(Event):
+    """Tool execution progress update."""
 
     event_type: EventType = EventType.TOOL_PROGRESS
-    progress: float = 0.0
-    message: str = ""
 
-    def model_post_init(self, __context: Any) -> None:
-        self.data["progress"] = self.progress
-        self.data["message"] = self.message
+    @classmethod
+    def create(
+        cls, tool: str, progress: float, message: str = "", request_id: str | None = None
+    ) -> "ToolProgressEvent":
+        return cls(
+            data={"tool": tool, "progress": progress, "message": message},
+            request_id=request_id,
+        )
 
 
-class ContentEvent(Event):
-    """Event for content streaming."""
+class ToolContentEvent(Event):
+    """Tool returned content (text, images, widgets)."""
+
+    event_type: EventType = EventType.TOOL_CONTENT
+
+    @classmethod
+    def create(
+        cls,
+        tool: str,
+        content_type: str,
+        data: Any,
+        encoding: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        request_id: str | None = None,
+    ) -> "ToolContentEvent":
+        event_data = {
+            "tool": tool,
+            "content_type": content_type,
+            "data": data,
+        }
+        if encoding:
+            event_data["encoding"] = encoding
+        if metadata:
+            event_data["metadata"] = metadata
+        return cls(data=event_data, request_id=request_id)
+
+
+class ToolCompleteEvent(Event):
+    """Tool execution completed."""
+
+    event_type: EventType = EventType.TOOL_COMPLETE
+
+    @classmethod
+    def create(
+        cls, tool: str, content_count: int = 1, request_id: str | None = None
+    ) -> "ToolCompleteEvent":
+        return cls(data={"tool": tool, "content_count": content_count}, request_id=request_id)
+
+
+class ToolErrorEvent(Event):
+    """Tool execution failed."""
+
+    event_type: EventType = EventType.TOOL_ERROR
+
+    @classmethod
+    def create(
+        cls, tool: str, error: str, error_type: str = "execution", request_id: str | None = None
+    ) -> "ToolErrorEvent":
+        return cls(
+            data={"tool": tool, "error": error, "error_type": error_type},
+            request_id=request_id,
+        )
+
+
+# =============================================================================
+# WORKFLOW EVENTS
+# =============================================================================
+
+
+class WorkflowCreatedEvent(Event):
+    """Workflow was created."""
+
+    event_type: EventType = EventType.WORKFLOW_CREATED
+
+    @classmethod
+    def create(
+        cls, goal: str, steps: int, request_id: str | None = None
+    ) -> "WorkflowCreatedEvent":
+        return cls(data={"goal": goal, "steps": steps}, request_id=request_id)
+
+
+class WorkflowStepStartEvent(Event):
+    """Workflow step started."""
+
+    event_type: EventType = EventType.WORKFLOW_STEP_START
+
+    @classmethod
+    def create(
+        cls, step: int, name: str, request_id: str | None = None
+    ) -> "WorkflowStepStartEvent":
+        return cls(data={"step": step, "name": name}, request_id=request_id)
+
+
+class WorkflowStepCompleteEvent(Event):
+    """Workflow step completed."""
+
+    event_type: EventType = EventType.WORKFLOW_STEP_COMPLETE
+
+    @classmethod
+    def create(cls, step: int, request_id: str | None = None) -> "WorkflowStepCompleteEvent":
+        return cls(data={"step": step}, request_id=request_id)
+
+
+class WorkflowCompleteEvent(Event):
+    """Workflow completed."""
+
+    event_type: EventType = EventType.WORKFLOW_COMPLETE
+
+    @classmethod
+    def create(cls, request_id: str | None = None) -> "WorkflowCompleteEvent":
+        return cls(data={}, request_id=request_id)
+
+
+# =============================================================================
+# RESPONSE EVENTS
+# =============================================================================
+
+
+class ResponseChunkEvent(Event):
+    """Response chunk for streaming."""
 
     event_type: EventType = EventType.RESPONSE_CHUNK
-    content: str = ""
-    content_type: str = "text/plain"
 
-    def model_post_init(self, __context: Any) -> None:
-        self.data["content"] = self.content
-        self.data["content_type"] = self.content_type
+    @classmethod
+    def create(cls, content: str, request_id: str | None = None) -> "ResponseChunkEvent":
+        return cls(data={"content": content}, request_id=request_id)
+
+
+class ResponseDoneEvent(Event):
+    """Response streaming complete."""
+
+    event_type: EventType = EventType.RESPONSE_DONE
+
+    @classmethod
+    def create(cls, request_id: str | None = None) -> "ResponseDoneEvent":
+        return cls(data={}, request_id=request_id)
+
+
+# =============================================================================
+# USER INTERACTION EVENTS
+# =============================================================================
+
+
+class ClarifyRequestEvent(Event):
+    """Request clarification from user."""
+
+    event_type: EventType = EventType.CLARIFY_REQUEST
+
+    @classmethod
+    def create(cls, question: str, request_id: str | None = None) -> "ClarifyRequestEvent":
+        return cls(data={"question": question}, request_id=request_id)
+
+
+# =============================================================================
+# MCP EVENTS
+# =============================================================================
+
+
+class MCPProgressEvent(Event):
+    """MCP tool reports progress."""
+
+    event_type: EventType = EventType.MCP_PROGRESS
+
+    @classmethod
+    def create(
+        cls,
+        server_id: str,
+        tool_name: str,
+        progress: float,
+        message: str = "",
+        request_id: str | None = None,
+    ) -> "MCPProgressEvent":
+        return cls(
+            data={
+                "server_id": server_id,
+                "tool": tool_name,
+                "progress": progress,
+                "message": message,
+            },
+            request_id=request_id,
+        )
+
+
+class MCPContentEvent(Event):
+    """MCP tool streams content."""
+
+    event_type: EventType = EventType.MCP_CONTENT
+
+    @classmethod
+    def create(
+        cls,
+        server_id: str,
+        tool_name: str,
+        content: Any,
+        content_type: str,
+        request_id: str | None = None,
+    ) -> "MCPContentEvent":
+        return cls(
+            data={
+                "server_id": server_id,
+                "tool": tool_name,
+                "content": content,
+                "content_type": content_type,
+            },
+            request_id=request_id,
+        )
+
+
+class MCPElicitationRequestEvent(Event):
+    """MCP tool requests user input."""
+
+    event_type: EventType = EventType.MCP_ELICITATION
+
+    @classmethod
+    def create(
+        cls,
+        server_id: str,
+        tool_name: str,
+        elicitation_id: str,
+        prompt: str,
+        input_type: str = "text",
+        options: list[str] | None = None,
+        default: str | None = None,
+        timeout_seconds: float = 60.0,
+        request_id: str | None = None,
+    ) -> "MCPElicitationRequestEvent":
+        return cls(
+            data={
+                "server_id": server_id,
+                "tool": tool_name,
+                "elicitation_id": elicitation_id,
+                "prompt": prompt,
+                "input_type": input_type,
+                "options": options,
+                "default": default,
+                "timeout_seconds": timeout_seconds,
+            },
+            request_id=request_id,
+        )
+
+
+class MCPErrorEvent(Event):
+    """MCP tool encountered an error."""
+
+    event_type: EventType = EventType.MCP_ERROR
+
+    @classmethod
+    def create(
+        cls,
+        server_id: str,
+        tool_name: str,
+        error: str,
+        error_type: str = "execution",
+        request_id: str | None = None,
+    ) -> "MCPErrorEvent":
+        return cls(
+            data={
+                "server_id": server_id,
+                "tool": tool_name,
+                "error": error,
+                "error_type": error_type,
+            },
+            request_id=request_id,
+        )
 
 
 class ErrorEvent(Event):
-    """Event for error reporting."""
+    """General error event."""
 
     event_type: EventType = EventType.ERROR
-    error_code: str = "unknown"
-    error_message: str = ""
-    recoverable: bool = True
 
-    def model_post_init(self, __context: Any) -> None:
-        self.data["error_code"] = self.error_code
-        self.data["error_message"] = self.error_message
-        self.data["recoverable"] = self.recoverable
+    @classmethod
+    def create(
+        cls, error: str, error_type: str = "general", request_id: str | None = None
+    ) -> "ErrorEvent":
+        return cls(data={"error": error, "error_type": error_type}, request_id=request_id)

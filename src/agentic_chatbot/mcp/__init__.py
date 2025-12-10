@@ -1,24 +1,75 @@
-"""MCP protocol integration module."""
+"""MCP (Model Context Protocol) integration."""
 
-from .models import ServerInfo, ToolSummary, ToolSchema, ToolContent, ToolResult
-from .client import MCPClient
-from .manager import MCPClientManager
-from .registry import MCPServerRegistry
-from .session import MCPSession, MCPSessionManager
-from .callbacks import MCPProgressCallback, MCPContentCallback, MCPErrorCallback
+from agentic_chatbot.mcp.models import (
+    MCPServerInfo,
+    ToolSummary,
+    ToolSchema,
+    ToolContent,
+    ToolResult,
+    ToolResultStatus,
+    ContentType,
+    WidgetSpec,
+    ToolCall,
+    ElicitationRequest,
+    ElicitationResponse,
+)
+from agentic_chatbot.mcp.callbacks import (
+    MCPCallbacks,
+    MCPProgressCallback,
+    MCPElicitationCallback,
+    MCPContentCallback,
+    MCPErrorCallback,
+    # Concrete implementations
+    MCPProgressHandler,
+    MCPContentHandler,
+    MCPErrorHandler,
+    MCPElicitationHandler,
+    # Elicitation management
+    ElicitationManager,
+    PendingElicitation,
+    # Factory
+    create_mcp_callbacks,
+)
+from agentic_chatbot.mcp.client import MCPClient
+from agentic_chatbot.mcp.manager import MCPClientManager
+from agentic_chatbot.mcp.registry import MCPServerRegistry
+from agentic_chatbot.mcp.session import MCPSession, MCPSessionManager
 
 __all__ = [
-    "ServerInfo",
+    # Models
+    "MCPServerInfo",
     "ToolSummary",
     "ToolSchema",
     "ToolContent",
     "ToolResult",
-    "MCPClient",
-    "MCPClientManager",
-    "MCPServerRegistry",
-    "MCPSession",
-    "MCPSessionManager",
+    "ToolResultStatus",
+    "ContentType",
+    "WidgetSpec",
+    "ToolCall",
+    "ElicitationRequest",
+    "ElicitationResponse",
+    # Callback Protocols
+    "MCPCallbacks",
     "MCPProgressCallback",
+    "MCPElicitationCallback",
     "MCPContentCallback",
     "MCPErrorCallback",
+    # Callback Implementations
+    "MCPProgressHandler",
+    "MCPContentHandler",
+    "MCPErrorHandler",
+    "MCPElicitationHandler",
+    # Elicitation Management
+    "ElicitationManager",
+    "PendingElicitation",
+    "create_mcp_callbacks",
+    # Client
+    "MCPClient",
+    # Manager
+    "MCPClientManager",
+    # Registry
+    "MCPServerRegistry",
+    # Session
+    "MCPSession",
+    "MCPSessionManager",
 ]

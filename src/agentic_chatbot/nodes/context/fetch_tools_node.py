@@ -2,33 +2,64 @@
 
 from typing import Any
 
-from ..base import AsyncBaseNode
-from ...utils.logging import get_logger
+from agentic_chatbot.nodes.base import AsyncBaseNode
+from agentic_chatbot.utils.logging import get_logger
+
 
 logger = get_logger(__name__)
 
 
 class FetchToolsNode(AsyncBaseNode):
     """
-    Fetches available MCP tools for the supervisor.
+    Load MCP tool summaries for supervisor context.
+
+    Type: Context Node
+
+    Fetches tool information from the MCP registry
+    so the supervisor knows what tools are available.
     """
 
-    name = "fetch_tools"
+    node_name = "fetch_tools"
+    description = "Fetch available tool summaries"
 
-    async def execute(self, shared: dict[str, Any]) -> str:
-        mcp_registry = shared.get("mcp_registry")
-        if mcp_registry:
-            try:
-                await mcp_registry.refresh()
-                shared["available_tools"] = [
-                    {"name": t.name, "description": t.description}
-                    for t in mcp_registry.tools
-                ]
-                logger.debug(f"Loaded {len(shared['available_tools'])} MCP tools")
-            except Exception as e:
-                logger.warning(f"Failed to fetch MCP tools: {e}")
-                shared["available_tools"] = []
-        else:
-            shared["available_tools"] = []
+    async def prep_async(self, shared: dict[str, Any]) -> dict[str, Any]:
+        """Get MCP registry reference."""
+        mcp = shared.get("mcp", {})
+        return {
+            "server_registry": mcp.get("server_registry"),
+        }
 
-        return "supervisor"
+    async def exec_async(self, prep_res: dict[str, Any]) -> dict[str, Any]:
+        """Fetch tool summaries."""
+        registry = prep_res.get("server_registry")
+
+        if registry is None:
+            logger.warning("No MCP server registry available")
+            return {"tool_summaries": [], "tool_count": 0}
+
+        try:
+            summaries = await registry.get_all_tool_summaries()
+            return {
+                "tool_summaries": summaries,
+                "tool_count": len(summaries),
+            }
+        except Exception as e:
+            logger.error(f"Failed to fetch tools: {e}")
+            return {"tool_summaries": [], "tool_count": 0, "error": str(e)}
+
+    async def post_async(
+        self,
+        shared: dict[str, Any],
+        prep_res: dict[str, Any],
+        exec_res: dict[str, Any],
+    ) -> str | None:
+        """Store tool summaries."""
+        shared.setdefault("mcp", {})
+        shared["mcp"]["tool_summaries"] = exec_res["tool_summaries"]
+
+        logger.debug(
+            "Tools fetched",
+            count=exec_res["tool_count"],
+        )
+
+        return "default"

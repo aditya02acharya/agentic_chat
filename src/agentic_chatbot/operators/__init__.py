@@ -1,8 +1,8 @@
-"""Operators module - Strategy pattern for tool execution."""
+"""Operators module - Strategy pattern for interchangeable algorithms."""
 
-from .base import BaseOperator, OperatorType
-from .registry import OperatorRegistry
-from .context import OperatorContext, OperatorResult
+from agentic_chatbot.operators.base import BaseOperator, OperatorType
+from agentic_chatbot.operators.registry import OperatorRegistry
+from agentic_chatbot.operators.context import OperatorContext, OperatorResult
 
 __all__ = [
     "BaseOperator",

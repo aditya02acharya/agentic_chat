@@ -1,67 +1,92 @@
-"""Web searcher operator."""
+"""Web searcher operator for external search."""
 
-import time
 from typing import TYPE_CHECKING
 
-from ..base import BaseOperator, OperatorType
-from ..context import OperatorContext, OperatorResult
-from ..registry import OperatorRegistry
+from agentic_chatbot.core.exceptions import OperatorError
+from agentic_chatbot.operators.base import BaseOperator, OperatorType
+from agentic_chatbot.operators.context import OperatorContext, OperatorResult
+from agentic_chatbot.operators.registry import OperatorRegistry
 
 if TYPE_CHECKING:
-    from ...mcp.session import MCPSession
+    from agentic_chatbot.mcp.session import MCPSession
 
 
 @OperatorRegistry.register("web_searcher")
 class WebSearcherOperator(BaseOperator):
-    """Searches the web for information."""
+    """
+    Searches the web for information.
+
+    Type: MCP_BACKED (no LLM, just MCP tool calls)
+    MCP Tools: web_search, news_search
+
+    Retrieves information from the web based on the search query.
+    """
 
     name = "web_searcher"
-    description = "Search the web for current information"
+    description = "Search the web for information"
     operator_type = OperatorType.MCP_BACKED
     mcp_tools = ["web_search", "news_search"]
-    context_requirements = ["query"]
+    context_requirements = ["query", "tools.schema(web_search)"]
 
     async def execute(
         self,
         context: OperatorContext,
         mcp_session: "MCPSession | None" = None,
     ) -> OperatorResult:
-        start_time = time.time()
+        """
+        Execute web search.
 
+        Args:
+            context: Operator context with query
+            mcp_session: Required MCP session
+
+        Returns:
+            OperatorResult with search results
+
+        Raises:
+            OperatorError: If MCP session not provided
+        """
         if not mcp_session:
-            return OperatorResult(
-                success=False,
-                error="MCP session required for web search",
-                duration_ms=(time.time() - start_time) * 1000,
-            )
+            raise OperatorError("MCP session required", operator_name=self.name)
 
         try:
-            max_results = context.get_param("max_results", 5)
+            # Determine which search tool to use
+            search_type = context.extra.get("search_type", "web")
+            tool_name = "news_search" if search_type == "news" else "web_search"
+
+            # Call the web search tool
             result = await mcp_session.call_tool(
-                "web_search",
-                {"query": context.query, "max_results": max_results},
+                tool_name,
+                {
+                    "query": context.query,
+                    "num_results": context.extra.get("num_results", 10),
+                },
             )
 
-            if not result.success:
-                return OperatorResult(
-                    success=False,
+            if not result.status.value == "success":
+                return OperatorResult.error_result(
                     error=result.error or "Web search failed",
-                    duration_ms=(time.time() - start_time) * 1000,
                 )
 
-            return OperatorResult(
-                success=True,
-                output=result.text,
+            # Extract text content
+            output = result.combined_text
+            if not output and result.contents:
+                # Handle JSON response
+                for content in result.contents:
+                    if content.content_type == "application/json":
+                        output = content.data
+                        break
+
+            return OperatorResult.success_result(
+                output=output,
+                contents=result.contents,
                 metadata={
-                    "tool": "web_search",
-                    "max_results": max_results,
+                    "tool": tool_name,
+                    "duration_ms": result.duration_ms,
                 },
-                duration_ms=(time.time() - start_time) * 1000,
             )
 
         except Exception as e:
-            return OperatorResult(
-                success=False,
-                error=str(e),
-                duration_ms=(time.time() - start_time) * 1000,
+            return OperatorResult.error_result(
+                error=f"Web search failed: {str(e)}",
             )

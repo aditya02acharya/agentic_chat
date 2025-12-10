@@ -1,5 +1,5 @@
 """PocketFlow nodes module."""
 
-from .base import AsyncBaseNode
+from agentic_chatbot.nodes.base import AsyncBaseNode
 
 __all__ = ["AsyncBaseNode"]

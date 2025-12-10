@@ -2,56 +2,114 @@
 
 from typing import Any
 
-from ..base import AsyncBaseNode
-from ...operators.registry import OperatorRegistry
-from ...operators.context import OperatorContext
-from ...events.types import EventType
-from ...utils.logging import get_logger
+from agentic_chatbot.nodes.base import AsyncBaseNode
+from agentic_chatbot.operators.registry import OperatorRegistry
+from agentic_chatbot.operators.context import OperatorContext
+from agentic_chatbot.utils.logging import get_logger
+
 
 logger = get_logger(__name__)
 
 
 class WriteNode(AsyncBaseNode):
     """
-    Formats the final response for the user.
+    Format final response for user.
+
+    Type: Output Node
+    Uses: Writer operator (Sonnet model)
+
+    Takes the synthesized content or direct answer and
+    formats it as a polished user response.
     """
 
-    name = "write"
+    node_name = "write"
+    description = "Format response with Writer operator"
 
-    async def execute(self, shared: dict[str, Any]) -> str:
-        if shared.get("final_response"):
-            return "stream"
+    async def prep_async(self, shared: dict[str, Any]) -> dict[str, Any]:
+        """Get content to format."""
+        results = shared.get("results", {})
 
-        decision = shared.get("decision")
-        if decision and decision.action == "ANSWER" and decision.response:
-            shared["final_response"] = decision.response
-            return "stream"
+        # Check for different content sources
+        content = None
 
-        content = shared.get("synthesized_content")
-        if not content:
-            previous_results = shared.get("previous_results", [])
-            if previous_results:
-                content = "\n\n".join(str(r) for r in previous_results)
-            else:
-                content = "I'm sorry, I couldn't find relevant information for your query."
+        # Priority: final_response > synthesis > direct answer
+        if results.get("final_response"):
+            content = results["final_response"]
+        elif results.get("synthesis"):
+            content = results["synthesis"]
+        else:
+            # Check for direct answer from supervisor
+            decision = shared.get("supervisor", {}).get("current_decision")
+            if decision and decision.response:
+                content = decision.response
+
+        # If still no content, try tool outputs
+        if not content and results.get("tool_outputs"):
+            outputs = results["tool_outputs"]
+            if outputs:
+                last_output = outputs[-1]
+                content = last_output.text_output if hasattr(last_output, "text_output") else str(last_output)
+
+        return {
+            "content": content,
+            "query": shared.get("user_query", ""),
+            "needs_formatting": content is not None and len(str(content)) > 100,
+        }
+
+    async def exec_async(self, prep_res: dict[str, Any]) -> dict[str, Any]:
+        """Format content."""
+        content = prep_res.get("content")
+        query = prep_res["query"]
+
+        if content is None:
+            return {
+                "response": "I apologize, but I wasn't able to generate a response. Could you please rephrase your question?",
+                "formatted": False,
+            }
+
+        # Short responses don't need formatting
+        if not prep_res["needs_formatting"]:
+            return {"response": str(content), "formatted": False}
+
+        # Use writer operator for longer content
+        try:
+            writer = OperatorRegistry.create("writer")
+        except KeyError:
+            # No writer available, return as-is
+            return {"response": str(content), "formatted": False}
+
+        context = OperatorContext(query=query)
+        context.extra["content"] = content
 
         try:
-            writer = OperatorRegistry.get("writer")
-            context = OperatorContext(
-                query=shared.get("query", self.ctx.user_query),
-                previous_results=[content],
-            )
-            context.params["content"] = content
-
             result = await writer.execute(context)
-
-            if result.success:
-                shared["final_response"] = result.output
-            else:
-                shared["final_response"] = content
-
+            return {
+                "response": result.output if result.success else str(content),
+                "formatted": result.success,
+            }
         except Exception as e:
-            logger.error(f"Writer failed: {e}", exc_info=True)
-            shared["final_response"] = content
+            logger.warning(f"Writer failed: {e}")
+            return {"response": str(content), "formatted": False}
 
-        return "stream"
+    async def post_async(
+        self,
+        shared: dict[str, Any],
+        prep_res: dict[str, Any],
+        exec_res: dict[str, Any],
+    ) -> str | None:
+        """Store formatted response."""
+        shared.setdefault("results", {})
+        shared["results"]["final_response"] = exec_res["response"]
+
+        # Also store in memory for conversation history
+        memory = shared.get("memory")
+        if memory and hasattr(memory, "add_message"):
+            memory.add_message("assistant", exec_res["response"])
+
+        logger.debug(
+            "Response written",
+            formatted=exec_res["formatted"],
+            length=len(exec_res["response"]),
+        )
+
+        return "default"
