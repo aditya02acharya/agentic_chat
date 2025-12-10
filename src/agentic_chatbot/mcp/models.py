@@ -7,6 +7,100 @@ from pydantic import BaseModel, Field
 
 
 # =============================================================================
+# MESSAGING CAPABILITIES
+# =============================================================================
+
+
+class OutputDataType(str, Enum):
+    """Data types that tools/operators can return."""
+
+    TEXT = "text"  # Plain text or markdown
+    HTML = "html"  # HTML content
+    IMAGE = "image"  # Image data (base64 encoded)
+    WIDGET = "widget"  # Interactive widget/component
+    JSON = "json"  # Structured JSON data
+    BINARY = "binary"  # Binary data
+    MIXED = "mixed"  # Multiple data types
+
+
+class MessagingCapabilities(BaseModel):
+    """
+    Describes the messaging capabilities of a tool or operator.
+
+    This metadata tells the system what a tool/operator can do in terms of
+    communication and response handling.
+    """
+
+    # Output data types this tool/operator can return
+    output_types: list[OutputDataType] = Field(
+        default_factory=lambda: [OutputDataType.TEXT],
+        description="Data types that can be returned (text, image, widget, etc.)",
+    )
+
+    # Progress reporting capability
+    supports_progress: bool = Field(
+        False,
+        description="Whether the tool/operator can report intermediate progress updates",
+    )
+
+    # Elicitation (user input) capability
+    supports_elicitation: bool = Field(
+        False,
+        description="Whether the tool/operator can request user input during execution",
+    )
+
+    # Direct response capability (bypass writer)
+    supports_direct_response: bool = Field(
+        False,
+        description="Whether the tool/operator can send responses directly to user, bypassing the writer",
+    )
+
+    # Streaming content capability
+    supports_streaming: bool = Field(
+        False,
+        description="Whether the tool/operator can stream content incrementally",
+    )
+
+    @classmethod
+    def default(cls) -> "MessagingCapabilities":
+        """Create default capabilities (text only, no special features)."""
+        return cls()
+
+    @classmethod
+    def full(cls) -> "MessagingCapabilities":
+        """Create full capabilities (all features enabled)."""
+        return cls(
+            output_types=[
+                OutputDataType.TEXT,
+                OutputDataType.HTML,
+                OutputDataType.IMAGE,
+                OutputDataType.WIDGET,
+                OutputDataType.JSON,
+            ],
+            supports_progress=True,
+            supports_elicitation=True,
+            supports_direct_response=True,
+            supports_streaming=True,
+        )
+
+    @classmethod
+    def widget_capable(cls) -> "MessagingCapabilities":
+        """Create capabilities for widget-returning tools."""
+        return cls(
+            output_types=[OutputDataType.TEXT, OutputDataType.WIDGET, OutputDataType.HTML],
+            supports_direct_response=True,
+        )
+
+    @classmethod
+    def image_capable(cls) -> "MessagingCapabilities":
+        """Create capabilities for image-returning tools."""
+        return cls(
+            output_types=[OutputDataType.TEXT, OutputDataType.IMAGE],
+            supports_progress=True,
+        )
+
+
+# =============================================================================
 # SERVER AND TOOL METADATA
 # =============================================================================
 
@@ -28,18 +122,25 @@ class ToolSummary(BaseModel):
     Summary information about a tool (for supervisor context).
 
     This is the lightweight version loaded at startup.
+    Includes messaging capabilities metadata for routing decisions.
     """
 
     name: str = Field(..., description="Tool name")
     description: str = Field(..., description="Short description of the tool")
     server_id: str = Field(..., description="ID of server hosting this tool")
 
+    # Messaging capabilities metadata
+    messaging: MessagingCapabilities = Field(
+        default_factory=MessagingCapabilities.default,
+        description="Messaging capabilities of this tool",
+    )
+
 
 class ToolSchema(BaseModel):
     """
     Full schema for a tool (lazy loaded on demand).
 
-    Contains the complete JSON schema for tool inputs.
+    Contains the complete JSON schema for tool inputs and messaging capabilities.
     """
 
     name: str = Field(..., description="Tool name")
@@ -47,6 +148,12 @@ class ToolSchema(BaseModel):
     server_id: str = Field(..., description="ID of server hosting this tool")
     input_schema: dict[str, Any] = Field(
         default_factory=dict, description="JSON Schema for tool inputs"
+    )
+
+    # Messaging capabilities metadata
+    messaging: MessagingCapabilities = Field(
+        default_factory=MessagingCapabilities.default,
+        description="Messaging capabilities of this tool",
     )
 
 

@@ -28,6 +28,14 @@ from agentic_chatbot.events.models import (
     MCPContentEvent,
     MCPElicitationRequestEvent,
     MCPErrorEvent,
+    # Direct response events
+    DirectResponseEvent,
+    DirectResponseStartEvent,
+    DirectResponseChunkEvent,
+    DirectResponseDoneEvent,
+    # Elicitation events
+    ElicitationRequestEvent,
+    ElicitationResponseEvent,
 )
 from agentic_chatbot.events.emitter import EventEmitter
 from agentic_chatbot.events.bus import EventBus, AsyncIOEventBus
@@ -63,4 +71,12 @@ __all__ = [
     "MCPContentEvent",
     "MCPElicitationRequestEvent",
     "MCPErrorEvent",
+    # Direct response events
+    "DirectResponseEvent",
+    "DirectResponseStartEvent",
+    "DirectResponseChunkEvent",
+    "DirectResponseDoneEvent",
+    # Elicitation events
+    "ElicitationRequestEvent",
+    "ElicitationResponseEvent",
 ]

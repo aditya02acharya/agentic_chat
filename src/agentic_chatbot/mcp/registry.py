@@ -7,7 +7,13 @@ from typing import Any
 import httpx
 
 from agentic_chatbot.core.exceptions import ToolNotFoundError, ServerNotFoundError
-from agentic_chatbot.mcp.models import MCPServerInfo, ToolSummary, ToolSchema
+from agentic_chatbot.mcp.models import (
+    MCPServerInfo,
+    ToolSummary,
+    ToolSchema,
+    MessagingCapabilities,
+    OutputDataType,
+)
 from agentic_chatbot.utils.logging import get_logger
 
 
@@ -201,7 +207,7 @@ class MCPServerRegistry:
             raise
 
     async def _fetch_server_tools(self, server: MCPServerInfo) -> None:
-        """Fetch tool summaries from a server."""
+        """Fetch tool summaries from a server including messaging capabilities."""
         try:
             client = await self._get_http_client()
             response = await client.get(f"{server.url}/tools")
@@ -210,10 +216,17 @@ class MCPServerRegistry:
 
             for tool_data in data.get("tools", []):
                 tool_name = tool_data["name"]
+
+                # Parse messaging capabilities if provided
+                messaging = self._parse_messaging_capabilities(
+                    tool_data.get("messaging", {})
+                )
+
                 summary = ToolSummary(
                     name=tool_name,
                     description=tool_data.get("description", ""),
                     server_id=server.id,
+                    messaging=messaging,
                 )
                 self._tool_summaries[tool_name] = summary
                 self._tool_to_server[tool_name] = server.id
@@ -225,8 +238,44 @@ class MCPServerRegistry:
                 error=str(e),
             )
 
+    def _parse_messaging_capabilities(
+        self, messaging_data: dict[str, Any]
+    ) -> MessagingCapabilities:
+        """
+        Parse messaging capabilities from tool metadata.
+
+        Args:
+            messaging_data: Dictionary with messaging capability fields
+
+        Returns:
+            MessagingCapabilities instance
+        """
+        if not messaging_data:
+            return MessagingCapabilities.default()
+
+        # Parse output types
+        output_types_raw = messaging_data.get("output_types", ["text"])
+        output_types = []
+        for ot in output_types_raw:
+            try:
+                output_types.append(OutputDataType(ot))
+            except ValueError:
+                # Unknown output type, default to TEXT
+                output_types.append(OutputDataType.TEXT)
+
+        if not output_types:
+            output_types = [OutputDataType.TEXT]
+
+        return MessagingCapabilities(
+            output_types=output_types,
+            supports_progress=messaging_data.get("supports_progress", False),
+            supports_elicitation=messaging_data.get("supports_elicitation", False),
+            supports_direct_response=messaging_data.get("supports_direct_response", False),
+            supports_streaming=messaging_data.get("supports_streaming", False),
+        )
+
     async def _fetch_tool_schema(self, server_id: str, tool_name: str) -> ToolSchema:
-        """Fetch full tool schema from server."""
+        """Fetch full tool schema from server including messaging capabilities."""
         server = self._servers.get(server_id)
         if not server:
             raise ServerNotFoundError(server_id)
@@ -237,11 +286,17 @@ class MCPServerRegistry:
             response.raise_for_status()
             data = response.json()
 
+            # Parse messaging capabilities if provided
+            messaging = self._parse_messaging_capabilities(
+                data.get("messaging", {})
+            )
+
             return ToolSchema(
                 name=tool_name,
                 description=data.get("description", ""),
                 server_id=server_id,
                 input_schema=data.get("input_schema", {}),
+                messaging=messaging,
             )
 
         except Exception as e:
@@ -253,6 +308,89 @@ class MCPServerRegistry:
             )
             raise ToolNotFoundError(tool_name) from e
 
+    async def get_tool_messaging_capabilities(
+        self, tool_name: str
+    ) -> MessagingCapabilities:
+        """
+        Get messaging capabilities for a specific tool.
+
+        Args:
+            tool_name: Name of the tool
+
+        Returns:
+            MessagingCapabilities instance
+
+        Raises:
+            ToolNotFoundError: If tool not found
+        """
+        summary = await self.get_tool_summary(tool_name)
+        return summary.messaging
+
+    async def get_tools_with_capability(
+        self,
+        supports_progress: bool | None = None,
+        supports_elicitation: bool | None = None,
+        supports_direct_response: bool | None = None,
+        supports_streaming: bool | None = None,
+        output_type: OutputDataType | None = None,
+    ) -> list[ToolSummary]:
+        """
+        Get tools that match the specified capability requirements.
+
+        Args:
+            supports_progress: Filter by progress support
+            supports_elicitation: Filter by elicitation support
+            supports_direct_response: Filter by direct response support
+            supports_streaming: Filter by streaming support
+            output_type: Filter by output type support
+
+        Returns:
+            List of ToolSummary instances matching all criteria
+        """
+        await self._ensure_fresh()
+        matching = []
+
+        for summary in self._tool_summaries.values():
+            messaging = summary.messaging
+
+            # Check each criterion
+            if supports_progress is not None:
+                if messaging.supports_progress != supports_progress:
+                    continue
+
+            if supports_elicitation is not None:
+                if messaging.supports_elicitation != supports_elicitation:
+                    continue
+
+            if supports_direct_response is not None:
+                if messaging.supports_direct_response != supports_direct_response:
+                    continue
+
+            if supports_streaming is not None:
+                if messaging.supports_streaming != supports_streaming:
+                    continue
+
+            if output_type is not None:
+                if output_type not in messaging.output_types:
+                    continue
+
+            matching.append(summary)
+
+        return matching
+
+    async def get_widget_capable_tools(self) -> list[ToolSummary]:
+        """Get tools that can return widgets (directly to user)."""
+        return await self.get_tools_with_capability(
+            output_type=OutputDataType.WIDGET,
+            supports_direct_response=True,
+        )
+
+    async def get_image_capable_tools(self) -> list[ToolSummary]:
+        """Get tools that can return images."""
+        return await self.get_tools_with_capability(
+            output_type=OutputDataType.IMAGE,
+        )
+
     async def close(self) -> None:
         """Close HTTP client."""
         if self._http_client:
@@ -263,10 +401,27 @@ class MCPServerRegistry:
         """
         Get formatted text of all tool summaries for prompts.
 
+        Includes messaging capabilities information.
+
         Returns:
             Formatted string of tool summaries
         """
         lines = []
         for name, summary in sorted(self._tool_summaries.items()):
-            lines.append(f"- {name}: {summary.description}")
+            messaging = summary.messaging
+            capabilities = []
+            if messaging.supports_progress:
+                capabilities.append("progress")
+            if messaging.supports_elicitation:
+                capabilities.append("elicitation")
+            if messaging.supports_direct_response:
+                capabilities.append("direct_response")
+            if messaging.supports_streaming:
+                capabilities.append("streaming")
+
+            output_types = [t.value for t in messaging.output_types]
+            cap_str = f" [caps: {', '.join(capabilities)}]" if capabilities else ""
+            out_str = f" [outputs: {', '.join(output_types)}]"
+
+            lines.append(f"- {name}: {summary.description}{out_str}{cap_str}")
         return "\n".join(lines) if lines else "No tools available"

@@ -354,3 +354,160 @@ class ErrorEvent(Event):
         cls, error: str, error_type: str = "general", request_id: str | None = None
     ) -> "ErrorEvent":
         return cls(data={"error": error, "error_type": error_type}, request_id=request_id)
+
+
+# =============================================================================
+# DIRECT RESPONSE EVENTS
+# =============================================================================
+
+
+class DirectResponseEvent(Event):
+    """
+    Direct response content sent to user (bypasses writer).
+
+    Used by operators/tools that can send content directly to the user
+    without going through the writer node.
+    """
+
+    event_type: EventType = EventType.DIRECT_RESPONSE
+
+    @classmethod
+    def create(
+        cls,
+        source: str,
+        content_type: str,
+        data: Any,
+        encoding: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        request_id: str | None = None,
+    ) -> "DirectResponseEvent":
+        """
+        Create a direct response event.
+
+        Args:
+            source: Name of the operator/tool sending the response
+            content_type: MIME type of the content
+            data: Content data
+            encoding: Encoding type (e.g., "base64" for binary)
+            metadata: Additional metadata
+            request_id: Request ID for correlation
+        """
+        event_data = {
+            "source": source,
+            "content_type": content_type,
+            "data": data,
+        }
+        if encoding:
+            event_data["encoding"] = encoding
+        if metadata:
+            event_data["metadata"] = metadata
+        return cls(data=event_data, request_id=request_id)
+
+
+class DirectResponseStartEvent(Event):
+    """Direct response streaming has started."""
+
+    event_type: EventType = EventType.DIRECT_RESPONSE_START
+
+    @classmethod
+    def create(
+        cls,
+        source: str,
+        content_type: str,
+        request_id: str | None = None,
+    ) -> "DirectResponseStartEvent":
+        return cls(
+            data={"source": source, "content_type": content_type},
+            request_id=request_id,
+        )
+
+
+class DirectResponseChunkEvent(Event):
+    """Chunk of a streaming direct response."""
+
+    event_type: EventType = EventType.DIRECT_RESPONSE_CHUNK
+
+    @classmethod
+    def create(
+        cls,
+        source: str,
+        content: str,
+        request_id: str | None = None,
+    ) -> "DirectResponseChunkEvent":
+        return cls(
+            data={"source": source, "content": content},
+            request_id=request_id,
+        )
+
+
+class DirectResponseDoneEvent(Event):
+    """Direct response streaming is complete."""
+
+    event_type: EventType = EventType.DIRECT_RESPONSE_DONE
+
+    @classmethod
+    def create(
+        cls,
+        source: str,
+        request_id: str | None = None,
+    ) -> "DirectResponseDoneEvent":
+        return cls(data={"source": source}, request_id=request_id)
+
+
+# =============================================================================
+# ELICITATION EVENTS
+# =============================================================================
+
+
+class ElicitationRequestEvent(Event):
+    """Request user input during operator/tool execution."""
+
+    event_type: EventType = EventType.ELICITATION_REQUEST
+
+    @classmethod
+    def create(
+        cls,
+        source: str,
+        elicitation_id: str,
+        prompt: str,
+        input_type: str = "text",
+        options: list[str] | None = None,
+        default: str | None = None,
+        timeout_seconds: float = 60.0,
+        request_id: str | None = None,
+    ) -> "ElicitationRequestEvent":
+        return cls(
+            data={
+                "source": source,
+                "elicitation_id": elicitation_id,
+                "prompt": prompt,
+                "input_type": input_type,
+                "options": options,
+                "default": default,
+                "timeout_seconds": timeout_seconds,
+            },
+            request_id=request_id,
+        )
+
+
+class ElicitationResponseEvent(Event):
+    """User responded to an elicitation request."""
+
+    event_type: EventType = EventType.ELICITATION_RESPONSE
+
+    @classmethod
+    def create(
+        cls,
+        elicitation_id: str,
+        value: Any,
+        cancelled: bool = False,
+        request_id: str | None = None,
+    ) -> "ElicitationResponseEvent":
+        return cls(
+            data={
+                "elicitation_id": elicitation_id,
+                "value": value,
+                "cancelled": cancelled,
+            },
+            request_id=request_id,
+        )

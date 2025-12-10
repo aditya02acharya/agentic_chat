@@ -4,6 +4,8 @@ from abc import ABC, abstractmethod
 from enum import Enum
 from typing import TYPE_CHECKING, Any
 
+from agentic_chatbot.mcp.models import MessagingCapabilities, OutputDataType
+
 if TYPE_CHECKING:
     from agentic_chatbot.mcp.session import MCPSession
     from agentic_chatbot.operators.context import OperatorContext, OperatorResult
@@ -30,6 +32,13 @@ class BaseOperator(ABC):
     - PURE_LLM: Only call LLM. Fast path, no MCP overhead.
     - MCP_BACKED: Only call MCP tools. Handle session lifecycle internally.
     - HYBRID: Use LLM for reasoning AND MCP tools for execution.
+
+    Messaging Capabilities:
+    - output_types: What data types this operator can return (text, image, widget, etc.)
+    - supports_progress: Whether operator can report intermediate progress
+    - supports_elicitation: Whether operator can request user input
+    - supports_direct_response: Whether operator can bypass writer and send directly to user
+    - supports_streaming: Whether operator can stream content incrementally
     """
 
     # Metadata - must be set by subclasses
@@ -49,6 +58,13 @@ class BaseOperator(ABC):
     # Error handling
     fallback_operator: str | None = None  # Operator to use if this fails
     max_retries: int = 2
+
+    # Messaging capabilities - subclasses can override these
+    output_types: list[OutputDataType] = [OutputDataType.TEXT]
+    supports_progress: bool = False
+    supports_elicitation: bool = False
+    supports_direct_response: bool = False
+    supports_streaming: bool = False
 
     def __init__(self, **kwargs: Any):
         """Initialize operator with optional overrides."""
@@ -112,10 +128,39 @@ class BaseOperator(ABC):
                 return await fallback.execute(context, mcp_session)
             raise
 
-    def get_tool_summary(self) -> dict[str, str]:
-        """Get summary for supervisor context."""
+    @property
+    def messaging_capabilities(self) -> MessagingCapabilities:
+        """Get messaging capabilities as a MessagingCapabilities object."""
+        return MessagingCapabilities(
+            output_types=self.output_types,
+            supports_progress=self.supports_progress,
+            supports_elicitation=self.supports_elicitation,
+            supports_direct_response=self.supports_direct_response,
+            supports_streaming=self.supports_streaming,
+        )
+
+    @property
+    def can_bypass_writer(self) -> bool:
+        """Check if operator can send responses directly to user."""
+        return self.supports_direct_response
+
+    @property
+    def returns_rich_content(self) -> bool:
+        """Check if operator can return images, widgets, or other rich content."""
+        rich_types = {OutputDataType.IMAGE, OutputDataType.WIDGET, OutputDataType.HTML}
+        return bool(rich_types.intersection(set(self.output_types)))
+
+    def get_tool_summary(self) -> dict[str, Any]:
+        """Get summary for supervisor context including messaging capabilities."""
         return {
             "name": self.name,
             "description": self.description,
             "type": self.operator_type.value,
+            "messaging": {
+                "output_types": [t.value for t in self.output_types],
+                "supports_progress": self.supports_progress,
+                "supports_elicitation": self.supports_elicitation,
+                "supports_direct_response": self.supports_direct_response,
+                "supports_streaming": self.supports_streaming,
+            },
         }
