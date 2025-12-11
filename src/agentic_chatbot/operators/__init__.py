@@ -2,7 +2,11 @@
 
 from agentic_chatbot.operators.base import BaseOperator, OperatorType
 from agentic_chatbot.operators.registry import OperatorRegistry
-from agentic_chatbot.operators.context import OperatorContext, OperatorResult
+from agentic_chatbot.operators.context import (
+    OperatorContext,
+    OperatorResult,
+    MessagingContext,
+)
 
 __all__ = [
     "BaseOperator",
@@ -10,4 +14,5 @@ __all__ = [
     "OperatorRegistry",
     "OperatorContext",
     "OperatorResult",
+    "MessagingContext",
 ]

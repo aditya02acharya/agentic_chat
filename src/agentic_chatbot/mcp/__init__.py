@@ -12,6 +12,9 @@ from agentic_chatbot.mcp.models import (
     ToolCall,
     ElicitationRequest,
     ElicitationResponse,
+    # Messaging capabilities
+    MessagingCapabilities,
+    OutputDataType,
 )
 from agentic_chatbot.mcp.callbacks import (
     MCPCallbacks,
@@ -48,6 +51,9 @@ __all__ = [
     "ToolCall",
     "ElicitationRequest",
     "ElicitationResponse",
+    # Messaging capabilities
+    "MessagingCapabilities",
+    "OutputDataType",
     # Callback Protocols
     "MCPCallbacks",
     "MCPProgressCallback",

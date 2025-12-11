@@ -14,8 +14,9 @@ A step-by-step guide to understanding the LangGraph-based agentic chatbot backen
 8. [Step 5: Understanding Events & SSE](#step-5-understanding-events--sse)
 9. [Step 6: Understanding Operators](#step-6-understanding-operators)
 10. [Step 7: Understanding MCP Integration](#step-7-understanding-mcp-integration)
-11. [Step 8: Understanding the Flow](#step-8-understanding-the-flow)
-12. [Debugging Tips](#debugging-tips)
+11. [Step 8: Understanding Local Tools](#step-8-understanding-local-tools)
+12. [Step 9: Understanding the Flow](#step-9-understanding-the-flow)
+13. [Debugging Tips](#debugging-tips)
 
 ---
 
@@ -63,7 +64,7 @@ src/agentic_chatbot/
 ├── api/                    # FastAPI layer
 │   ├── routes.py          # HTTP endpoints
 │   ├── models.py          # Request/Response schemas
-│   ├── dependencies.py    # Dependency injection
+│   ├── dependencies.py    # Dependency injection (incl. ToolProviderDep)
 │   └── sse.py             # Server-Sent Events helpers
 │
 ├── events/                 # Event system for real-time updates
@@ -73,17 +74,33 @@ src/agentic_chatbot/
 │   └── bus.py             # Event routing
 │
 ├── operators/              # Tool implementations
-│   ├── base.py            # Base operator class
+│   ├── base.py            # Base operator class + messaging attributes
 │   ├── registry.py        # Operator registry (Factory pattern)
+│   ├── context.py         # OperatorContext + MessagingContext
 │   ├── llm/               # Pure LLM operators
 │   ├── mcp/               # MCP-backed operators
 │   └── hybrid/            # Combined operators
+│
+├── tools/                  # 🆕 Local tools (zero-latency, in-process)
+│   ├── base.py            # LocalTool base class
+│   ├── registry.py        # LocalToolRegistry (decorator pattern)
+│   ├── provider.py        # UnifiedToolProvider (merges local + MCP)
+│   └── builtin/           # Built-in tools
+│       ├── self_info.py   # Bot version, capabilities, release notes
+│       ├── capabilities.py # Detailed feature list
+│       └── introspection.py # list_tools, list_operators
 │
 ├── mcp/                    # MCP Protocol integration
 │   ├── callbacks.py       # Callback handlers + ElicitationManager
 │   ├── client.py          # MCP client
 │   ├── manager.py         # Connection management
+│   ├── models.py          # Tool schemas + MessagingCapabilities
+│   ├── registry.py        # MCPServerRegistry
 │   └── session.py         # Session management
+│
+├── context/                # Context optimization
+│   ├── models.py          # DataChunk, DataSummary, TaskContext
+│   └── summarizer.py      # Inline summarization (haiku)
 │
 ├── config/                 # Configuration
 │   ├── settings.py        # Environment settings
@@ -132,10 +149,12 @@ def reduce_messages(left, right):
 |---------|--------|---------|
 | Input | `user_query`, `conversation_id`, `request_id` | Initial request data |
 | Conversation | `messages` | Chat history (uses reducer) |
-| Supervisor | `current_decision`, `iteration`, `action_history` | Decision-making state |
+| Supervisor | `current_decision`, `iteration`, `action_history`, `current_task_context` | Decision-making state |
 | Execution | `tool_results`, `current_tool`, `workflow_steps` | Tool execution state |
+| Context | `data_chunks`, `data_summaries`, `source_counter` | Context optimization (citations) |
+| Messaging | `sent_direct_response`, `direct_response_contents` | Direct response tracking |
 | Output | `final_response`, `clarify_question` | Final output data |
-| Runtime | `event_emitter`, `mcp_callbacks` | Runtime context (not persisted) |
+| Runtime | `event_emitter`, `mcp_callbacks`, `tool_provider`, `elicitation_manager` | Runtime context (not persisted) |
 
 ### Helper Function
 
@@ -145,7 +164,13 @@ initial_state = create_initial_state(
     conversation_id="conv-123",
     request_id="req-456",
     event_emitter=emitter,
-    # ... other runtime context
+    event_queue=event_queue,
+    mcp_registry=mcp_registry,
+    mcp_session_manager=mcp_session_manager,
+    mcp_callbacks=mcp_callbacks,
+    elicitation_manager=elicitation_manager,
+    tool_provider=tool_provider,  # UnifiedToolProvider for local + remote tools
+    user_context=user_context,
 )
 ```
 
@@ -200,10 +225,16 @@ def route_supervisor_decision(state: ChatState) -> Literal["answer", "call_tool"
     decision = state.get("current_decision")
     return decision.action.lower() if decision else "clarify"
 
-def route_reflection(state: ChatState) -> Literal["satisfied", "need_more", "blocked"]:
+def route_reflection(state: ChatState) -> Literal["satisfied", "need_more", "blocked", "direct_response"]:
+    # If operator sent content directly to user, skip synthesis/write
+    if state.get("sent_direct_response"):
+        return "direct_response"
+
     reflection = state.get("reflection")
     return reflection.assessment if reflection else "satisfied"
 ```
+
+The `direct_response` route is used when an operator bypasses the normal response flow by sending content directly to the user (e.g., widgets, images, or streaming data).
 
 ---
 
@@ -267,6 +298,8 @@ START
   │                 ▼                │   │
   │         ┌──────────────┐         │   │
   │         │ execute_tool │         │   │
+  │         │  (local or   │         │   │
+  │         │   operator)  │         │   │
   │         └──────────────┘         │   │
   │                 │                │   │
   │                 ▼                │   │
@@ -274,10 +307,10 @@ START
   │         │   reflect    │         │   │
   │         └──────────────┘         │   │
   │                 │                │   │
-  │    ┌────────────┼────────────┐   │   │
+  │    ┌────────────┼────────────┬───────┐
   │    │            │            │   │   │
-  │    ▼            ▼            ▼   │   │
-  │ "satisfied" "need_more"  "blocked"   │
+  │    ▼            ▼            ▼   │   ▼
+  │ "satisfied" "need_more"  "blocked"  "direct_response"
   │    │            │            │   │   │
   │    ▼            │            ▼   │   │
   │ ┌──────────┐    │    ┌───────────┐   │
@@ -294,19 +327,21 @@ START
                    │                     │
                    ▼                     │
             ┌──────────────┐             │
-  ┌────────►│   stream     │             │
-  │         └──────────────┘             │
-  │                │                     │
-  │                ▼                     │
-  │              END                     │
-  │                                      │
-  └── "clarify" ─────────────────────────┘
-        │
-        ▼
-  ┌──────────────┐
-  │   clarify    │───────────────────────►
+  ┌────────►│   stream     │◄────────────┘
+  │         └──────────────┘  (direct_response skips write)
+  │                │
+  │                ▼
+  │              END
+  │
+  └── "clarify" ────────────┐
+        │                   │
+        ▼                   │
+  ┌──────────────┐          │
+  │   clarify    │──────────┘
   └──────────────┘
 ```
+
+**Note:** The `direct_response` route allows operators to bypass the `synthesize` and `write` nodes when they've already sent content directly to the user (e.g., widgets, images, streaming responses).
 
 ### Optional: Checkpointer for Persistence
 
@@ -322,6 +357,20 @@ graph = create_chat_graph(checkpointer=MemorySaver())
 
 **File:** `src/agentic_chatbot/api/routes.py`
 
+### Dependency Injection
+
+FastAPI dependencies provide runtime context:
+
+```python
+# Type aliases in dependencies.py
+MCPRegistryDep = Annotated[MCPServerRegistry | None, Depends(get_mcp_registry)]
+MCPSessionManagerDep = Annotated[MCPSessionManager | None, Depends(get_mcp_session_manager)]
+ElicitationManagerDep = Annotated[ElicitationManager, Depends(get_elicitation_manager)]
+ToolProviderDep = Annotated[UnifiedToolProvider, Depends(get_tool_provider)]
+```
+
+The `ToolProviderDep` provides a unified interface to all tools (local + remote).
+
 ### Main Chat Endpoint (SSE Streaming)
 
 ```
@@ -336,19 +385,34 @@ Content-Type: application/json
 
 **Flow:**
 
-1. Create `event_queue` for SSE
-2. Create `EventEmitter` connected to queue
-3. Create MCP callbacks wired to emitter
-4. Build initial state with `create_initial_state()`
-5. Start background task to run graph
-6. Return `StreamingResponse` that yields from queue
+1. Inject dependencies (`mcp_registry`, `tool_provider`, `elicitation_manager`)
+2. Create `event_queue` for SSE
+3. Create `EventEmitter` connected to queue
+4. Create MCP callbacks wired to emitter
+5. Build initial state with `create_initial_state()` (includes `tool_provider`)
+6. Start background task to run graph
+7. Return `StreamingResponse` that yields from queue
 
 ```python
-async def run_graph():
-    graph = create_chat_graph()
-    config = {"configurable": {"thread_id": conversation_id}}
-    await graph.ainvoke(initial_state, config)
+@router.post("/chat")
+async def chat(
+    request: Request,
+    chat_request: ChatRequest,
+    mcp_registry: MCPRegistryDep,
+    mcp_session_manager: MCPSessionManagerDep,
+    elicitation_manager: ElicitationManagerDep,
+    tool_provider: ToolProviderDep,  # Unified local + remote tools
+) -> StreamingResponse:
+    ...
 ```
+
+### Tools Endpoint
+
+```
+GET /api/v1/tools
+```
+
+Lists all available tools via `UnifiedToolProvider` (local + MCP + operators).
 
 ### Sync Endpoint (Non-streaming)
 
@@ -378,13 +442,29 @@ Events provide real-time updates to the client via Server-Sent Events.
 
 ```python
 class EventType(str, Enum):
+    # Supervisor events
     SUPERVISOR_THINKING = "supervisor.thinking"
     SUPERVISOR_DECIDED = "supervisor.decided"
+
+    # Tool execution events
     TOOL_START = "tool.start"
     TOOL_PROGRESS = "tool.progress"
     TOOL_COMPLETE = "tool.complete"
+    TOOL_ERROR = "tool.error"
+
+    # Response streaming
     RESPONSE_CHUNK = "response.chunk"
     RESPONSE_DONE = "response.done"
+
+    # Direct response (operator bypasses writer)
+    DIRECT_RESPONSE = "direct.response"
+    DIRECT_RESPONSE_START = "direct.response.start"
+    DIRECT_RESPONSE_CHUNK = "direct.response.chunk"
+    DIRECT_RESPONSE_DONE = "direct.response.done"
+
+    # Elicitation (user input requests)
+    ELICITATION_REQUEST = "elicitation.request"
+    ELICITATION_RESPONSE = "elicitation.response"
     # ... more
 ```
 
@@ -432,6 +512,55 @@ Operators are the tools/actions the agent can use.
 | MCP-backed | Calls MCP tools | `RAGRetrieverOperator` |
 | Hybrid | LLM + MCP | `CoderOperator` |
 
+### Messaging Capabilities
+
+Operators can now communicate directly with users via `MessagingContext`:
+
+```python
+class BaseOperator:
+    # Messaging capability attributes
+    output_types: list[OutputDataType] = [OutputDataType.TEXT]
+    supports_progress: bool = False
+    supports_elicitation: bool = False
+    supports_direct_response: bool = False
+    supports_streaming: bool = False
+```
+
+| Capability | Purpose |
+|------------|---------|
+| `output_types` | Data types the operator can return (text, html, image, widget, json) |
+| `supports_progress` | Can send intermediate progress updates |
+| `supports_elicitation` | Can request user input during execution |
+| `supports_direct_response` | Can bypass writer and send content directly |
+| `supports_streaming` | Can stream content in chunks |
+
+### Using MessagingContext
+
+Operators receive a `MessagingContext` through their `OperatorContext`:
+
+```python
+async def execute(self, context: OperatorContext) -> OperatorResult:
+    messaging = context.messaging
+
+    # Send progress update
+    await messaging.send_progress("Processing step 1 of 3...")
+
+    # Send content directly to user (bypasses writer)
+    await messaging.send_content("Here's your result", direct_response=True)
+
+    # Send a widget (e.g., chart, interactive component)
+    await messaging.send_widget("<div>...</div>", widget_type="chart")
+
+    # Request user confirmation
+    confirmed = await messaging.confirm("Proceed with deletion?")
+
+    # Request user choice
+    choice = await messaging.choose(
+        "Select format:",
+        options=["JSON", "CSV", "XML"]
+    )
+```
+
 ### Operator Registry (Factory Pattern)
 
 ```python
@@ -450,8 +579,10 @@ result = await operator.execute(context)
 
 1. Create file in `operators/llm/`, `operators/mcp/`, or `operators/hybrid/`
 2. Inherit from `BaseOperator`
-3. Implement `execute(context) -> OperatorResult`
-4. Register with decorator
+3. Set messaging capability attributes if needed
+4. Implement `execute(context) -> OperatorResult`
+5. Use `context.messaging` for direct user communication
+6. Register with decorator
 
 ---
 
@@ -516,7 +647,119 @@ callbacks = create_mcp_callbacks(
 
 ---
 
-## Step 8: Understanding the Flow
+## Step 8: Understanding Local Tools
+
+**Files:** `src/agentic_chatbot/tools/`
+
+Local tools provide zero-latency, in-process operations that don't require network calls.
+
+### Why Local Tools?
+
+| Aspect | Local Tools | Remote MCP Tools |
+|--------|-------------|------------------|
+| Latency | Zero (in-process) | Network dependent |
+| Use Case | Self-awareness, introspection | External services |
+| Execution | Synchronous | Async with callbacks |
+| Context | Has access to registries | Isolated |
+
+### Built-in Local Tools
+
+| Tool | Purpose |
+|------|---------|
+| `self_info` | Returns bot version, capabilities, release notes |
+| `list_capabilities` | Detailed feature list (what bot can/cannot do) |
+| `list_tools` | Lists all available tools (local + remote) |
+| `list_operators` | Lists all registered operators |
+
+### LocalTool Base Class
+
+```python
+class LocalTool(ABC):
+    name: str
+    description: str
+    input_schema: dict[str, Any] = {}
+    messaging: MessagingCapabilities = MessagingCapabilities.default()
+    needs_introspection: bool = False  # Needs access to registries
+
+    @abstractmethod
+    async def execute(self, context: LocalToolContext) -> ToolResult:
+        pass
+```
+
+### LocalToolRegistry (Decorator Pattern)
+
+```python
+# Register a local tool
+@LocalToolRegistry.register("my_tool")
+class MyTool(LocalTool):
+    name = "my_tool"
+    description = "Does something useful"
+
+    async def execute(self, context: LocalToolContext) -> ToolResult:
+        return ToolResult(
+            status=ToolStatus.SUCCESS,
+            contents=[TextContent(text="Result")]
+        )
+
+# Get tool by name
+tool_cls = LocalToolRegistry.get("my_tool")
+tool = tool_cls()
+```
+
+### UnifiedToolProvider
+
+The `UnifiedToolProvider` merges local and remote tools into a single interface:
+
+```python
+class UnifiedToolProvider:
+    def __init__(
+        self,
+        local_registry: type[LocalToolRegistry],
+        mcp_registry: MCPServerRegistry | None,
+        operator_registry: type[OperatorRegistry] | None,
+    ):
+        ...
+
+    async def get_all_summaries(self) -> list[ToolSummary]:
+        """Get summaries from all sources."""
+
+    def is_local_tool(self, name: str) -> bool:
+        """Check if tool is local (zero-latency)."""
+
+    async def execute(self, name: str, params: dict, **kwargs) -> ToolResult:
+        """Execute local tool by name."""
+
+    def get_tools_text(self) -> str:
+        """Get formatted text for supervisor prompt."""
+```
+
+### Integration with Graph
+
+The `execute_tool_node` automatically routes to local tools:
+
+```python
+async def execute_tool_node(state: ChatState) -> dict[str, Any]:
+    tool_provider = state.get("tool_provider")
+
+    # Check if local tool (zero-latency)
+    if tool_provider.is_local_tool(tool_name):
+        return await _execute_local_tool(...)
+
+    # Otherwise, execute as operator
+    return await _execute_operator(...)
+```
+
+### Creating a New Local Tool
+
+1. Create file in `tools/builtin/`
+2. Inherit from `LocalTool`
+3. Implement `execute(context) -> ToolResult`
+4. Register with decorator
+5. Import in `tools/builtin/__init__.py`
+
+---
+
+## Step 9: Understanding the Flow
 
 ### Complete Request Flow
 
@@ -524,28 +767,32 @@ callbacks = create_mcp_callbacks(
 1. HTTP Request arrives at /api/v1/chat
        │
        ▼
-2. Create EventEmitter + Queue
+2. Inject dependencies (mcp_registry, tool_provider, elicitation_manager)
        │
        ▼
-3. Create MCP callbacks
+3. Create EventEmitter + Queue
        │
        ▼
-4. Create initial ChatState
+4. Create MCP callbacks
        │
        ▼
-5. Start background task: graph.ainvoke(state)
+5. Create initial ChatState (includes tool_provider)
        │
        ▼
-6. Return StreamingResponse
+6. Start background task: graph.ainvoke(state)
        │
        ▼
-7. Graph executes:
+7. Return StreamingResponse
+       │
+       ▼
+8. Graph executes:
    │
    ├─► initialize_node
    │       └─► Validates input, adds user message
    │
    ├─► supervisor_node
    │       ├─► Emits "thinking" event
+   │       ├─► Gets tool list from UnifiedToolProvider
    │       ├─► Calls LLM for decision
    │       └─► Returns decision + emits "decided" event
    │
@@ -554,10 +801,15 @@ callbacks = create_mcp_callbacks(
    │       ├─ ANSWER ─► write_node ─► stream_node ─► END
    │       │
    │       ├─ CALL_TOOL ─► execute_tool_node
-   │       │                    └─► reflect_node
-   │       │                           ├─ satisfied ─► synthesize ─► write ─► stream ─► END
-   │       │                           ├─ need_more ─► supervisor (loop)
-   │       │                           └─ blocked ─► handle_blocked ─► write ─► stream ─► END
+   │       │                    │
+   │       │                    ├─ [Local tool?] ─► _execute_local_tool (zero latency)
+   │       │                    └─ [Operator?] ─► _execute_operator (may use MCP)
+   │       │                           │
+   │       │                           └─► reflect_node
+   │       │                                  ├─ satisfied ─► synthesize ─► write ─► stream ─► END
+   │       │                                  ├─ need_more ─► supervisor (loop)
+   │       │                                  ├─ blocked ─► handle_blocked ─► write ─► stream ─► END
+   │       │                                  └─ direct_response ─► stream ─► END (skip write)
    │       │
    │       └─ CLARIFY ─► clarify_node ─► stream_node ─► END
    │
@@ -644,9 +896,22 @@ print(result.get("final_response"))
 | State | `graph/state.py` | TypedDict + reducers |
 | Nodes | `graph/nodes.py` | Async functions returning state updates |
 | Graph | `graph/builder.py` | StateGraph with conditional edges |
-| API | `api/routes.py` | FastAPI + SSE streaming |
+| API | `api/routes.py` | FastAPI + SSE streaming + dependency injection |
 | Events | `events/` | Real-time updates to client |
-| Operators | `operators/` | Pluggable tools (Strategy pattern) |
+| Operators | `operators/` | Pluggable tools with messaging capabilities |
+| Local Tools | `tools/` | Zero-latency in-process tools |
+| Tool Provider | `tools/provider.py` | UnifiedToolProvider (local + remote) |
 | MCP | `mcp/` | External tool protocol |
+| Context | `context/` | DataChunk/DataSummary for citations |
 
-Start by reading `graph/state.py`, then `graph/nodes.py`, then `graph/builder.py`. This gives you the core flow. Then explore `api/routes.py` to see how it's exposed via HTTP.
+### New Features Summary
+
+| Feature | Description |
+|---------|-------------|
+| **Local Tools** | Zero-latency tools for self-awareness (`self_info`, `list_capabilities`) |
+| **UnifiedToolProvider** | Merges local and remote tools into single interface |
+| **MessagingContext** | Allows operators to send progress, direct responses, elicit input |
+| **Direct Response** | Operators can bypass writer and send content directly to user |
+| **Context Optimization** | DataChunks for raw data, DataSummaries for supervisor decisions |
+
+Start by reading `graph/state.py`, then `graph/nodes.py`, then `graph/builder.py`. This gives you the core flow. Then explore `api/routes.py` to see how it's exposed via HTTP. For self-awareness features, see `tools/builtin/`.

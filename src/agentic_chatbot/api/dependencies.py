@@ -9,6 +9,9 @@ from agentic_chatbot.mcp.callbacks import ElicitationManager
 from agentic_chatbot.mcp.manager import MCPClientManager
 from agentic_chatbot.mcp.registry import MCPServerRegistry
 from agentic_chatbot.mcp.session import MCPSessionManager
+from agentic_chatbot.tools.provider import UnifiedToolProvider
+from agentic_chatbot.tools.registry import LocalToolRegistry
+from agentic_chatbot.operators.registry import OperatorRegistry
 
 
 def get_app_settings() -> Settings:
@@ -48,9 +51,29 @@ async def get_elicitation_manager(request: Request) -> ElicitationManager:
     return request.app.state.elicitation_manager
 
 
+async def get_tool_provider(
+    mcp_registry: Annotated[MCPServerRegistry | None, Depends(get_mcp_registry)],
+) -> UnifiedToolProvider:
+    """
+    Get UnifiedToolProvider for local and remote tools.
+
+    The tool provider merges:
+    - Local tools (zero-latency, in-process)
+    - Remote MCP tools (network calls to external servers)
+
+    This gives the supervisor a unified interface to all tools.
+    """
+    return UnifiedToolProvider(
+        local_registry=LocalToolRegistry,
+        mcp_registry=mcp_registry,
+        operator_registry=OperatorRegistry,
+    )
+
+
 # Type aliases for dependency injection
 SettingsDep = Annotated[Settings, Depends(get_app_settings)]
 MCPRegistryDep = Annotated[MCPServerRegistry | None, Depends(get_mcp_registry)]
 MCPClientManagerDep = Annotated[MCPClientManager | None, Depends(get_mcp_client_manager)]
 MCPSessionManagerDep = Annotated[MCPSessionManager | None, Depends(get_mcp_session_manager)]
 ElicitationManagerDep = Annotated[ElicitationManager, Depends(get_elicitation_manager)]
+ToolProviderDep = Annotated[UnifiedToolProvider, Depends(get_tool_provider)]
