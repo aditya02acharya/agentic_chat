@@ -113,10 +113,24 @@ def format_tool_results(state: ChatState) -> str:
 
 
 def get_tool_summaries(state: ChatState) -> str:
-    """Get formatted tool summaries."""
+    """
+    Get formatted tool summaries.
+
+    Priority:
+    1. UnifiedToolProvider (includes both local and remote tools)
+    2. MCP registry (remote tools only)
+    3. Operator registry (fallback)
+    """
+    # Prefer UnifiedToolProvider - includes local tools for self-awareness
+    tool_provider = state.get("tool_provider")
+    if tool_provider and hasattr(tool_provider, "get_tools_text"):
+        return tool_provider.get_tools_text()
+
+    # Fallback to MCP registry
     registry = state.get("mcp_registry")
     if registry and hasattr(registry, "get_tool_summaries_text"):
         return registry.get_tool_summaries_text()
+
     return OperatorRegistry.get_operators_text()
 
 
@@ -288,6 +302,11 @@ async def execute_tool_node(state: ChatState) -> dict[str, Any]:
     """
     Execute a single tool/operator with context optimization and messaging support.
 
+    TOOL TYPES:
+    - Local tools: Zero-latency, in-process (self_info, list_capabilities, etc.)
+    - Remote MCP tools: Network calls to external servers
+    - Operators: High-level execution strategies (may use MCP tools internally)
+
     CONTEXT OPTIMIZATION:
     - Receives TaskContext from supervisor (focused task, not full conversation)
     - Creates DataChunk with source tracking (for citations)
@@ -302,10 +321,11 @@ async def execute_tool_node(state: ChatState) -> dict[str, Any]:
       - Rich content (images, widgets)
 
     Flow:
-    1. Execute tool with TaskContext and MessagingContext
-    2. Store raw output as DataChunk (for synthesizer/writer citations)
-    3. Generate inline summary (for supervisor decisions)
-    4. Track if operator sent direct response (skip writer if so)
+    1. Check if local tool (execute via UnifiedToolProvider) or operator
+    2. Execute tool with TaskContext and MessagingContext
+    3. Store raw output as DataChunk (for synthesizer/writer citations)
+    4. Generate inline summary (for supervisor decisions)
+    5. Track if operator sent direct response (skip writer if so)
     """
     decision = state.get("current_decision")
     if not decision or not decision.operator:
@@ -322,6 +342,7 @@ async def execute_tool_node(state: ChatState) -> dict[str, Any]:
     tool_name = decision.operator
     params = decision.params or {}
     task_context = state.get("current_task_context")
+    tool_provider = state.get("tool_provider")
 
     await emit_event(
         state,
@@ -332,6 +353,164 @@ async def execute_tool_node(state: ChatState) -> dict[str, Any]:
         ),
     )
 
+    # Check if this is a local tool (zero-latency, in-process)
+    is_local = False
+    if tool_provider and hasattr(tool_provider, "is_local_tool"):
+        is_local = tool_provider.is_local_tool(tool_name)
+
+    if is_local:
+        # Execute local tool via UnifiedToolProvider
+        return await _execute_local_tool(state, tool_name, params, task_context, tool_provider)
+
+    # Otherwise, execute as operator (may use MCP tools internally)
+    return await _execute_operator(state, tool_name, params, task_context)
+
+
+async def _execute_local_tool(
+    state: ChatState,
+    tool_name: str,
+    params: dict[str, Any],
+    task_context: TaskContext | None,
+    tool_provider: Any,
+) -> dict[str, Any]:
+    """
+    Execute a local tool via UnifiedToolProvider.
+
+    Local tools are zero-latency, in-process tools like:
+    - self_info: Bot version and capabilities
+    - list_capabilities: Detailed feature list
+    - list_tools: Available tools
+    - list_operators: Available operators
+    """
+    try:
+        # Execute via tool provider
+        result = await tool_provider.execute(
+            tool_name,
+            params,
+            request_id=state.get("request_id"),
+            conversation_id=state.get("conversation_id"),
+        )
+
+        await emit_event(
+            state,
+            ToolCompleteEvent.create(
+                tool=tool_name,
+                content_count=len(result.contents) if result.contents else 1,
+                request_id=state.get("request_id"),
+            ),
+        )
+
+        # Generate source ID for citations
+        source_id, updated_counter = generate_source_id(state, tool_name)
+
+        # Extract content from local tool result
+        result_content = ""
+        if result.contents:
+            # Join all content items
+            content_parts = []
+            for content in result.contents:
+                if hasattr(content, "text"):
+                    content_parts.append(content.text)
+                elif hasattr(content, "content"):
+                    content_parts.append(str(content.content))
+                else:
+                    content_parts.append(str(content))
+            result_content = "\n".join(content_parts)
+
+        result_success = result.status.value == "success"
+        result_error = result.error
+
+        # Create DataChunk for synthesizer
+        data_chunk = DataChunk(
+            source_id=source_id,
+            source_type=tool_name,
+            content=result_content if result_success else f"Error: {result_error}",
+            query_used=task_context.task_description if task_context else state.get("user_query", ""),
+            metadata={"local_tool": True},
+        )
+
+        # Generate summary for supervisor (fast, using haiku)
+        task_desc = task_context.task_description if task_context else state.get("user_query", "")
+        data_summary = await summarize_tool_output(
+            chunk=data_chunk,
+            task_description=task_desc,
+        )
+
+        logger.info(
+            "Local tool executed",
+            tool=tool_name,
+            source_id=source_id,
+            success=result_success,
+        )
+
+        return {
+            "tool_results": [
+                ToolResult(
+                    tool_name=tool_name,
+                    success=result_success,
+                    content=result_content,
+                    error=result_error,
+                    metadata={"local_tool": True},
+                )
+            ],
+            "current_tool": None,
+            "data_chunks": [data_chunk],
+            "data_summaries": [data_summary],
+            "source_counter": updated_counter,
+        }
+
+    except Exception as e:
+        logger.error(f"Local tool execution failed: {e}", exc_info=True)
+
+        await emit_event(
+            state,
+            ToolErrorEvent.create(
+                tool=tool_name,
+                error=str(e),
+                request_id=state.get("request_id"),
+            ),
+        )
+
+        source_id, updated_counter = generate_source_id(state, tool_name)
+
+        return {
+            "tool_results": [
+                ToolResult(
+                    tool_name=tool_name,
+                    success=False,
+                    error=str(e),
+                    metadata={"local_tool": True},
+                )
+            ],
+            "current_tool": None,
+            "data_summaries": [
+                DataSummary(
+                    source_id=source_id,
+                    source_type=tool_name,
+                    key_findings=[],
+                    executive_summary="Local tool execution failed",
+                    has_results=False,
+                    error=str(e),
+                )
+            ],
+            "source_counter": updated_counter,
+        }
+
+
+async def _execute_operator(
+    state: ChatState,
+    tool_name: str,
+    params: dict[str, Any],
+    task_context: TaskContext | None,
+) -> dict[str, Any]:
+    """
+    Execute an operator with messaging context support.
+
+    Operators are high-level execution strategies that may:
+    - Use MCP tools internally
+    - Send direct responses to user
+    - Support progress updates and elicitation
+    """
     try:
         # Get operator from registry
         operator_cls = OperatorRegistry.get(tool_name)

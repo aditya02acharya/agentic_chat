@@ -292,6 +292,7 @@ class ChatState(TypedDict, total=False):
     mcp_session_manager: Any | None  # MCPSessionManager
     mcp_callbacks: MCPCallbacks | None  # MCP callback handlers
     elicitation_manager: ElicitationManager | None  # For user input requests
+    tool_provider: Any | None  # UnifiedToolProvider for local + remote tools
 
     # Error handling
     error: str | None
@@ -313,6 +314,7 @@ def create_initial_state(
     mcp_session_manager: Any = None,
     mcp_callbacks: MCPCallbacks | None = None,
     elicitation_manager: ElicitationManager | None = None,
+    tool_provider: Any = None,
     user_context: dict[str, Any] | None = None,
 ) -> ChatState:
     """
@@ -327,6 +329,7 @@ def create_initial_state(
         mcp_registry: MCP server registry
         mcp_session_manager: MCP session manager
         mcp_callbacks: MCP callbacks
+        tool_provider: UnifiedToolProvider for local + remote tools
         elicitation_manager: Manager for user input requests
         user_context: Additional context from user
 
@@ -382,6 +385,7 @@ def create_initial_state(
         mcp_session_manager=mcp_session_manager,
         mcp_callbacks=mcp_callbacks,
         elicitation_manager=elicitation_manager,
+        tool_provider=tool_provider,
 
         # Error handling
         error=None,

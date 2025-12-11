@@ -23,6 +23,7 @@ from agentic_chatbot.api.dependencies import (
     MCPRegistryDep,
     MCPSessionManagerDep,
     ElicitationManagerDep,
+    ToolProviderDep,
 )
 from agentic_chatbot.api.sse import event_generator_with_task
 from agentic_chatbot.events.emitter import EventEmitter
@@ -53,32 +54,34 @@ async def health_check() -> HealthResponse:
 
 @router.get("/tools", response_model=ToolsResponse)
 async def list_tools(
-    mcp_registry: MCPRegistryDep,
+    tool_provider: ToolProviderDep,
 ) -> ToolsResponse:
     """
     List available tools.
 
-    Returns summaries of all registered tools from both
-    MCP servers and internal operators.
+    Returns summaries of all registered tools:
+    - Local tools (self-awareness, introspection)
+    - Remote MCP tools (external servers)
+    - Operators (internal execution strategies)
     """
     tools = []
 
-    # Get MCP tools
-    if mcp_registry:
-        try:
-            mcp_summaries = await mcp_registry.get_all_tool_summaries()
-            for summary in mcp_summaries:
-                tools.append(
-                    ToolSummaryResponse(
-                        name=summary.name,
-                        description=summary.description,
-                        server_id=summary.server_id,
-                    )
+    # Get all tool summaries via UnifiedToolProvider
+    # This includes local tools, MCP tools, and can be extended
+    try:
+        all_summaries = await tool_provider.get_all_summaries()
+        for summary in all_summaries:
+            tools.append(
+                ToolSummaryResponse(
+                    name=summary.name,
+                    description=summary.description,
+                    server_id=getattr(summary, "server_id", None),
                 )
-        except Exception as e:
-            logger.warning(f"Failed to get MCP tools: {e}")
+            )
+    except Exception as e:
+        logger.warning(f"Failed to get tool summaries from provider: {e}")
 
-    # Get operator summaries
+    # Get operator summaries (operators are separate from tools)
     operator_summaries = OperatorRegistry.get_all_summaries()
     for summary in operator_summaries:
         # Avoid duplicates
@@ -100,6 +103,7 @@ async def chat(
     mcp_registry: MCPRegistryDep,
     mcp_session_manager: MCPSessionManagerDep,
     elicitation_manager: ElicitationManagerDep,
+    tool_provider: ToolProviderDep,
 ) -> StreamingResponse:
     """
     Main chat endpoint with SSE streaming.
@@ -151,6 +155,7 @@ async def chat(
         mcp_session_manager=mcp_session_manager,
         mcp_callbacks=mcp_callbacks,
         elicitation_manager=elicitation_manager,
+        tool_provider=tool_provider,
         user_context=chat_request.context,
     )
 
@@ -212,6 +217,7 @@ async def chat_sync(
     mcp_registry: MCPRegistryDep,
     mcp_session_manager: MCPSessionManagerDep,
     elicitation_manager: ElicitationManagerDep,
+    tool_provider: ToolProviderDep,
 ) -> ChatResponse:
     """
     Non-streaming chat endpoint.
@@ -250,6 +256,7 @@ async def chat_sync(
         mcp_session_manager=mcp_session_manager,
         mcp_callbacks=mcp_callbacks,
         elicitation_manager=elicitation_manager,
+        tool_provider=tool_provider,
         user_context=chat_request.context,
     )
 

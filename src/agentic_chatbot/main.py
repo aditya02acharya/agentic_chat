@@ -25,6 +25,10 @@ from agentic_chatbot.operators.mcp import (  # noqa: F401
 )
 from agentic_chatbot.operators.hybrid import CoderOperator  # noqa: F401
 
+# Register builtin local tools (self-awareness, introspection)
+from agentic_chatbot.tools.builtin import register_builtin_tools
+register_builtin_tools()
+
 
 logger = get_logger(__name__)
 
