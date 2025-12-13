@@ -17,6 +17,10 @@ class ChatRequest(BaseModel):
     conversation_id: str = Field(..., description="Unique conversation identifier")
     message: str = Field(..., description="User's message")
     context: dict[str, Any] | None = Field(None, description="Additional context")
+    model: str | None = Field(
+        None,
+        description="Model to use for response generation (e.g., 'sonnet', 'haiku', 'thinking'). Uses default if not specified.",
+    )
 
 
 # =============================================================================
@@ -62,6 +66,17 @@ class ChatHistoryResponse(BaseModel):
     messages: list[MessageResponse] = Field(default_factory=list)
 
 
+class TokenUsageResponse(BaseModel):
+    """Token usage information."""
+
+    input_tokens: int = Field(0, description="Number of input tokens")
+    output_tokens: int = Field(0, description="Number of output tokens")
+    thinking_tokens: int = Field(0, description="Number of thinking tokens (extended thinking)")
+    cache_read_tokens: int = Field(0, description="Number of cached tokens read")
+    cache_write_tokens: int = Field(0, description="Number of tokens written to cache")
+    total_tokens: int = Field(0, description="Total tokens used")
+
+
 class ChatResponse(BaseModel):
     """
     Non-streaming response for chat endpoint.
@@ -73,6 +88,7 @@ class ChatResponse(BaseModel):
     conversation_id: str = Field(..., description="Conversation identifier")
     response: str = Field(..., description="Assistant's response")
     request_id: str = Field(..., description="Request identifier")
+    usage: TokenUsageResponse | None = Field(None, description="Token usage information")
 
 
 class ErrorResponse(BaseModel):

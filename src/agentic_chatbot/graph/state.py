@@ -23,6 +23,7 @@ from agentic_chatbot.events.emitter import EventEmitter
 from agentic_chatbot.mcp.callbacks import MCPCallbacks, ElicitationManager
 from agentic_chatbot.core.workflow import WorkflowDefinition, WorkflowResult
 from agentic_chatbot.context.models import TaskContext, DataChunk, DataSummary, DataStore
+from agentic_chatbot.config.models import TokenUsage
 
 
 # =============================================================================
@@ -196,6 +197,18 @@ def reduce_data_summaries(
     return left + right
 
 
+def reduce_token_usage(
+    left: TokenUsage | None,
+    right: TokenUsage | None,
+) -> TokenUsage:
+    """Reducer for token usage - accumulates all token counts."""
+    if not left:
+        left = TokenUsage()
+    if not right:
+        return left
+    return left + right
+
+
 # =============================================================================
 # MAIN STATE DEFINITION
 # =============================================================================
@@ -282,6 +295,12 @@ class ChatState(TypedDict, total=False):
     # Direct response tracking (operator/tool bypassed writer)
     sent_direct_response: bool  # Whether operator sent response directly to user
     direct_response_contents: list[Any]  # Content items sent directly
+
+    # -------------------------------------------------------------------------
+    # TOKEN TRACKING
+    # Accumulates all token usage across the entire request
+    # -------------------------------------------------------------------------
+    token_usage: Annotated[TokenUsage, reduce_token_usage]
 
     # -------------------------------------------------------------------------
     # RUNTIME CONTEXT (not persisted to checkpointer)
@@ -377,6 +396,9 @@ def create_initial_state(
         # Direct response tracking
         sent_direct_response=False,
         direct_response_contents=[],
+
+        # Token tracking
+        token_usage=TokenUsage(),
 
         # Runtime context
         event_emitter=event_emitter,

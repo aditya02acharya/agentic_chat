@@ -1,9 +1,10 @@
 """AWS Bedrock provider for Claude models using Converse API."""
 
-from typing import AsyncIterator
+from typing import AsyncIterator, Any
 
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
+from agentic_chatbot.config.models import ThinkingConfig, TokenUsage
 from agentic_chatbot.utils.providers.base import BaseLLMProvider, LLMResponse
 from agentic_chatbot.utils.logging import get_logger
 
@@ -19,28 +20,19 @@ class BedrockProvider(BaseLLMProvider):
     for conversational AI models across different providers.
 
     Features:
-    - Model aliases mapped to Bedrock model IDs
+    - Model resolution via ModelRegistry
     - Cross-region inference support
     - Automatic retry with exponential backoff
-    - Usage tracking (tokens)
+    - Comprehensive token tracking
     - Streaming support via converse_stream
 
     Note: Requires AWS credentials configured via:
     - Environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)
     - AWS credentials file (~/.aws/credentials)
     - IAM role (when running on AWS)
-    """
 
-    # Bedrock uses different model IDs - includes anthropic. prefix
-    MODEL_ALIASES: dict[str, str] = {
-        "haiku": "anthropic.claude-3-haiku-20240307-v1:0",
-        "sonnet": "anthropic.claude-3-5-sonnet-20241022-v2:0",
-        "opus": "anthropic.claude-3-opus-20240229-v1:0",
-        # Also support cross-region inference IDs
-        "haiku-us": "us.anthropic.claude-3-haiku-20240307-v1:0",
-        "sonnet-us": "us.anthropic.claude-3-5-sonnet-20241022-v2:0",
-        "opus-us": "us.anthropic.claude-3-opus-20240229-v1:0",
-    }
+    Note: Extended thinking is not yet supported on Bedrock.
+    """
 
     def __init__(
         self,
@@ -112,9 +104,22 @@ class BedrockProvider(BaseLLMProvider):
         model: str = "sonnet",
         max_tokens: int = 4096,
         temperature: float = 0.0,
+        thinking: ThinkingConfig | None = None,
+        **kwargs: Any,
     ) -> LLMResponse:
-        """Call Bedrock Converse API and get complete response."""
+        """
+        Call Bedrock Converse API and get complete response.
+
+        Note: Extended thinking is not yet supported on Bedrock.
+        The thinking parameter is accepted for API compatibility but ignored.
+        """
         resolved_model = self.resolve_model(model)
+
+        if thinking and thinking.enabled:
+            logger.warning(
+                "Extended thinking is not supported on Bedrock, ignoring",
+                model=resolved_model,
+            )
 
         logger.debug(
             "Calling Bedrock Converse API",
@@ -161,24 +166,25 @@ class BedrockProvider(BaseLLMProvider):
                 content += block["text"]
 
         # Extract usage info
-        usage = response.get("usage", {})
-        input_tokens = usage.get("inputTokens", 0)
-        output_tokens = usage.get("outputTokens", 0)
+        usage_data = response.get("usage", {})
+        usage = TokenUsage(
+            input_tokens=usage_data.get("inputTokens", 0),
+            output_tokens=usage_data.get("outputTokens", 0),
+        )
         stop_reason = response.get("stopReason", "unknown")
 
         logger.debug(
             "Bedrock Converse response received",
             model=resolved_model,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
             stop_reason=stop_reason,
         )
 
         return LLMResponse(
             content=content,
             model=resolved_model,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
+            usage=usage,
             stop_reason=stop_reason,
             provider=self.provider_name,
         )
@@ -190,9 +196,17 @@ class BedrockProvider(BaseLLMProvider):
         model: str = "sonnet",
         max_tokens: int = 4096,
         temperature: float = 0.0,
+        thinking: ThinkingConfig | None = None,
+        **kwargs: Any,
     ) -> AsyncIterator[str]:
         """Stream response from Bedrock Converse API."""
         resolved_model = self.resolve_model(model)
+
+        if thinking and thinking.enabled:
+            logger.warning(
+                "Extended thinking is not supported on Bedrock streaming, ignoring",
+                model=resolved_model,
+            )
 
         logger.debug(
             "Starting Bedrock Converse stream",

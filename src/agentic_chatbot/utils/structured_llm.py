@@ -1,11 +1,13 @@
-"""Structured LLM output with Pydantic validation and retry."""
+"""Structured LLM output with Pydantic validation, retry, and thinking support."""
 
 import json
-from typing import TypeVar, Type, Any
+from dataclasses import dataclass, field
+from typing import TypeVar, Type, Any, Generic
 
 from pydantic import BaseModel, ValidationError
 
-from agentic_chatbot.utils.llm import LLMClient
+from agentic_chatbot.config.models import TokenUsage, get_thinking_config
+from agentic_chatbot.utils.llm import LLMClient, LLMResponse
 from agentic_chatbot.utils.logging import get_logger
 
 
@@ -23,6 +25,17 @@ class StructuredOutputError(Exception):
         self.attempts = attempts  # History of failed attempts
 
 
+@dataclass
+class StructuredResult(Generic[T]):
+    """Result from structured LLM call including token usage."""
+
+    data: T
+    usage: TokenUsage = field(default_factory=TokenUsage)
+    thinking_content: str = ""  # Model's thinking process (if enabled)
+    model: str = ""
+    attempts: int = 1
+
+
 class StructuredLLMCaller:
     """
     Calls LLM expecting structured JSON output with validation and retry.
@@ -30,6 +43,8 @@ class StructuredLLMCaller:
     Features:
     - Pydantic schema validation
     - Error-feedback retry (tells LLM what went wrong)
+    - Extended thinking mode support
+    - Token usage tracking across retries
     - Configurable max retries
     - Preserves original inputs on retry
 
@@ -57,6 +72,8 @@ class StructuredLLMCaller:
         response_model: Type[T],
         system: str | None = None,
         model: str = "sonnet",
+        enable_thinking: bool = False,
+        thinking_budget: int | None = None,
     ) -> T:
         """
         Call LLM and parse response into Pydantic model.
@@ -66,9 +83,47 @@ class StructuredLLMCaller:
             response_model: Pydantic model class for validation
             system: System prompt (will append schema instructions)
             model: LLM model to use
+            enable_thinking: Enable extended thinking mode
+            thinking_budget: Custom thinking token budget
 
         Returns:
             Validated Pydantic model instance
+
+        Raises:
+            StructuredOutputError: After max_retries failures
+        """
+        result = await self.call_with_usage(
+            prompt=prompt,
+            response_model=response_model,
+            system=system,
+            model=model,
+            enable_thinking=enable_thinking,
+            thinking_budget=thinking_budget,
+        )
+        return result.data
+
+    async def call_with_usage(
+        self,
+        prompt: str,
+        response_model: Type[T],
+        system: str | None = None,
+        model: str = "sonnet",
+        enable_thinking: bool = False,
+        thinking_budget: int | None = None,
+    ) -> StructuredResult[T]:
+        """
+        Call LLM and parse response, returning result with token usage.
+
+        Args:
+            prompt: User prompt requesting structured output
+            response_model: Pydantic model class for validation
+            system: System prompt (will append schema instructions)
+            model: LLM model to use
+            enable_thinking: Enable extended thinking mode
+            thinking_budget: Custom thinking token budget
+
+        Returns:
+            StructuredResult with validated data and usage info
 
         Raises:
             StructuredOutputError: After max_retries failures
@@ -81,13 +136,26 @@ class StructuredLLMCaller:
         attempts: list[dict[str, Any]] = []
         current_prompt = prompt
 
+        # Track total usage across retries
+        total_usage = TokenUsage()
+        thinking_content = ""
+        final_model = model
+
         for attempt in range(self.max_retries):
             # Call LLM
             response = await self.llm_client.complete(
                 prompt=current_prompt,
                 system=full_system,
                 model=model,
+                enable_thinking=enable_thinking,
+                thinking_budget=thinking_budget,
             )
+
+            # Accumulate token usage
+            total_usage = total_usage + response.usage
+            if response.thinking_content:
+                thinking_content = response.thinking_content
+            final_model = response.model
 
             raw_output = response.content
 
@@ -127,7 +195,13 @@ class StructuredLLMCaller:
                     model=response_model.__name__,
                     attempts=attempt + 1,
                 )
-                return result
+                return StructuredResult(
+                    data=result,
+                    usage=total_usage,
+                    thinking_content=thinking_content,
+                    model=final_model,
+                    attempts=attempt + 1,
+                )
             except ValidationError as e:
                 error_msg = self._format_validation_errors(e)
                 logger.warning(
