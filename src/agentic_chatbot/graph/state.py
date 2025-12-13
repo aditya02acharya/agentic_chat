@@ -236,6 +236,7 @@ class ChatState(TypedDict, total=False):
     conversation_id: str  # Unique conversation identifier
     request_id: str  # Unique request identifier
     user_context: dict[str, Any]  # Additional context from the user
+    requested_model: str | None  # Model requested by user for response generation
 
     # -------------------------------------------------------------------------
     # CONVERSATION HISTORY
@@ -335,6 +336,7 @@ def create_initial_state(
     elicitation_manager: ElicitationManager | None = None,
     tool_provider: Any = None,
     user_context: dict[str, Any] | None = None,
+    requested_model: str | None = None,
 ) -> ChatState:
     """
     Create initial state for a new chat request.
@@ -351,6 +353,7 @@ def create_initial_state(
         tool_provider: UnifiedToolProvider for local + remote tools
         elicitation_manager: Manager for user input requests
         user_context: Additional context from user
+        requested_model: Model ID requested by user for response generation
 
     Returns:
         Initialized ChatState
@@ -361,6 +364,7 @@ def create_initial_state(
         conversation_id=conversation_id,
         request_id=request_id,
         user_context=user_context or {},
+        requested_model=requested_model,
 
         # Conversation
         messages=[],

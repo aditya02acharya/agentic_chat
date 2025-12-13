@@ -1,5 +1,6 @@
 """Coder operator that uses LLM for code generation and MCP for execution."""
 
+import re
 from typing import TYPE_CHECKING
 
 from agentic_chatbot.config.prompts import CODER_SYSTEM_PROMPT, CODER_PROMPT
@@ -9,9 +10,24 @@ from agentic_chatbot.operators.context import OperatorContext, OperatorResult
 from agentic_chatbot.operators.registry import OperatorRegistry
 from agentic_chatbot.utils.llm import LLMClient
 from agentic_chatbot.mcp.models import ToolContent
+from agentic_chatbot.utils.logging import get_logger
 
 if TYPE_CHECKING:
     from agentic_chatbot.mcp.session import MCPSession
+
+
+logger = get_logger(__name__)
+
+
+# Keywords that indicate complex coding tasks requiring extended thinking
+COMPLEX_TASK_KEYWORDS = [
+    "algorithm", "optimize", "performance", "recursive", "dynamic programming",
+    "tree", "graph", "traversal", "binary search", "sorting", "data structure",
+    "concurrent", "async", "parallel", "thread", "multiprocess",
+    "design pattern", "architecture", "refactor", "debug", "fix",
+    "test", "unit test", "integration", "security", "vulnerability",
+    "memory", "efficient", "complexity", "big o", "cache",
+]
 
 
 @OperatorRegistry.register("coder")
@@ -42,6 +58,13 @@ class CoderOperator(BaseOperator):
         """
         Execute code generation and execution.
 
+        Uses extended thinking mode for complex coding tasks that require:
+        - Algorithm design
+        - Performance optimization
+        - Debugging/fixing issues
+        - Security considerations
+        - Complex data structures
+
         Args:
             context: Operator context with query and language
             mcp_session: Required MCP session
@@ -60,6 +83,9 @@ class CoderOperator(BaseOperator):
         if language not in ["python", "javascript"]:
             language = "python"
 
+        # Determine if task requires extended thinking
+        use_thinking = self._should_use_thinking(context.query)
+
         client = LLMClient()
 
         # Step 1: LLM generates code
@@ -70,11 +96,25 @@ class CoderOperator(BaseOperator):
         )
 
         try:
-            code_response = await client.complete(
-                prompt=prompt,
-                system=CODER_SYSTEM_PROMPT,
-                model=self.model or "sonnet",
-            )
+            # Use thinking mode for complex tasks
+            if use_thinking:
+                logger.info(
+                    "Using extended thinking for complex coding task",
+                    task_preview=context.query[:100],
+                )
+                code_response = await client.complete(
+                    prompt=prompt,
+                    system=CODER_SYSTEM_PROMPT,
+                    model="thinking",
+                    enable_thinking=True,
+                    thinking_budget=15000,
+                )
+            else:
+                code_response = await client.complete(
+                    prompt=prompt,
+                    system=CODER_SYSTEM_PROMPT,
+                    model=self.model or "sonnet",
+                )
 
             code = self._extract_code(code_response.content, language)
 
@@ -103,11 +143,13 @@ class CoderOperator(BaseOperator):
             return OperatorResult.success_result(
                 output=output,
                 contents=contents,
-                input_tokens=code_response.input_tokens,
-                output_tokens=code_response.output_tokens,
+                input_tokens=code_response.usage.input_tokens,
+                output_tokens=code_response.usage.output_tokens,
                 metadata={
                     "model": code_response.model,
                     "execution_duration_ms": exec_result.duration_ms,
+                    "used_thinking": use_thinking,
+                    "thinking_tokens": code_response.usage.thinking_tokens,
                 },
             )
 
@@ -144,3 +186,37 @@ class CoderOperator(BaseOperator):
             code_lines.append(line)
 
         return "\n".join(code_lines)
+
+    def _should_use_thinking(self, query: str) -> bool:
+        """
+        Determine if the coding task requires extended thinking.
+
+        Complex tasks that benefit from thinking mode:
+        - Algorithm design and optimization
+        - Debugging and fixing issues
+        - Performance optimization
+        - Security considerations
+        - Complex data structures
+
+        Args:
+            query: The coding task description
+
+        Returns:
+            True if extended thinking should be used
+        """
+        query_lower = query.lower()
+
+        # Check for complex task keywords
+        for keyword in COMPLEX_TASK_KEYWORDS:
+            if keyword in query_lower:
+                return True
+
+        # Check for long/complex queries (likely more complex tasks)
+        if len(query) > 300:
+            return True
+
+        # Check for multiple requirements (indicated by bullet points or numbers)
+        if re.search(r"(\d+\.|[-*])\s+\w+", query):
+            return True
+
+        return False

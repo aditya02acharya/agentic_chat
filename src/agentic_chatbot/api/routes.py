@@ -13,6 +13,7 @@ from agentic_chatbot.api.models import (
     HealthResponse,
     ToolsResponse,
     ToolSummaryResponse,
+    TokenUsageResponse,
     ErrorResponse,
     ElicitationResponseRequest,
     ElicitationResponseResult,
@@ -157,6 +158,7 @@ async def chat(
         elicitation_manager=elicitation_manager,
         tool_provider=tool_provider,
         user_context=chat_request.context,
+        requested_model=chat_request.model,
     )
 
     # Track request
@@ -258,6 +260,7 @@ async def chat_sync(
         elicitation_manager=elicitation_manager,
         tool_provider=tool_provider,
         user_context=chat_request.context,
+        requested_model=chat_request.model,
     )
 
     try:
@@ -274,10 +277,24 @@ async def chat_sync(
         # Get response from final state
         response = final_state.get("final_response", "")
 
+        # Extract token usage from final state
+        token_usage = final_state.get("token_usage")
+        usage_response = None
+        if token_usage:
+            usage_response = TokenUsageResponse(
+                input_tokens=token_usage.input_tokens,
+                output_tokens=token_usage.output_tokens,
+                thinking_tokens=token_usage.thinking_tokens,
+                cache_read_tokens=token_usage.cache_read_tokens,
+                cache_write_tokens=token_usage.cache_write_tokens,
+                total_tokens=token_usage.total,
+            )
+
         return ChatResponse(
             conversation_id=chat_request.conversation_id,
             response=response,
             request_id=request_id,
+            usage=usage_response,
         )
 
     except Exception as e:

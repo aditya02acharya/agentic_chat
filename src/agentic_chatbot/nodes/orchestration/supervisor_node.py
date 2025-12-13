@@ -4,12 +4,13 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from agentic_chatbot.config.models import TokenUsage
 from agentic_chatbot.config.prompts import SUPERVISOR_SYSTEM_PROMPT, SUPERVISOR_DECISION_PROMPT
 from agentic_chatbot.core.supervisor import SupervisorDecision, SupervisorState
 from agentic_chatbot.events.models import SupervisorThinkingEvent, SupervisorDecidedEvent
 from agentic_chatbot.nodes.base import AsyncBaseNode
 from agentic_chatbot.operators.registry import OperatorRegistry
-from agentic_chatbot.utils.structured_llm import StructuredLLMCaller, StructuredOutputError
+from agentic_chatbot.utils.structured_llm import StructuredLLMCaller, StructuredOutputError, StructuredResult
 from agentic_chatbot.utils.logging import get_logger
 
 
@@ -66,8 +67,8 @@ class SupervisorNode(AsyncBaseNode):
 
         return context
 
-    async def exec_async(self, prep_res: dict[str, Any]) -> SupervisorDecision:
-        """Execute supervisor decision-making."""
+    async def exec_async(self, prep_res: dict[str, Any]) -> StructuredResult[SupervisorDecision]:
+        """Execute supervisor decision-making with extended thinking."""
         caller = StructuredLLMCaller(max_retries=3)
 
         # Build prompts
@@ -81,60 +82,84 @@ class SupervisorNode(AsyncBaseNode):
         )
 
         try:
-            decision = await caller.call(
+            # Use extended thinking for complex reasoning
+            result = await caller.call_with_usage(
                 prompt=prompt,
                 response_model=SupervisorDecision,
                 system=system,
-                model="sonnet",
+                model="thinking",
+                enable_thinking=True,
+                thinking_budget=10000,
             )
-            return decision
+            return result
 
         except StructuredOutputError as e:
             # Fallback to CLARIFY action
             logger.error(f"Supervisor decision failed: {e.attempts}")
-            return SupervisorDecision(
-                action="CLARIFY",
-                reasoning="Unable to determine appropriate action due to processing error",
-                question="Could you please rephrase your request?",
+            return StructuredResult(
+                data=SupervisorDecision(
+                    action="CLARIFY",
+                    reasoning="Unable to determine appropriate action due to processing error",
+                    question="Could you please rephrase your request?",
+                ),
+                usage=TokenUsage(),
             )
 
     async def post_async(
         self,
         shared: dict[str, Any],
         prep_res: dict[str, Any],
-        exec_res: SupervisorDecision,
+        exec_res: StructuredResult[SupervisorDecision],
     ) -> str:
-        """Store decision and return action for routing."""
+        """Store decision, track token usage, and return action for routing."""
         state: SupervisorState = prep_res["state"]
 
+        # Extract decision and token usage from result
+        decision = exec_res.data
+        token_usage = exec_res.usage
+
         # Store decision
-        shared["supervisor"]["current_decision"] = exec_res
-        state.current_decision = exec_res
+        shared["supervisor"]["current_decision"] = decision
+        state.current_decision = decision
+
+        # Track token usage in shared state
+        current_usage = shared.get("token_usage")
+        if current_usage is None:
+            current_usage = TokenUsage()
+        shared["token_usage"] = current_usage + token_usage
+
+        # Log thinking content if available (for debugging)
+        if exec_res.thinking_content:
+            logger.debug(
+                "Supervisor thinking",
+                thinking_preview=exec_res.thinking_content[:200],
+            )
 
         # Emit decided event
         action_messages = {
             "ANSWER": "I can answer this directly",
-            "CALL_TOOL": f"Using {exec_res.operator or 'tool'} to get information",
+            "CALL_TOOL": f"Using {decision.operator or 'tool'} to get information",
             "CREATE_WORKFLOW": "Creating a multi-step plan",
             "CLARIFY": "I need some clarification",
         }
         await self.emit_event(
             shared,
             SupervisorDecidedEvent.create(
-                action=exec_res.action,
-                message=action_messages.get(exec_res.action, "Processing..."),
+                action=decision.action,
+                message=action_messages.get(decision.action, "Processing..."),
                 request_id=shared.get("request_id"),
             ),
         )
 
         logger.info(
             "Supervisor decided",
-            action=exec_res.action,
-            reasoning=exec_res.reasoning[:100],
+            action=decision.action,
+            reasoning=decision.reasoning[:100],
+            thinking_tokens=token_usage.thinking_tokens,
         )
 
         # Map to flow action
-        return exec_res.action.lower()
+        return decision.action.lower()
 
     def _format_conversation_context(self, shared: dict[str, Any]) -> str:
         """Format conversation context for prompt."""

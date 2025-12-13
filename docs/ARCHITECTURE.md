@@ -104,11 +104,16 @@ src/agentic_chatbot/
 │
 ├── config/                 # Configuration
 │   ├── settings.py        # Environment settings
+│   ├── models.py          # Model registry + TokenUsage + ThinkingConfig
 │   └── prompts.py         # LLM prompt templates
 │
 └── utils/                  # Utilities
-    ├── llm.py             # LLM client wrapper
-    ├── structured_llm.py  # Structured output with validation
+    ├── llm.py             # LLM client wrapper with thinking support
+    ├── structured_llm.py  # Structured output with validation + token tracking
+    ├── providers/         # Multi-provider LLM support
+    │   ├── base.py        # BaseLLMProvider + LLMResponse
+    │   ├── anthropic.py   # Anthropic direct API with thinking
+    │   └── bedrock.py     # AWS Bedrock provider
     └── logging.py         # Logging configuration
 ```
 
@@ -147,14 +152,42 @@ def reduce_messages(left, right):
 
 | Section | Fields | Purpose |
 |---------|--------|---------|
-| Input | `user_query`, `conversation_id`, `request_id` | Initial request data |
+| Input | `user_query`, `conversation_id`, `request_id`, `requested_model` | Initial request data |
 | Conversation | `messages` | Chat history (uses reducer) |
 | Supervisor | `current_decision`, `iteration`, `action_history`, `current_task_context` | Decision-making state |
 | Execution | `tool_results`, `current_tool`, `workflow_steps` | Tool execution state |
 | Context | `data_chunks`, `data_summaries`, `source_counter` | Context optimization (citations) |
 | Messaging | `sent_direct_response`, `direct_response_contents` | Direct response tracking |
+| Token Tracking | `token_usage` | Accumulated token counts (uses reducer) |
 | Output | `final_response`, `clarify_question` | Final output data |
 | Runtime | `event_emitter`, `mcp_callbacks`, `tool_provider`, `elicitation_manager` | Runtime context (not persisted) |
+
+### Token Usage Tracking
+
+Token usage is tracked across all LLM calls using a reducer:
+
+```python
+@dataclass
+class TokenUsage:
+    input_tokens: int = 0
+    output_tokens: int = 0
+    thinking_tokens: int = 0      # Extended thinking tokens
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+
+    @property
+    def total(self) -> int:
+        return self.input_tokens + self.output_tokens + self.thinking_tokens
+
+    def __add__(self, other: "TokenUsage") -> "TokenUsage":
+        # Accumulates tokens from multiple calls
+        ...
+
+# In ChatState
+token_usage: Annotated[TokenUsage, reduce_token_usage]
+```
+
+Each node that calls an LLM returns `{"token_usage": usage}` which gets accumulated via the reducer.
 
 ### Helper Function
 
@@ -171,6 +204,7 @@ initial_state = create_initial_state(
     elicitation_manager=elicitation_manager,
     tool_provider=tool_provider,  # UnifiedToolProvider for local + remote tools
     user_context=user_context,
+    requested_model="sonnet",  # Model preference for response generation
 )
 ```
 
@@ -913,5 +947,148 @@ print(result.get("final_response"))
 | **MessagingContext** | Allows operators to send progress, direct responses, elicit input |
 | **Direct Response** | Operators can bypass writer and send content directly to user |
 | **Context Optimization** | DataChunks for raw data, DataSummaries for supervisor decisions |
+| **Extended Thinking** | Supervisor, planner, and coder use thinking mode for complex reasoning |
+| **Token Tracking** | Full token usage tracking across all LLM calls (input, output, thinking) |
+| **Model Configuration** | Centralized model registry with aliases and thinking support |
 
-Start by reading `graph/state.py`, then `graph/nodes.py`, then `graph/builder.py`. This gives you the core flow. Then explore `api/routes.py` to see how it's exposed via HTTP. For self-awareness features, see `tools/builtin/`.
+---
+
+## Extended Thinking Mode
+
+**Files:** `src/agentic_chatbot/config/models.py`, `src/agentic_chatbot/utils/providers/`
+
+Extended thinking enables Claude models to "think" before responding, improving quality for complex reasoning tasks.
+
+### Model Configuration
+
+```python
+@dataclass
+class ModelConfig:
+    id: str                          # Full model ID (e.g., "claude-sonnet-4-20250514")
+    name: str                        # Human-readable name
+    aliases: list[str]               # Short aliases (e.g., ["sonnet", "claude-sonnet"])
+    supports_thinking: bool = False  # Whether model supports extended thinking
+    default_thinking_budget: int = 10000
+
+# Registry provides lookup by alias or ID
+config = ModelRegistry.get("thinking")  # Returns thinking-enabled model
+model_id = config.id  # "claude-sonnet-4-20250514"
+```
+
+### Using Extended Thinking
+
+The supervisor and planner nodes automatically use extended thinking:
+
+```python
+# In supervisor_node
+result = await caller.call_with_usage(
+    prompt=prompt,
+    response_model=SupervisorDecision,
+    system=system,
+    model="thinking",           # Alias for thinking-enabled model
+    enable_thinking=True,
+    thinking_budget=10000,      # Max thinking tokens
+)
+
+# Access thinking content and usage
+decision = result.data
+thinking_content = result.thinking_content  # Model's reasoning process
+usage = result.usage  # TokenUsage with thinking_tokens
+```
+
+### Conditional Thinking (Coder Operator)
+
+The coder operator conditionally uses thinking mode for complex tasks:
+
+```python
+class CoderOperator(BaseOperator):
+    def _should_use_thinking(self, query: str) -> bool:
+        """Detect complex tasks requiring extended thinking."""
+        # Keywords indicating complexity
+        COMPLEX_KEYWORDS = ["algorithm", "optimize", "debug", "security", ...]
+
+        query_lower = query.lower()
+        for keyword in COMPLEX_KEYWORDS:
+            if keyword in query_lower:
+                return True
+
+        # Long queries are likely complex
+        if len(query) > 300:
+            return True
+
+        return False
+
+    async def execute(self, context: OperatorContext):
+        use_thinking = self._should_use_thinking(context.query)
+
+        if use_thinking:
+            response = await client.complete(
+                prompt=prompt,
+                model="thinking",
+                enable_thinking=True,
+                thinking_budget=15000,
+            )
+        else:
+            response = await client.complete(
+                prompt=prompt,
+                model="sonnet",
+            )
+```
+
+### Token Tracking
+
+Token usage is tracked comprehensively across all LLM calls:
+
+```python
+@dataclass
+class TokenUsage:
+    input_tokens: int = 0
+    output_tokens: int = 0
+    thinking_tokens: int = 0      # Extended thinking tokens
+    cache_read_tokens: int = 0    # Prompt caching
+    cache_write_tokens: int = 0
+
+    @property
+    def total(self) -> int:
+        return self.input_tokens + self.output_tokens + self.thinking_tokens
+```
+
+The API returns total token usage in the response:
+
+```python
+# POST /api/v1/chat/sync response
+{
+    "conversation_id": "conv-123",
+    "response": "...",
+    "request_id": "req-456",
+    "usage": {
+        "input_tokens": 1500,
+        "output_tokens": 800,
+        "thinking_tokens": 5000,
+        "cache_read_tokens": 200,
+        "cache_write_tokens": 0,
+        "total_tokens": 7500
+    }
+}
+```
+
+### User Model Selection
+
+Users can specify their preferred model for response generation:
+
+```python
+# API request
+{
+    "conversation_id": "conv-123",
+    "message": "What is Python?",
+    "model": "opus"  # User preference for writer
+}
+
+# In write_node
+requested_model = state.get("requested_model") or "sonnet"
+response = await client.complete(prompt, model=requested_model)
+```
+
+---
+
+Start by reading `graph/state.py`, then `graph/nodes.py`, then `graph/builder.py`. This gives you the core flow. Then explore `api/routes.py` to see how it's exposed via HTTP. For self-awareness features, see `tools/builtin/`. For thinking mode, see `config/models.py`.

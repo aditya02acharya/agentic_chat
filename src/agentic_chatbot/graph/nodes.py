@@ -56,6 +56,7 @@ from agentic_chatbot.operators.context import OperatorContext, MessagingContext
 from agentic_chatbot.utils.structured_llm import StructuredLLMCaller, StructuredOutputError
 from agentic_chatbot.utils.llm import LLMClient
 from agentic_chatbot.utils.logging import get_logger
+from agentic_chatbot.config.models import TokenUsage
 from agentic_chatbot.context.models import DataChunk, DataSummary, TaskContext
 from agentic_chatbot.context.summarizer import summarize_tool_output
 from agentic_chatbot.core.workflow import (
@@ -236,12 +237,18 @@ async def supervisor_node(state: ChatState) -> dict[str, Any]:
     caller = StructuredLLMCaller(max_retries=3)
 
     try:
-        decision = await caller.call(
+        # Use extended thinking for complex reasoning decisions
+        result = await caller.call_with_usage(
             prompt=prompt,
             response_model=SupervisorDecision,
             system=system,
-            model="sonnet",
+            model="thinking",
+            enable_thinking=True,
+            thinking_budget=10000,
         )
+
+        decision = result.data
+        token_usage = result.usage
 
         # Emit decided event
         action_messages = {
@@ -259,7 +266,11 @@ async def supervisor_node(state: ChatState) -> dict[str, Any]:
             ),
         )
 
-        logger.info("Supervisor decided", action=decision.action)
+        logger.info(
+            "Supervisor decided",
+            action=decision.action,
+            thinking_tokens=token_usage.thinking_tokens,
+        )
 
         # Record action
         action_record = ActionRecord(
@@ -279,6 +290,7 @@ async def supervisor_node(state: ChatState) -> dict[str, Any]:
             "iteration": iteration + 1,
             "action_history": [action_record],
             "current_task_context": task_context,  # For operators
+            "token_usage": token_usage,  # Track token usage
         }
 
     except StructuredOutputError as e:
@@ -751,12 +763,18 @@ async def plan_workflow_node(state: ChatState) -> dict[str, Any]:
     caller = StructuredLLMCaller(max_retries=3)
 
     try:
-        workflow_schema = await caller.call(
+        # Use extended thinking for complex workflow planning
+        result = await caller.call_with_usage(
             prompt=prompt,
             response_model=WorkflowDefinitionSchema,
             system=system,
-            model="sonnet",
+            model="thinking",
+            enable_thinking=True,
+            thinking_budget=15000,  # More budget for complex planning
         )
+
+        workflow_schema = result.data
+        token_usage = result.usage
 
         # Convert to runtime WorkflowDefinition
         workflow = WorkflowDefinition.from_schema(workflow_schema)
@@ -776,12 +794,14 @@ async def plan_workflow_node(state: ChatState) -> dict[str, Any]:
             goal=workflow.goal,
             steps=len(workflow.steps),
             step_names=[s.name for s in workflow.steps],
+            thinking_tokens=token_usage.thinking_tokens,
         )
 
         # Store workflow definition in state for execution
         return {
             "workflow_definition": workflow,
             "workflow_goal": workflow.goal,
+            "token_usage": token_usage,  # Track token usage
         }
 
     except StructuredOutputError as e:
@@ -1032,6 +1052,10 @@ async def write_node(state: ChatState) -> dict[str, Any]:
     - Adds GitHub-style footnotes [^source_id] for citations
     - Appends citation references at the end
 
+    MODEL SELECTION:
+    - Uses requested_model from state if provided by user
+    - Falls back to default 'sonnet' model
+
     Citation Format (GitHub Footnotes):
     - In text: "The data shows X[^web_search_1]"
     - At end: "[^web_search_1]: Source: web_search"
@@ -1039,6 +1063,12 @@ async def write_node(state: ChatState) -> dict[str, Any]:
     decision = state.get("current_decision")
     existing_response = state.get("final_response", "")
     data_chunks = get_data_chunks(state)
+
+    # Get requested model from state (user preference) or use default
+    requested_model = state.get("requested_model") or "sonnet"
+
+    # Track token usage for writer (only set if LLM is called)
+    writer_token_usage = None
 
     # If we already have a synthesized response, use it
     if existing_response:
@@ -1064,7 +1094,21 @@ async def write_node(state: ChatState) -> dict[str, Any]:
             context=context,
         )
         client = LLMClient()
-        final = await client.generate(prompt, model="sonnet")
+        response = await client.complete(prompt, model=requested_model)
+        final = response.content
+
+        # Track token usage for writer
+        writer_token_usage = TokenUsage(
+            input_tokens=response.usage.input_tokens,
+            output_tokens=response.usage.output_tokens,
+        )
+
+        logger.info(
+            "Writer generated response",
+            model=requested_model,
+            input_tokens=response.usage.input_tokens,
+            output_tokens=response.usage.output_tokens,
+        )
 
     # Add footnote references if we have data chunks and citations were used
     if data_chunks and "[^" in final:
@@ -1083,10 +1127,16 @@ async def write_node(state: ChatState) -> dict[str, Any]:
     # Add assistant message to conversation
     assistant_message = AIMessage(content=final)
 
-    return {
+    result = {
         "final_response": final,
         "messages": [assistant_message],
     }
+
+    # Include token usage if LLM was called
+    if writer_token_usage:
+        result["token_usage"] = writer_token_usage
+
+    return result
 
 
 # =============================================================================
