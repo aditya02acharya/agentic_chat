@@ -186,12 +186,20 @@ class MCPSession:
             )
 
     async def close(self) -> None:
-        """Cancel all active streams and cleanup."""
+        """
+        Cancel all active streams and cleanup.
+
+        Note: Most streams are managed by async context managers in call_tool(),
+        so _active_streams is typically empty. This method handles any manually
+        tracked streams that need cleanup.
+        """
         for stream in self._active_streams:
             try:
                 await stream.aclose()
-            except Exception:
-                pass
+            except asyncio.CancelledError:
+                pass  # Expected during cancellation
+            except Exception as e:
+                logger.warning(f"Error closing MCP stream: {e}")
         self._active_streams.clear()
 
 

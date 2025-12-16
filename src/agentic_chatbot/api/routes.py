@@ -39,6 +39,9 @@ from agentic_chatbot.utils.logging import get_logger
 logger = get_logger(__name__)
 router = APIRouter()
 
+# Maximum time for graph execution (5 minutes)
+GRAPH_EXECUTION_TIMEOUT = 300.0
+
 
 @router.get("/health", response_model=HealthResponse)
 async def health_check() -> HealthResponse:
@@ -166,7 +169,7 @@ async def chat(
     active_requests.add(request_id)
 
     async def run_graph() -> None:
-        """Run the LangGraph in background."""
+        """Run the LangGraph in background with timeout protection."""
         try:
             # Create the chat graph
             graph = create_chat_graph()
@@ -178,9 +181,24 @@ async def chat(
                 }
             }
 
-            # Run the graph
-            await graph.ainvoke(initial_state, config)
+            # Run the graph with timeout protection
+            await asyncio.wait_for(
+                graph.ainvoke(initial_state, config),
+                timeout=GRAPH_EXECUTION_TIMEOUT,
+            )
 
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"Graph execution timeout after {GRAPH_EXECUTION_TIMEOUT}s",
+                request_id=request_id,
+            )
+            await event_queue.put(
+                ErrorEvent.create(
+                    error=f"Request timed out after {GRAPH_EXECUTION_TIMEOUT} seconds",
+                    error_type="timeout",
+                    request_id=request_id,
+                )
+            )
         except Exception as e:
             logger.error(f"Graph execution error: {e}", exc_info=True)
             await event_queue.put(
@@ -264,7 +282,7 @@ async def chat_sync(
     )
 
     try:
-        # Create and run graph
+        # Create and run graph with timeout protection
         graph = create_chat_graph()
         config = {
             "configurable": {
@@ -272,7 +290,20 @@ async def chat_sync(
             }
         }
 
-        final_state = await graph.ainvoke(initial_state, config)
+        try:
+            final_state = await asyncio.wait_for(
+                graph.ainvoke(initial_state, config),
+                timeout=GRAPH_EXECUTION_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"Sync graph execution timeout after {GRAPH_EXECUTION_TIMEOUT}s",
+                request_id=request_id,
+            )
+            raise HTTPException(
+                status_code=504,
+                detail=f"Request timed out after {GRAPH_EXECUTION_TIMEOUT} seconds",
+            )
 
         # Get response from final state
         response = final_state.get("final_response", "")

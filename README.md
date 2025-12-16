@@ -1,23 +1,37 @@
 # Agentic Chatbot Backend
 
-A ReACT-based agentic chatbot backend built with **LangGraph v1.x** and MCP integration.
+A ReACT-based agentic chatbot backend built with **LangGraph v1.x**, featuring extended thinking mode, comprehensive token tracking, and MCP integration.
 
 ## Features
 
-- **ReACT Supervisor**: Intelligent decision-making agent that thinks, reasons, plans, and acts
+### Core Capabilities
+- **ReACT Supervisor**: Intelligent decision-making agent with extended thinking for complex reasoning
 - **Four Action Types**:
   - `ANSWER`: Direct responses for simple questions
   - `CALL_TOOL`: Single tool execution for data retrieval
   - `CREATE_WORKFLOW`: Multi-step plans for complex tasks
   - `CLARIFY`: Request clarification for ambiguous queries
-- **LangGraph v1.0**: Production-ready stateful agent framework with:
-  - Durable state persistence
-  - Built-in checkpointing
-  - Human-in-the-loop patterns via `interrupt()`
+
+### LLM Features
+- **Extended Thinking Mode**: Supervisor and planner use Claude's thinking tokens for complex reasoning
+- **Conditional Thinking**: Coder operator auto-enables thinking for algorithm/optimization tasks
+- **Comprehensive Token Tracking**: Input, output, thinking, and cache tokens tracked across all calls
+- **User Model Selection**: API accepts model preference for response generation
+- **Configurable Model Registry**: Centralized model configuration with aliases
+
+### Infrastructure
+- **LangGraph v1.0**: Production-ready stateful agent framework with checkpointing
 - **MCP Integration**: Full Model Context Protocol support for external tools
+- **Local Tools**: Zero-latency in-process tools for self-awareness and introspection
+- **UnifiedToolProvider**: Single interface for local, MCP, and operator tools
 - **SSE Streaming**: Real-time progress updates via Server-Sent Events
-- **Extensible Operators**: Easy to add new operators via Registry pattern
-- **Error Handling**: 4-layer error handling (tool, operator, supervisor, LLM validation)
+- **Direct Response**: Operators can bypass writer to send content directly to users
+
+### Reliability
+- **Timeout Protection**: 5-minute timeout on graph execution prevents hanging requests
+- **Graceful Cleanup**: Proper resource cleanup on client disconnect
+- **Error Logging**: Comprehensive error logging instead of silent failures
+- **Event Queue Management**: Automatic draining of unused events
 
 ## Architecture
 
@@ -25,15 +39,20 @@ A ReACT-based agentic chatbot backend built with **LangGraph v1.x** and MCP inte
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                         LANGGRAPH STATE FLOW                                 │
 ├─────────────────────────────────────────────────────────────────────────────┤
-│  START → initialize → supervisor                                             │
-│      ├── "answer" ─────────────────────────────────┐                        │
-│      ├── "call_tool" → execute_tool → reflect      │                        │
-│      │                    ├── "satisfied" → synthesize                       │
-│      │                    ├── "need_more" → supervisor (loop)                │
-│      │                    └── "blocked" → handle_blocked                     │
-│      └── "clarify" → clarify                       │                        │
-│                        │                           │                        │
-│                        └───────────────────────────┼──→ write → stream → END │
+│  START → initialize → supervisor (with thinking)                             │
+│      ├── "answer" ─────────────────────────────────────┐                    │
+│      ├── "call_tool" → execute_tool → reflect          │                    │
+│      │                    ├── "satisfied" → synthesize  │                    │
+│      │                    ├── "need_more" → supervisor  │ (loop)            │
+│      │                    ├── "blocked" → handle_blocked│                    │
+│      │                    └── "direct_response" ────────┼──→ stream → END   │
+│      ├── "create_workflow" → plan (with thinking) →    │                    │
+│      │                       execute_workflow → reflect │                    │
+│      └── "clarify" → clarify                           │                    │
+│                        │                               │                    │
+│                        └───────────────────────────────┼──→ write → stream  │
+│                                                        │     (uses requested│
+│                                                        │      model)        │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -79,23 +98,16 @@ AWS_ACCESS_KEY_ID=your-access-key
 AWS_SECRET_ACCESS_KEY=your-secret-key
 ```
 
-### Other Settings
+### Model Configuration
 
-```bash
-# MCP (optional)
-MCP_DISCOVERY_URL=http://localhost:8080/servers
+Models are configured in `config/models.py` with aliases:
 
-# Other settings (see .env.example for full list)
-```
-
-### LLM Provider Details
-
-| Provider | Model Aliases | Notes |
-|----------|---------------|-------|
-| `anthropic` | haiku, sonnet, opus | Direct Anthropic API |
-| `bedrock` | haiku, sonnet, opus | AWS Bedrock (requires IAM permissions) |
-
-Both providers support the same model aliases which map to the appropriate model IDs for each platform.
+| Alias | Model | Supports Thinking |
+|-------|-------|-------------------|
+| `haiku` | Claude 3.5 Haiku | No |
+| `sonnet` | Claude Sonnet 4 | No |
+| `opus` | Claude Opus 4 | No |
+| `thinking` | Claude Sonnet 4 | Yes (default) |
 
 ## Usage
 
@@ -120,103 +132,183 @@ Main chat endpoint with SSE streaming.
 ```bash
 curl -X POST http://localhost:8000/api/v1/chat \
   -H "Content-Type: application/json" \
-  -d '{"conversation_id": "conv-123", "message": "What is Python?"}'
+  -d '{
+    "conversation_id": "conv-123",
+    "message": "What is Python?",
+    "model": "sonnet"
+  }'
 ```
 
 #### POST /api/v1/chat/sync
-Non-streaming chat endpoint.
+Non-streaming chat endpoint with token usage in response.
 
 ```bash
 curl -X POST http://localhost:8000/api/v1/chat/sync \
   -H "Content-Type: application/json" \
-  -d '{"conversation_id": "conv-123", "message": "What is Python?"}'
+  -d '{
+    "conversation_id": "conv-123",
+    "message": "What is Python?",
+    "model": "opus"
+  }'
+```
+
+Response includes token usage:
+```json
+{
+  "conversation_id": "conv-123",
+  "response": "Python is...",
+  "request_id": "req-456",
+  "usage": {
+    "input_tokens": 1500,
+    "output_tokens": 800,
+    "thinking_tokens": 5000,
+    "cache_read_tokens": 200,
+    "cache_write_tokens": 0,
+    "total_tokens": 7500
+  }
+}
 ```
 
 #### GET /api/v1/health
 Health check endpoint.
 
 #### GET /api/v1/tools
-List available tools.
+List available tools (local + MCP + operators).
 
 #### POST /api/v1/elicitation/respond
 Submit user response to a tool's input request.
-
-```bash
-curl -X POST http://localhost:8000/api/v1/elicitation/respond \
-  -H "Content-Type: application/json" \
-  -d '{"elicitation_id": "xxx", "value": "user input"}'
-```
 
 ## Project Structure
 
 ```
 src/agentic_chatbot/
 ├── api/                    # FastAPI routes and models
-├── config/                 # Settings and prompts
-├── context/                # Context management (memory, results, actions)
-├── core/                   # Core domain (supervisor, workflow, exceptions)
-├── events/                 # Event system for SSE
+│   ├── routes.py           # HTTP endpoints with timeout protection
+│   ├── models.py           # Request/Response schemas incl. TokenUsageResponse
+│   ├── dependencies.py     # Dependency injection (ToolProviderDep)
+│   └── sse.py              # SSE helpers with cleanup
+│
+├── config/                 # Configuration
+│   ├── settings.py         # Environment settings
+│   ├── models.py           # Model registry, ThinkingConfig, TokenUsage
+│   └── prompts.py          # LLM prompt templates
+│
+├── tools/                  # Local tools (zero-latency)
+│   ├── base.py             # LocalTool base class
+│   ├── registry.py         # LocalToolRegistry
+│   ├── provider.py         # UnifiedToolProvider (local + MCP)
+│   └── builtin/            # Built-in tools
+│       ├── self_info.py    # Bot version, capabilities
+│       ├── capabilities.py # Detailed feature list
+│       └── introspection.py# list_tools, list_operators
+│
+├── operators/              # Operators (Strategy pattern)
+│   ├── base.py             # BaseOperator with messaging attributes
+│   ├── context.py          # OperatorContext + MessagingContext
+│   ├── registry.py         # OperatorRegistry
+│   ├── hybrid/             # LLM + MCP operators (e.g., coder with thinking)
+│   ├── llm/                # Pure LLM operators
+│   └── mcp/                # MCP-backed operators
+│
 ├── graph/                  # LangGraph implementation
-│   ├── state.py           # State definitions with TypedDict + reducers
-│   ├── nodes.py           # Node functions for the graph
-│   └── builder.py         # StateGraph construction
-├── flows/                  # Legacy flow definitions (deprecated)
+│   ├── state.py            # ChatState with token_usage reducer
+│   ├── nodes.py            # Node functions with thinking mode
+│   └── builder.py          # StateGraph construction
+│
+├── events/                 # Event system for SSE
+│   ├── emitter.py          # EventEmitter with error logging
+│   ├── models.py           # Event data classes
+│   └── types.py            # Event type enums
+│
 ├── mcp/                    # MCP protocol integration
-│   ├── callbacks.py       # Callback handlers with elicitation support
-│   ├── client.py          # MCP client
-│   ├── manager.py         # Connection management
-│   └── session.py         # Session management
-├── nodes/                  # Legacy PocketFlow nodes (deprecated)
-├── operators/             # Operators (Strategy pattern)
-│   ├── hybrid/            # LLM + MCP operators
-│   ├── llm/               # Pure LLM operators
-│   └── mcp/               # MCP-backed operators
-└── utils/                 # Utilities (LLM, logging)
+│   ├── callbacks.py        # Callbacks + ElicitationManager
+│   ├── client.py           # MCP client
+│   ├── manager.py          # Connection management
+│   └── session.py          # Session management with cleanup
+│
+├── context/                # Context optimization
+│   ├── models.py           # DataChunk, DataSummary, TaskContext
+│   └── summarizer.py       # Inline summarization
+│
+├── core/                   # Core domain
+│   ├── supervisor.py       # SupervisorDecision model
+│   ├── workflow.py         # WorkflowDefinition
+│   └── exceptions.py       # Custom exceptions
+│
+└── utils/                  # Utilities
+    ├── llm.py              # LLMClient with thinking support
+    ├── structured_llm.py   # Structured output + token tracking
+    ├── providers/          # Multi-provider LLM support
+    │   ├── base.py         # BaseLLMProvider + LLMResponse
+    │   ├── anthropic.py    # Anthropic API with thinking
+    │   └── bedrock.py      # AWS Bedrock provider
+    └── logging.py          # Logging configuration
 ```
 
-## LangGraph Integration
+## Extended Thinking Mode
 
-The chatbot uses LangGraph v1.0 for orchestration. Key concepts:
-
-### State Management
+The supervisor and planner use Claude's extended thinking for complex reasoning:
 
 ```python
-from agentic_chatbot.graph.state import ChatState, create_initial_state
+# Supervisor uses thinking mode for decision-making
+result = await caller.call_with_usage(
+    prompt=prompt,
+    response_model=SupervisorDecision,
+    model="thinking",
+    enable_thinking=True,
+    thinking_budget=10000,  # Max thinking tokens
+)
 
-# State is defined with TypedDict + Annotated reducers
-class ChatState(TypedDict, total=False):
-    messages: Annotated[list[BaseMessage], reduce_messages]  # Appends
-    tool_results: Annotated[list[ToolResult], reduce_tool_results]
-    # ... other fields
+# Access thinking content and token usage
+decision = result.data
+thinking_content = result.thinking_content
+usage = result.usage  # TokenUsage with thinking_tokens
 ```
 
-### Creating the Graph
+### Conditional Thinking (Coder)
+
+The coder operator automatically enables thinking for complex tasks:
 
 ```python
-from agentic_chatbot.graph import create_chat_graph
+# Keywords that trigger thinking mode:
+COMPLEX_KEYWORDS = [
+    "algorithm", "optimize", "debug", "security",
+    "performance", "recursive", "data structure", ...
+]
 
-# Create compiled graph
-graph = create_chat_graph()
-
-# With checkpointer for persistence
-from langgraph.checkpoint.memory import MemorySaver
-graph = create_chat_graph(checkpointer=MemorySaver())
-
-# With human-in-the-loop interrupts
-graph = create_chat_graph(interrupt_before=["execute_tool"])
+# Also enabled for:
+# - Queries > 300 characters
+# - Multiple requirements (bullet points)
 ```
 
-### Running the Graph
+## Token Tracking
+
+Token usage is accumulated across all LLM calls:
 
 ```python
-# Async execution
-config = {"configurable": {"thread_id": "conversation-123"}}
-result = await graph.ainvoke(initial_state, config)
+@dataclass
+class TokenUsage:
+    input_tokens: int = 0
+    output_tokens: int = 0
+    thinking_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
 
-# Streaming execution
-async for event in graph.astream(initial_state, config, stream_mode="updates"):
-    print(event)
+    @property
+    def total(self) -> int:
+        return self.input_tokens + self.output_tokens + self.thinking_tokens
 ```
+
+## Local Tools
+
+Zero-latency tools for self-awareness:
+
+| Tool | Description |
+|------|-------------|
+| `self_info` | Bot version, capabilities, release notes |
+| `list_capabilities` | Detailed feature list |
+| `list_tools` | All available tools |
+| `list_operators` | Registered operators |
 
 ## Development
 
@@ -237,28 +329,22 @@ make typecheck
 ## Design Patterns
 
 - **Strategy Pattern**: Operators as interchangeable algorithms
-- **Factory + Registry Pattern**: Dynamic operator instantiation
+- **Factory + Registry Pattern**: Dynamic operator/tool instantiation
 - **Observer Pattern**: Event-driven SSE streaming
 - **Builder Pattern**: Context assembly and workflow construction
 - **Chain of Responsibility**: Error handling layers
 - **Mediator Pattern**: Supervisor coordinates all components
 - **State Pattern**: LangGraph state management with reducers
 - **Composite Pattern**: Graph with conditional edges
+- **Provider Pattern**: UnifiedToolProvider merges tool sources
 
-## Migration from PocketFlow
+## Error Handling & Reliability
 
-The codebase has been migrated from PocketFlow to LangGraph v1.x:
-
-| PocketFlow | LangGraph |
-|------------|-----------|
-| `AsyncNode.prep_async()` | Node function receives state |
-| `AsyncNode.exec_async()` | Node function logic |
-| `AsyncNode.post_async()` | Node function returns state updates |
-| `node1 >> node2` | `builder.add_edge("node1", "node2")` |
-| `node - "action" >> next` | `builder.add_conditional_edges(...)` |
-| `AsyncFlow(start=node)` | `builder.compile()` |
-
-Legacy `flows/` and `nodes/` modules are kept for backwards compatibility but are deprecated.
+- **Timeout Protection**: Graph execution times out after 5 minutes
+- **Graceful Cancellation**: Background tasks get 5 seconds to cleanup
+- **Event Queue Cleanup**: Remaining events drained on disconnect
+- **Error Logging**: Handler errors logged instead of silently swallowed
+- **Stream Cleanup**: MCP streams properly closed on session end
 
 ## License
 

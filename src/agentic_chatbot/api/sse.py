@@ -5,6 +5,13 @@ from typing import AsyncIterator
 
 from agentic_chatbot.events.models import Event
 from agentic_chatbot.events.types import EventType
+from agentic_chatbot.utils.logging import get_logger
+
+
+logger = get_logger(__name__)
+
+# Timeout for graceful task cancellation
+TASK_CANCEL_TIMEOUT = 5.0
 
 
 async def event_generator(
@@ -78,6 +85,28 @@ async def event_generator_with_task(
         if not task.done():
             task.cancel()
             try:
-                await task
+                # Wait with timeout for graceful cleanup
+                await asyncio.wait_for(task, timeout=TASK_CANCEL_TIMEOUT)
             except asyncio.CancelledError:
                 pass
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Task did not cancel gracefully within timeout, may leak resources"
+                )
+
+        # Drain any remaining events to free memory
+        _drain_queue(event_queue)
+
+
+def _drain_queue(event_queue: asyncio.Queue[Event]) -> int:
+    """Drain all remaining events from queue to free memory."""
+    drained = 0
+    try:
+        while not event_queue.empty():
+            event_queue.get_nowait()
+            drained += 1
+    except asyncio.QueueEmpty:
+        pass
+    if drained > 0:
+        logger.debug(f"Drained {drained} events from queue during cleanup")
+    return drained
