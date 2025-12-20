@@ -49,7 +49,8 @@ from agentic_chatbot.graph.state import (
     get_emitter,
     generate_source_id,
     get_summaries_text,
-    get_data_chunks,
+    get_sourced_contents,
+    get_citation_blocks,
 )
 from agentic_chatbot.operators.registry import OperatorRegistry
 from agentic_chatbot.operators.context import OperatorContext, MessagingContext
@@ -57,8 +58,11 @@ from agentic_chatbot.utils.structured_llm import StructuredLLMCaller, Structured
 from agentic_chatbot.utils.llm import LLMClient
 from agentic_chatbot.utils.logging import get_logger
 from agentic_chatbot.config.models import TokenUsage
-from agentic_chatbot.context.models import DataChunk, DataSummary, TaskContext
-from agentic_chatbot.context.summarizer import summarize_tool_output
+
+# New unified data model
+from agentic_chatbot.data.content import ContentBlock, TextContent
+from agentic_chatbot.data.sourced import SourcedContent, ContentSource, ContentSummary, create_sourced_content
+from agentic_chatbot.data.execution import ExecutionInput, ExecutionOutput, ExecutionStatus, TaskInfo
 from agentic_chatbot.core.workflow import (
     WorkflowDefinition,
     WorkflowDefinitionSchema,
@@ -279,8 +283,8 @@ async def supervisor_node(state: ChatState) -> dict[str, Any]:
             iteration=iteration,
         )
 
-        # Create task context for operators (focused, not full conversation)
-        task_context = decision.to_task_context(state.get("user_query", ""))
+        # Create task info for operators (focused, not full conversation)
+        task_info = decision.to_task_info(state.get("user_query", ""))
 
         return {
             "current_decision": decision,
@@ -289,7 +293,7 @@ async def supervisor_node(state: ChatState) -> dict[str, Any]:
             "workflow_goal": decision.goal,
             "iteration": iteration + 1,
             "action_history": [action_record],
-            "current_task_context": task_context,  # For operators
+            "current_task": task_info,  # For operators (unified data model)
             "token_usage": token_usage,  # Track token usage
         }
 
@@ -353,7 +357,7 @@ async def execute_tool_node(state: ChatState) -> dict[str, Any]:
 
     tool_name = decision.operator
     params = decision.params or {}
-    task_context = state.get("current_task_context")
+    task_info = state.get("current_task")
     tool_provider = state.get("tool_provider")
 
     await emit_event(
@@ -372,17 +376,17 @@ async def execute_tool_node(state: ChatState) -> dict[str, Any]:
 
     if is_local:
         # Execute local tool via UnifiedToolProvider
-        return await _execute_local_tool(state, tool_name, params, task_context, tool_provider)
+        return await _execute_local_tool(state, tool_name, params, task_info, tool_provider)
 
     # Otherwise, execute as operator (may use MCP tools internally)
-    return await _execute_operator(state, tool_name, params, task_context)
+    return await _execute_operator(state, tool_name, params, task_info)
 
 
 async def _execute_local_tool(
     state: ChatState,
     tool_name: str,
     params: dict[str, Any],
-    task_context: TaskContext | None,
+    task_info: TaskInfo | None,
     tool_provider: Any,
 ) -> dict[str, Any]:
     """
@@ -393,6 +397,8 @@ async def _execute_local_tool(
     - list_capabilities: Detailed feature list
     - list_tools: Available tools
     - list_operators: Available operators
+
+    Returns SourcedContent with the tool output.
     """
     try:
         # Execute via tool provider
@@ -432,21 +438,41 @@ async def _execute_local_tool(
         result_success = result.status.value == "success"
         result_error = result.error
 
-        # Create DataChunk for synthesizer
-        data_chunk = DataChunk(
-            source_id=source_id,
-            source_type=tool_name,
+        # Create SourcedContent (unified data model)
+        query_used = task_info.description if task_info else state.get("user_query", "")
+        sourced = create_sourced_content(
             content=result_content if result_success else f"Error: {result_error}",
-            query_used=task_context.task_description if task_context else state.get("user_query", ""),
-            metadata={"local_tool": True},
+            source_type=tool_name,
+            source_id=source_id,
+            query_used=query_used,
         )
 
-        # Generate summary for supervisor (fast, using haiku)
-        task_desc = task_context.task_description if task_context else state.get("user_query", "")
-        data_summary = await summarize_tool_output(
-            chunk=data_chunk,
-            task_description=task_desc,
-        )
+        # Generate summary for supervisor (inline, using haiku)
+        if result_success:
+            summary = ContentSummary(
+                executive_summary=f"Local tool {tool_name} returned data",
+                key_findings=[result_content[:100] + "..." if len(result_content) > 100 else result_content],
+                has_useful_data=bool(result_content),
+                task_description=query_used,
+            )
+        else:
+            summary = ContentSummary(
+                executive_summary=f"Local tool {tool_name} failed",
+                key_findings=[],
+                has_useful_data=False,
+                error=result_error,
+                task_description=query_used,
+            )
+        sourced.set_summary(summary)
+
+        # Create ExecutionOutput (new unified output type)
+        if result_success:
+            exec_output = ExecutionOutput.success(
+                TextContent.markdown(result_content),
+                sourced_contents=[sourced],
+            )
+        else:
+            exec_output = ExecutionOutput.error(result_error or "Unknown error")
 
         logger.info(
             "Local tool executed",
@@ -466,8 +492,8 @@ async def _execute_local_tool(
                 )
             ],
             "current_tool": None,
-            "data_chunks": [data_chunk],
-            "data_summaries": [data_summary],
+            "sourced_contents": [sourced],
+            "execution_outputs": [exec_output],
             "source_counter": updated_counter,
         }
 
@@ -485,6 +511,20 @@ async def _execute_local_tool(
 
         source_id, updated_counter = generate_source_id(state, tool_name)
 
+        # Create error SourcedContent
+        sourced = create_sourced_content(
+            content=f"Error: {e}",
+            source_type=tool_name,
+            source_id=source_id,
+            query_used=state.get("user_query", ""),
+        )
+        sourced.set_summary(ContentSummary(
+            executive_summary="Local tool execution failed",
+            key_findings=[],
+            has_useful_data=False,
+            error=str(e),
+        ))
+
         return {
             "tool_results": [
                 ToolResult(
@@ -495,16 +535,8 @@ async def _execute_local_tool(
                 )
             ],
             "current_tool": None,
-            "data_summaries": [
-                DataSummary(
-                    source_id=source_id,
-                    source_type=tool_name,
-                    key_findings=[],
-                    executive_summary="Local tool execution failed",
-                    has_results=False,
-                    error=str(e),
-                )
-            ],
+            "sourced_contents": [sourced],
+            "execution_outputs": [ExecutionOutput.error(str(e))],
             "source_counter": updated_counter,
         }
 
@@ -513,7 +545,7 @@ async def _execute_operator(
     state: ChatState,
     tool_name: str,
     params: dict[str, Any],
-    task_context: TaskContext | None,
+    task_info: TaskInfo | None,
 ) -> dict[str, Any]:
     """
     Execute an operator with messaging context support.
@@ -522,6 +554,8 @@ async def _execute_operator(
     - Use MCP tools internally
     - Send direct responses to user
     - Support progress updates and elicitation
+
+    Returns SourcedContent with the operator output.
     """
     try:
         # Get operator from registry
@@ -532,7 +566,6 @@ async def _execute_operator(
         operator = operator_cls()
 
         # Create MessagingContext for operators that support messaging capabilities
-        # This allows operators to send progress, direct responses, elicit input, etc.
         emitter = get_emitter(state)
         elicitation_manager = state.get("elicitation_manager")
 
@@ -543,20 +576,19 @@ async def _execute_operator(
             operator_name=tool_name,
         )
 
-        # Create operator context with TaskContext (focused, not full conversation)
-        # The operator receives the reformulated task, not the original query
-        query = task_context.task_description if task_context else state.get("user_query", "")
+        # Create operator context with TaskInfo (focused, not full conversation)
+        query = task_info.description if task_info else state.get("user_query", "")
 
         context = OperatorContext(
             query=query,
-            recent_messages=[],  # Could be populated from state["messages"] if needed
+            recent_messages=[],
             conversation_summary="",
             tool_schemas={},
             step_results={},
             extra={
                 "params": params,
-                "task_goal": task_context.goal if task_context else "",
-                "task_scope": task_context.scope if task_context else "",
+                "task_goal": task_info.goal if task_info else "",
+                "task_scope": task_info.scope if task_info else "",
                 "conversation_id": state.get("conversation_id", ""),
                 "request_id": state.get("request_id", ""),
             },
@@ -578,68 +610,83 @@ async def _execute_operator(
             ),
         )
 
-        # === CONTEXT OPTIMIZATION: Create DataChunk and Summary ===
-
         # Generate unique source ID for citations
         source_id, updated_counter = generate_source_id(state, tool_name)
 
-        # Get result content - handle both old and new result formats
+        # Get result content
         result_content = ""
         result_success = True
         result_error = None
         result_metadata = {}
 
-        # Check if result is new OperatorResult with direct response support
         if hasattr(result, "output"):
-            # New OperatorResult format
             result_content = result.text_output if hasattr(result, "text_output") else str(result.output)
             result_success = result.success
             result_error = result.error
             result_metadata = result.metadata if hasattr(result, "metadata") else {}
         elif hasattr(result, "content"):
-            # Old format
             result_content = result.content
             result_success = getattr(result, "success", True)
             result_error = getattr(result, "error", None)
             result_metadata = getattr(result, "metadata", {})
 
-        # Create DataChunk with raw content (for synthesizer/writer)
-        data_chunk = DataChunk(
-            source_id=source_id,
-            source_type=tool_name,
+        # Create SourcedContent (unified data model)
+        query_used = task_info.description if task_info else state.get("user_query", "")
+        sourced = create_sourced_content(
             content=result_content if result_success else f"Error: {result_error}",
-            query_used=task_context.task_description if task_context else state.get("user_query", ""),
-            metadata=result_metadata,
+            source_type=tool_name,
+            source_id=source_id,
+            query_used=query_used,
         )
 
-        # Generate inline summary (for supervisor) - uses haiku for speed
-        task_desc = task_context.task_description if task_context else state.get("user_query", "")
-        data_summary = await summarize_tool_output(
-            chunk=data_chunk,
-            task_description=task_desc,
-        )
+        # Create summary for supervisor
+        if result_success:
+            summary = ContentSummary(
+                executive_summary=f"Operator {tool_name} completed successfully",
+                key_findings=[result_content[:150] + "..." if len(result_content) > 150 else result_content] if result_content else [],
+                has_useful_data=bool(result_content),
+                task_description=query_used,
+            )
+        else:
+            summary = ContentSummary(
+                executive_summary=f"Operator {tool_name} failed",
+                key_findings=[],
+                has_useful_data=False,
+                error=result_error,
+                task_description=query_used,
+            )
+        sourced.set_summary(summary)
 
-        # === MESSAGING: Check for direct responses ===
-        # If the operator sent content directly to the user, track it
+        # Check for direct responses
         sent_direct_response = False
         direct_response_contents = []
 
-        # Check if operator result indicates direct response was sent
         if hasattr(result, "sent_direct_response") and result.sent_direct_response:
             sent_direct_response = True
             if hasattr(result, "direct_responses"):
                 direct_response_contents = result.direct_responses
 
-        # Also check the messaging context for direct responses
         if messaging_context.has_direct_responses:
             sent_direct_response = True
             direct_response_contents.extend(messaging_context.direct_responses)
 
+        # Create ExecutionOutput
+        if result_success:
+            exec_output = ExecutionOutput.success(
+                TextContent.markdown(result_content),
+                sourced_contents=[sourced],
+                sent_direct_response=sent_direct_response,
+                input_tokens=result.input_tokens if hasattr(result, "input_tokens") else 0,
+                output_tokens=result.output_tokens if hasattr(result, "output_tokens") else 0,
+            )
+        else:
+            exec_output = ExecutionOutput.error(result_error or "Unknown error")
+
         logger.info(
-            "Tool executed with context optimization",
+            "Operator executed",
             tool=tool_name,
             source_id=source_id,
-            has_summary=bool(data_summary.key_findings),
+            has_summary=bool(summary.key_findings),
             sent_direct_response=sent_direct_response,
         )
 
@@ -654,11 +701,9 @@ async def _execute_operator(
                 )
             ],
             "current_tool": None,
-            # Context optimization outputs
-            "data_chunks": [data_chunk],
-            "data_summaries": [data_summary],
+            "sourced_contents": [sourced],
+            "execution_outputs": [exec_output],
             "source_counter": updated_counter,
-            # Direct response tracking
             "sent_direct_response": sent_direct_response,
             "direct_response_contents": direct_response_contents,
         }
@@ -675,18 +720,21 @@ async def _execute_operator(
             ),
         )
 
-        # Generate source ID even for errors (for tracking)
         source_id, updated_counter = generate_source_id(state, tool_name)
 
-        # Create error summary for supervisor
-        error_summary = DataSummary(
-            source_id=source_id,
+        # Create error SourcedContent
+        sourced = create_sourced_content(
+            content=f"Error: {e}",
             source_type=tool_name,
-            key_findings=[],
-            executive_summary=f"Tool execution failed",
-            has_results=False,
-            error=str(e),
+            source_id=source_id,
+            query_used=state.get("user_query", ""),
         )
+        sourced.set_summary(ContentSummary(
+            executive_summary="Tool execution failed",
+            key_findings=[],
+            has_useful_data=False,
+            error=str(e),
+        ))
 
         return {
             "tool_results": [
@@ -697,7 +745,8 @@ async def _execute_operator(
                 )
             ],
             "current_tool": None,
-            "data_summaries": [error_summary],
+            "sourced_contents": [sourced],
+            "execution_outputs": [ExecutionOutput.error(str(e))],
             "source_counter": updated_counter,
         }
 
@@ -991,9 +1040,9 @@ async def synthesize_node(state: ChatState) -> dict[str, Any]:
     """
     Synthesize data into a coherent response with citation support.
 
-    CONTEXT OPTIMIZATION:
-    - Uses RAW DataChunks (verbatim data for accuracy)
-    - Formats with source IDs for citation tracking
+    Uses SourcedContent (unified data model):
+    - SourcedContent.content for full data (verbatim for accuracy)
+    - SourcedContent.source for citation tracking
     - Produces content that writer can cite using [^source_id] markers
 
     The synthesizer receives full data context, not summaries,
@@ -1001,11 +1050,11 @@ async def synthesize_node(state: ChatState) -> dict[str, Any]:
     """
     user_query = state.get("user_query", "")
 
-    # Get raw data chunks (full context, not summaries)
-    data_chunks = get_data_chunks(state)
+    # Get sourced contents (unified data model)
+    sourced_contents = get_sourced_contents(state)
 
-    if not data_chunks:
-        # Fallback to tool_results if no data chunks
+    if not sourced_contents:
+        # Fallback to tool_results if no sourced contents
         tool_results = state.get("tool_results", [])
         results_text = "\n\n".join(
             f"**{r.tool_name}**:\n{r.content}"
@@ -1013,19 +1062,19 @@ async def synthesize_node(state: ChatState) -> dict[str, Any]:
             if r.success
         )
     else:
-        # Format data chunks with source IDs for citation tracking
+        # Format sourced contents with source IDs for citation tracking
         results_text = "\n\n".join(
-            f"[Source: {chunk.source_id}] ({chunk.source_type}):\n{chunk.content}"
-            for chunk in data_chunks
-            if chunk.content and not chunk.content.startswith("Error:")
+            f"[Source: {sc.source_id}] ({sc.source_type}):\n{sc.text}"
+            for sc in sourced_contents
+            if sc.text and not sc.text.startswith("Error:")
         )
 
     # Build citation reference block for the writer
     citation_block = ""
-    if data_chunks:
+    if sourced_contents:
         citation_block = "\n\n---\nAvailable Sources for Citations:\n"
-        for chunk in data_chunks:
-            citation_block += f"- [^{chunk.source_id}]: {chunk.source_type}\n"
+        for sc in sourced_contents:
+            citation_block += f"- [^{sc.source_id}]: {sc.source_type}\n"
 
     prompt = SYNTHESIZER_PROMPT.format(
         query=user_query,
@@ -1047,10 +1096,10 @@ async def write_node(state: ChatState) -> dict[str, Any]:
     """
     Format the final response with GitHub footnote citations.
 
-    CONTEXT OPTIMIZATION:
-    - Uses synthesized content OR raw DataChunks
-    - Adds GitHub-style footnotes [^source_id] for citations
-    - Appends citation references at the end
+    Uses SourcedContent (unified data model):
+    - SourcedContent.content for full data
+    - SourcedContent.source for citation tracking
+    - Adds GitHub-style footnotes [^source_id]
 
     MODEL SELECTION:
     - Uses requested_model from state if provided by user
@@ -1062,7 +1111,7 @@ async def write_node(state: ChatState) -> dict[str, Any]:
     """
     decision = state.get("current_decision")
     existing_response = state.get("final_response", "")
-    data_chunks = get_data_chunks(state)
+    sourced_contents = get_sourced_contents(state)
 
     # Get requested model from state (user preference) or use default
     requested_model = state.get("requested_model") or "sonnet"
@@ -1077,13 +1126,12 @@ async def write_node(state: ChatState) -> dict[str, Any]:
         final = decision.response
     else:
         # Generate response with citation context
-        # Use raw data chunks for the writer
-        if data_chunks:
+        if sourced_contents:
             context_parts = []
-            for chunk in data_chunks:
-                if chunk.content and not chunk.content.startswith("Error:"):
+            for sc in sourced_contents:
+                if sc.text and not sc.text.startswith("Error:"):
                     context_parts.append(
-                        f"[^{chunk.source_id}] ({chunk.source_type}):\n{chunk.content}"
+                        f"[^{sc.source_id}] ({sc.source_type}):\n{sc.text}"
                     )
             context = "\n\n".join(context_parts)
         else:
@@ -1110,15 +1158,15 @@ async def write_node(state: ChatState) -> dict[str, Any]:
             output_tokens=response.usage.output_tokens,
         )
 
-    # Add footnote references if we have data chunks and citations were used
-    if data_chunks and "[^" in final:
+    # Add footnote references if we have sourced contents and citations were used
+    if sourced_contents and "[^" in final:
         footnotes = "\n\n---\n"
-        for chunk in data_chunks:
+        for sc in sourced_contents:
             # Only add footnotes for sources that are actually cited
-            if f"[^{chunk.source_id}]" in final:
-                footnotes += f"\n[^{chunk.source_id}]: {chunk.source_type}"
-                if chunk.query_used:
-                    footnotes += f" (query: \"{chunk.query_used[:50]}...\")"
+            if f"[^{sc.source_id}]" in final:
+                footnotes += f"\n[^{sc.source_id}]: {sc.source_type}"
+                if sc.source.query_used:
+                    footnotes += f" (query: \"{sc.source.query_used[:50]}...\")"
 
         # Only append if we have any footnotes
         if footnotes != "\n\n---\n":

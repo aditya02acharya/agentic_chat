@@ -1,13 +1,22 @@
-"""Base operator class and types."""
+"""Base operator class and types.
+
+Operators are the units of execution that the supervisor delegates to.
+They receive ExecutionInput and return ExecutionOutput.
+
+The atomic unit of information is ContentBlock (from data.content).
+"""
 
 from abc import ABC, abstractmethod
 from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 from agentic_chatbot.mcp.models import MessagingCapabilities, OutputDataType
+from agentic_chatbot.data.execution import ExecutionInput, ExecutionOutput
+from agentic_chatbot.data.content import ContentBlock, TextContent
 
 if TYPE_CHECKING:
     from agentic_chatbot.mcp.session import MCPSession
+    # Legacy types for backward compatibility
     from agentic_chatbot.operators.context import OperatorContext, OperatorResult
 
 
@@ -82,6 +91,98 @@ class BaseOperator(ABC):
         """Check if operator needs LLM."""
         return self.operator_type in (OperatorType.PURE_LLM, OperatorType.HYBRID)
 
+    async def run(
+        self,
+        input: ExecutionInput,
+        mcp_session: "MCPSession | None" = None,
+    ) -> ExecutionOutput:
+        """
+        Execute the operator with the new unified interface.
+
+        This is the preferred method for new code. Override this method
+        in new operators.
+
+        Args:
+            input: ExecutionInput with query, task, and messaging capabilities
+            mcp_session: MCP session (required if requires_mcp=True)
+
+        Returns:
+            ExecutionOutput with contents and metadata
+        """
+        # Default implementation converts to legacy interface
+        # Subclasses should override this method directly
+        from agentic_chatbot.operators.context import OperatorContext, OperatorResult
+
+        # Convert ExecutionInput to OperatorContext
+        context = OperatorContext(
+            query=input.query,
+            step_results={
+                k: v.text for k, v in input.step_results.items()
+            },
+            extra=input.extra,
+        )
+
+        # Wire up messaging if available
+        if input.messaging_enabled:
+            from agentic_chatbot.operators.context import MessagingContext
+
+            messaging = MessagingContext(
+                emitter=input._emitter,
+                elicitation_manager=input._elicitation_manager,
+                request_id=input._request_id,
+                operator_name=input._operator_name,
+            )
+            context.set_messaging(messaging)
+
+        # Call legacy execute
+        result = await self.execute(context, mcp_session)
+
+        # Convert OperatorResult to ExecutionOutput
+        return self._convert_result(result, input)
+
+    def _convert_result(
+        self,
+        result: "OperatorResult",
+        input: ExecutionInput,
+    ) -> ExecutionOutput:
+        """Convert legacy OperatorResult to ExecutionOutput."""
+        from agentic_chatbot.data.execution import ExecutionStatus
+
+        if not result.success:
+            return ExecutionOutput.error(
+                result.error or "Unknown error",
+                input_tokens=result.input_tokens,
+                output_tokens=result.output_tokens,
+            )
+
+        # Convert output to ContentBlock
+        contents = []
+        if result.output:
+            if isinstance(result.output, str):
+                contents.append(TextContent.markdown(result.output))
+            elif isinstance(result.output, dict):
+                from agentic_chatbot.data.content import JsonContent
+
+                contents.append(JsonContent(result.output))
+            else:
+                contents.append(TextContent.plain(str(result.output)))
+
+        # Convert direct responses
+        direct_responses = []
+        for tc in result.direct_responses:
+            direct_responses.append(
+                ContentBlock.create(tc.content_type, tc.data)
+            )
+
+        return ExecutionOutput(
+            status=ExecutionStatus.SUCCESS,
+            contents=contents,
+            direct_responses=direct_responses,
+            sent_direct_response=result.sent_direct_response,
+            input_tokens=result.input_tokens,
+            output_tokens=result.output_tokens,
+        )
+
     @abstractmethod
     async def execute(
         self,
@@ -89,7 +190,9 @@ class BaseOperator(ABC):
         mcp_session: "MCPSession | None" = None,
     ) -> "OperatorResult":
         """
-        Execute the operator.
+        Execute the operator (legacy interface).
+
+        DEPRECATED: Override run() instead for new operators.
 
         Args:
             context: Focused context built by ContextAssembler
@@ -100,15 +203,41 @@ class BaseOperator(ABC):
         """
         pass
 
+    async def run_with_fallback(
+        self,
+        input: ExecutionInput,
+        mcp_session: "MCPSession | None" = None,
+    ) -> ExecutionOutput:
+        """
+        Execute with fallback on failure.
+
+        Args:
+            input: ExecutionInput
+            mcp_session: Optional MCP session
+
+        Returns:
+            Result from this operator or fallback
+        """
+        from agentic_chatbot.core.exceptions import OperatorError
+        from agentic_chatbot.operators.registry import OperatorRegistry
+
+        try:
+            return await self.run(input, mcp_session)
+        except OperatorError as e:
+            if self.fallback_operator:
+                fallback = OperatorRegistry.create(self.fallback_operator)
+                return await fallback.run(input, mcp_session)
+            raise
+
     async def execute_with_fallback(
         self,
         context: "OperatorContext",
         mcp_session: "MCPSession | None" = None,
     ) -> "OperatorResult":
         """
-        Execute with fallback on failure.
+        Execute with fallback on failure (legacy interface).
 
-        Design Pattern: Chain of Responsibility (Layer 2 error handling)
+        DEPRECATED: Use run_with_fallback() instead.
 
         Args:
             context: Operator context
