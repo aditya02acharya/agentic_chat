@@ -7,6 +7,10 @@ from agentic_chatbot.operators.base import BaseOperator, OperatorType
 from agentic_chatbot.operators.context import OperatorContext, OperatorResult
 from agentic_chatbot.operators.registry import OperatorRegistry
 
+# New unified data model
+from agentic_chatbot.data.execution import ExecutionInput, ExecutionOutput
+from agentic_chatbot.data.content import TextContent
+
 if TYPE_CHECKING:
     from agentic_chatbot.mcp.session import MCPSession
 
@@ -32,20 +36,20 @@ class RAGRetrieverOperator(BaseOperator):
     # Fallback to web search if RAG fails
     fallback_operator = "web_searcher"
 
-    async def execute(
+    async def run(
         self,
-        context: OperatorContext,
+        input: ExecutionInput,
         mcp_session: "MCPSession | None" = None,
-    ) -> OperatorResult:
+    ) -> ExecutionOutput:
         """
-        Execute RAG search.
+        Execute RAG search using unified data model.
 
         Args:
-            context: Operator context with query
+            input: ExecutionInput with query
             mcp_session: Required MCP session
 
         Returns:
-            OperatorResult with search results
+            ExecutionOutput with search results as ContentBlock
 
         Raises:
             OperatorError: If MCP session not provided
@@ -58,15 +62,13 @@ class RAGRetrieverOperator(BaseOperator):
             result = await mcp_session.call_tool(
                 "rag_search",
                 {
-                    "query": context.query,
-                    "top_k": context.extra.get("top_k", 5),
+                    "query": input.query,
+                    "top_k": input.get("top_k", 5),
                 },
             )
 
             if not result.status.value == "success":
-                return OperatorResult.error_result(
-                    error=result.error or "RAG search failed",
-                )
+                return ExecutionOutput.error(result.error or "RAG search failed")
 
             # Extract text content
             output = result.combined_text
@@ -74,12 +76,11 @@ class RAGRetrieverOperator(BaseOperator):
                 # Handle JSON response
                 for content in result.contents:
                     if content.content_type == "application/json":
-                        output = content.data
+                        output = str(content.data)
                         break
 
-            return OperatorResult.success_result(
-                output=output,
-                contents=result.contents,
+            return ExecutionOutput.success(
+                TextContent.markdown(output) if output else TextContent.plain("No results found"),
                 metadata={
                     "tool": "rag_search",
                     "duration_ms": result.duration_ms,
@@ -87,6 +88,30 @@ class RAGRetrieverOperator(BaseOperator):
             )
 
         except Exception as e:
-            return OperatorResult.error_result(
-                error=f"RAG retrieval failed: {str(e)}",
+            return ExecutionOutput.error(f"RAG retrieval failed: {str(e)}")
+
+    async def execute(
+        self,
+        context: OperatorContext,
+        mcp_session: "MCPSession | None" = None,
+    ) -> OperatorResult:
+        """
+        Legacy interface - converts to new run() interface.
+
+        DEPRECATED: Use run() with ExecutionInput instead.
+        """
+        exec_input = ExecutionInput(
+            query=context.query,
+            extra=context.extra,
+            step_results={},
+        )
+
+        output = await self.run(exec_input, mcp_session)
+
+        if output.success:
+            return OperatorResult.success_result(
+                output=output.text,
+                metadata=output.metadata,
             )
+        else:
+            return OperatorResult.error_result(error=output.error)

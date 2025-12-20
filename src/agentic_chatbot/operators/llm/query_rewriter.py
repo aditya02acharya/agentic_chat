@@ -10,6 +10,10 @@ from agentic_chatbot.operators.context import OperatorContext, OperatorResult
 from agentic_chatbot.operators.registry import OperatorRegistry
 from agentic_chatbot.utils.structured_llm import StructuredLLMCaller
 
+# New unified data model
+from agentic_chatbot.data.execution import ExecutionInput, ExecutionOutput
+from agentic_chatbot.data.content import JsonContent
+
 if TYPE_CHECKING:
     from agentic_chatbot.mcp.session import MCPSession
 
@@ -42,24 +46,24 @@ class QueryRewriterOperator(BaseOperator):
     model = "haiku"
     context_requirements = ["query"]
 
-    async def execute(
+    async def run(
         self,
-        context: OperatorContext,
+        input: ExecutionInput,
         mcp_session: "MCPSession | None" = None,
-    ) -> OperatorResult:
+    ) -> ExecutionOutput:
         """
-        Execute query rewriting.
+        Execute query rewriting using unified data model.
 
         Args:
-            context: Operator context with query
+            input: ExecutionInput with query
             mcp_session: Not used (pure LLM operator)
 
         Returns:
-            OperatorResult with rewritten queries
+            ExecutionOutput with rewritten queries as JsonContent
         """
         caller = StructuredLLMCaller(max_retries=2)
 
-        prompt = QUERY_REWRITER_PROMPT.format(query=context.query)
+        prompt = QUERY_REWRITER_PROMPT.format(query=input.query)
 
         try:
             result = await caller.call(
@@ -69,16 +73,44 @@ class QueryRewriterOperator(BaseOperator):
                 model=self.model or "haiku",
             )
 
-            return OperatorResult.success_result(
-                output={
-                    "internal_query": result.internal_query,
-                    "external_query": result.external_query,
-                    "keywords": result.keywords,
-                },
-                metadata={"original_query": context.query},
+            output_data = {
+                "internal_query": result.internal_query,
+                "external_query": result.external_query,
+                "keywords": result.keywords,
+            }
+
+            return ExecutionOutput.success(
+                JsonContent(output_data),
+                metadata={"original_query": input.query},
             )
 
         except Exception as e:
-            return OperatorResult.error_result(
-                error=f"Query rewriting failed: {str(e)}",
+            return ExecutionOutput.error(f"Query rewriting failed: {str(e)}")
+
+    async def execute(
+        self,
+        context: OperatorContext,
+        mcp_session: "MCPSession | None" = None,
+    ) -> OperatorResult:
+        """
+        Legacy interface - converts to new run() interface.
+
+        DEPRECATED: Use run() with ExecutionInput instead.
+        """
+        exec_input = ExecutionInput(
+            query=context.query,
+            extra=context.extra,
+            step_results={},
+        )
+
+        output = await self.run(exec_input, mcp_session)
+
+        if output.success:
+            # Extract JSON data for legacy output
+            json_data = output.contents[0].data if output.contents else {}
+            return OperatorResult.success_result(
+                output=json_data,
+                metadata=output.metadata,
             )
+        else:
+            return OperatorResult.error_result(error=output.error)
