@@ -1,27 +1,32 @@
 """Context management models for optimized information flow.
 
-This module defines the data structures for:
-- TaskContext: What supervisor delegates to operators (focused scope)
-- DataChunk: Raw data with source tracking for citations
-- DataSummary: Condensed findings for supervisor decision-making
+DEPRECATED: This module contains legacy data structures.
+Use the unified data model from agentic_chatbot.data instead:
+- TaskContext -> TaskInfo (from data.execution)
+- DataChunk + DataSummary -> SourcedContent (from data.sourced)
+- DataStore -> use state.sourced_contents directly
 
-Design Principles:
-- Supervisor sees summaries, not raw data (context optimization)
-- Operators get focused TaskContext, not full conversation
-- Synthesizer/Writer get raw DataChunks for accurate citations
+These structures are kept for backward compatibility during migration.
 """
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any
+from typing import Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from agentic_chatbot.data.execution import TaskInfo
+    from agentic_chatbot.data.sourced import SourcedContent, ContentSummary
 
 
 @dataclass
 class TaskContext:
     """
     Focused context for operators - what the supervisor delegates.
+
+    DEPRECATED: Use TaskInfo from agentic_chatbot.data.execution instead.
 
     Operators receive this instead of full conversation history,
     keeping their context focused on the specific task.
@@ -55,11 +60,27 @@ class TaskContext:
 
         return "\n".join(parts)
 
+    def to_task_info(self) -> "TaskInfo":
+        """Convert to new TaskInfo type."""
+        from agentic_chatbot.data.execution import TaskInfo
+
+        return TaskInfo(
+            description=self.task_description,
+            goal=self.goal,
+            scope=self.scope,
+            constraints=self.constraints,
+            hints=self.hints,
+            original_query=self.original_query_summary,
+        )
+
 
 @dataclass
 class DataChunk:
     """
     Raw data with source tracking for citations.
+
+    DEPRECATED: Use SourcedContent from agentic_chatbot.data.sourced instead.
+    SourcedContent combines both the raw content and its summary.
 
     Stored verbatim for synthesizer/writer to use with proper citations.
     Each chunk gets a unique source_id for footnote references.
@@ -85,11 +106,41 @@ class DataChunk:
         """Get the footnote reference marker."""
         return f"[^{self.source_id}]"
 
+    def to_sourced_content(self, summary: "DataSummary | None" = None) -> "SourcedContent":
+        """Convert to new SourcedContent type."""
+        from agentic_chatbot.data.sourced import (
+            SourcedContent,
+            ContentSource,
+            ContentSummary,
+            create_sourced_content,
+        )
+
+        sourced = create_sourced_content(
+            content=self.content,
+            source_type=self.source_type,
+            source_id=self.source_id,
+            query_used=self.query_used,
+        )
+
+        if summary:
+            sourced.set_summary(ContentSummary(
+                executive_summary=summary.executive_summary,
+                key_findings=summary.key_findings,
+                has_useful_data=summary.has_results,
+                error=summary.error,
+                task_description=summary.task_description,
+            ))
+
+        return sourced
+
 
 @dataclass
 class DataSummary:
     """
     Condensed summary for supervisor decision-making.
+
+    DEPRECATED: Use ContentSummary from agentic_chatbot.data.sourced instead.
+    ContentSummary is part of SourcedContent, which unifies chunk + summary.
 
     Generated via LLM (haiku for speed) right after tool execution.
     Supervisor uses these to decide next action without seeing raw data.
@@ -120,11 +171,26 @@ class DataSummary:
         findings = "\n".join(f"  - {f}" for f in self.key_findings[:3])  # Limit to top 3
         return f"**{self.source_type}** [{self.source_id}]: {self.executive_summary}\n{findings}"
 
+    def to_content_summary(self) -> "ContentSummary":
+        """Convert to new ContentSummary type."""
+        from agentic_chatbot.data.sourced import ContentSummary
+
+        return ContentSummary(
+            executive_summary=self.executive_summary,
+            key_findings=self.key_findings,
+            has_useful_data=self.has_results,
+            error=self.error,
+            task_description=self.task_description,
+        )
+
 
 @dataclass
 class DataStore:
     """
     Container for all data collected during a conversation turn.
+
+    DEPRECATED: Use state.sourced_contents directly instead.
+    Each SourcedContent contains both the raw content and its summary.
 
     Maintains both raw chunks (for synthesizer/writer) and
     summaries (for supervisor).
@@ -170,3 +236,12 @@ class DataStore:
             if chunk.source_id == source_id:
                 return chunk
         return None
+
+    def to_sourced_contents(self) -> list["SourcedContent"]:
+        """Convert all chunks to SourcedContent list."""
+        # Match chunks with their summaries
+        summary_map = {s.source_id: s for s in self.summaries}
+        return [
+            chunk.to_sourced_content(summary_map.get(chunk.source_id))
+            for chunk in self.chunks
+        ]
