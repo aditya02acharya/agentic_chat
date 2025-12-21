@@ -27,8 +27,11 @@ A ReACT-based agentic chatbot backend built with **LangGraph v1.x**, featuring e
 - **SSE Streaming**: Real-time progress updates via Server-Sent Events
 - **Direct Response**: Operators can bypass writer to send content directly to users
 
-### Reliability
-- **Timeout Protection**: 5-minute timeout on graph execution prevents hanging requests
+### Reliability & Fault Tolerance
+- **Resilience Patterns**: Retry, circuit breaker, and timeout via [hyx](https://github.com/roma-glushko/hyx) library
+- **Automatic Retry**: Transient failures retry with exponential backoff (1-60s)
+- **Circuit Breakers**: Prevent cascade failures to unhealthy services
+- **Timeout Protection**: 5-minute timeout on graph execution, 120s on LLM calls
 - **Graceful Cleanup**: Proper resource cleanup on client disconnect
 - **Error Logging**: Comprehensive error logging instead of silent failures
 - **Event Queue Management**: Automatic draining of unused events
@@ -233,7 +236,8 @@ src/agentic_chatbot/
 ├── core/                   # Core domain
 │   ├── supervisor.py       # SupervisorDecision model
 │   ├── workflow.py         # WorkflowDefinition
-│   └── exceptions.py       # Custom exceptions
+│   ├── exceptions.py       # Custom exceptions
+│   └── resilience.py       # Fault tolerance patterns (hyx)
 │
 └── utils/                  # Utilities
     ├── llm.py              # LLMClient with thinking support
@@ -310,6 +314,42 @@ Zero-latency tools for self-awareness:
 | `list_tools` | All available tools |
 | `list_operators` | Registered operators |
 
+## Resilience Patterns
+
+Fault tolerance for all remote calls using [hyx](https://github.com/roma-glushko/hyx):
+
+### Patterns Applied
+
+| Pattern | Description | Configuration |
+|---------|-------------|---------------|
+| **Retry** | Exponential backoff for transient failures | 3 attempts, 1-60s backoff |
+| **Circuit Breaker** | Stop calling failing services | Opens after 3-5 failures, recovers in 30-60s |
+| **Timeout** | Bound operation duration | 120s for LLM, 30s for MCP |
+
+### Usage
+
+```python
+from agentic_chatbot.core.resilience import (
+    llm_retry,
+    llm_circuit_breaker,
+    llm_timeout,
+    wrap_anthropic_errors,
+)
+
+@llm_retry
+@llm_circuit_breaker
+@llm_timeout
+@wrap_anthropic_errors
+async def call_llm(...):
+    ...
+```
+
+### Protected Components
+
+- **MCP Client**: Tool calls, schema fetches, health checks
+- **MCP Registry**: Discovery service refresh, tool listing
+- **LLM Providers**: Anthropic and Bedrock API calls
+
 ## Development
 
 ```bash
@@ -337,10 +377,15 @@ make typecheck
 - **State Pattern**: LangGraph state management with reducers
 - **Composite Pattern**: Graph with conditional edges
 - **Provider Pattern**: UnifiedToolProvider merges tool sources
+- **Circuit Breaker Pattern**: Prevent cascade failures via hyx
+- **Retry Pattern**: Automatic recovery from transient failures
 
 ## Error Handling & Reliability
 
-- **Timeout Protection**: Graph execution times out after 5 minutes
+- **Resilience Patterns**: Retry, circuit breaker, timeout via hyx library
+- **Timeout Protection**: Graph execution times out after 5 minutes, LLM calls after 120s
+- **Circuit Breakers**: Prevent cascade failures to unhealthy MCP/LLM services
+- **Automatic Retry**: Transient failures retry with exponential backoff
 - **Graceful Cancellation**: Background tasks get 5 seconds to cleanup
 - **Event Queue Cleanup**: Remaining events drained on disconnect
 - **Error Logging**: Handler errors logged instead of silently swallowed

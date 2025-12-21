@@ -16,7 +16,8 @@ A step-by-step guide to understanding the LangGraph-based agentic chatbot backen
 10. [Step 7: Understanding MCP Integration](#step-7-understanding-mcp-integration)
 11. [Step 8: Understanding Local Tools](#step-8-understanding-local-tools)
 12. [Step 9: Understanding the Flow](#step-9-understanding-the-flow)
-13. [Debugging Tips](#debugging-tips)
+13. [Step 10: Understanding Resilience Patterns](#step-10-understanding-resilience-patterns)
+14. [Debugging Tips](#debugging-tips)
 
 ---
 
@@ -37,6 +38,7 @@ This chatbot uses **LangGraph v1.x** to orchestrate a ReACT-style agent that can
 | Anthropic Claude | LLM for reasoning and generation |
 | MCP | Model Context Protocol for external tools |
 | Pydantic | Data validation and settings |
+| hyx | Fault tolerance patterns (retry, circuit breaker, timeout) |
 
 ---
 
@@ -106,6 +108,10 @@ src/agentic_chatbot/
 │   ├── settings.py        # Environment settings
 │   ├── models.py          # Model registry + TokenUsage + ThinkingConfig
 │   └── prompts.py         # LLM prompt templates
+│
+├── core/                   # Core domain
+│   ├── exceptions.py      # Custom exceptions
+│   └── resilience.py      # Fault tolerance patterns (hyx)
 │
 └── utils/                  # Utilities
     ├── llm.py             # LLM client wrapper with thinking support
@@ -862,6 +868,165 @@ The supervisor can loop up to `max_iterations` (default 5):
 
 ---
 
+## Step 10: Understanding Resilience Patterns
+
+**File:** `src/agentic_chatbot/core/resilience.py`
+
+The resilience module provides fault tolerance for all remote calls using the **hyx** library.
+
+### Why Resilience Patterns?
+
+The chatbot makes many remote calls that can fail:
+- **MCP tool calls**: External services may be unavailable
+- **LLM API calls**: Rate limits, timeouts, server errors
+- **Registry refresh**: Discovery service may be down
+
+Without proper handling, a single failure can cascade and break the entire request.
+
+### Available Patterns
+
+| Pattern | Purpose | Use Case |
+|---------|---------|----------|
+| **Retry** | Automatically retry transient failures | Network timeouts, 5xx errors |
+| **Circuit Breaker** | Stop calling failing services temporarily | Prevent cascade failures |
+| **Timeout** | Bound operation duration | Prevent hanging requests |
+| **Bulkhead** | Limit concurrent operations | Resource protection |
+| **Fallback** | Graceful degradation | Return default on failure |
+
+### Pre-configured Decorators
+
+```python
+from agentic_chatbot.core.resilience import (
+    mcp_retry,
+    mcp_circuit_breaker,
+    llm_retry,
+    llm_circuit_breaker,
+    llm_timeout,
+)
+
+# MCP calls: retry + circuit breaker
+@mcp_retry
+@mcp_circuit_breaker
+async def call_mcp_tool(...):
+    ...
+
+# LLM calls: retry + circuit breaker + timeout
+@llm_retry
+@llm_circuit_breaker
+@llm_timeout
+async def call_llm_api(...):
+    ...
+```
+
+### Configuration
+
+Centralized configuration in `ResilienceConfig`:
+
+```python
+class ResilienceConfig:
+    # MCP Configuration
+    MCP_RETRY_ATTEMPTS: int = 3
+    MCP_RETRY_BACKOFF_BASE: float = 1.0  # seconds
+    MCP_RETRY_BACKOFF_MAX: float = 30.0  # seconds
+    MCP_CIRCUIT_FAILURE_THRESHOLD: int = 5
+    MCP_CIRCUIT_RECOVERY_TIME: float = 30.0  # seconds
+
+    # LLM Configuration
+    LLM_RETRY_ATTEMPTS: int = 3
+    LLM_RETRY_BACKOFF_BASE: float = 2.0  # longer for rate limits
+    LLM_RETRY_BACKOFF_MAX: float = 60.0  # seconds
+    LLM_CIRCUIT_FAILURE_THRESHOLD: int = 3
+    LLM_CIRCUIT_RECOVERY_TIME: float = 60.0  # seconds
+    LLM_TIMEOUT: float = 120.0  # seconds
+```
+
+### Custom Exception Types
+
+```python
+class TransientError(Exception):
+    """Error likely to succeed on retry (network issues, timeouts)."""
+    pass
+
+class RateLimitError(Exception):
+    """HTTP 429 or throttling errors."""
+    pass
+```
+
+### Error Wrapping Decorators
+
+Provider-specific errors are converted to resilience-aware exceptions:
+
+```python
+from agentic_chatbot.core.resilience import (
+    wrap_anthropic_errors,
+    wrap_aws_errors,
+    wrap_httpx_errors,
+)
+
+# Anthropic API errors → TransientError/RateLimitError
+@wrap_anthropic_errors
+async def call_anthropic(...):
+    ...
+
+# AWS/Bedrock errors → TransientError/RateLimitError
+@wrap_aws_errors
+async def call_bedrock(...):
+    ...
+
+# httpx errors → TransientError/RateLimitError
+@wrap_httpx_errors
+async def call_http(...):
+    ...
+```
+
+### Applied Locations
+
+| Component | File | Patterns Applied |
+|-----------|------|------------------|
+| MCP Client | `mcp/client.py` | retry, circuit breaker |
+| MCP Registry | `mcp/registry.py` | retry, circuit breaker |
+| Anthropic Provider | `utils/providers/anthropic.py` | retry, circuit breaker, timeout |
+| Bedrock Provider | `utils/providers/bedrock.py` | retry, circuit breaker, timeout |
+
+### Circuit Breaker States
+
+```
+CLOSED (normal) ──[failures exceed threshold]──► OPEN (failing)
+                                                      │
+                    ◄──[recovery time elapsed]────────┘
+                                                      │
+                                                      ▼
+                                                 HALF-OPEN
+                                                      │
+                    ◄──[success]──────────────────────┤
+                    ──[failure]───────────────────────►
+```
+
+### Example: MCP Client with Resilience
+
+```python
+class MCPClient:
+    @mcp_retry
+    @mcp_circuit_breaker
+    async def call_tool(self, name: str, params: dict) -> ToolResult:
+        try:
+            response = await self._session.call_tool(name, params)
+            return self._parse_result(response)
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 429:
+                raise RateLimitError(f"Rate limited: {e}") from e
+            if e.response.status_code >= 500:
+                raise TransientError(f"Server error: {e}") from e
+            raise
+        except BreakerOpen as e:
+            return ToolResult(
+                status=ToolResultStatus.ERROR,
+                error=f"Service unavailable (circuit breaker open): {e}",
+            )
+```
+
+---
+
 ## Debugging Tips
 
 ### 1. Check Events in Browser
@@ -937,6 +1102,7 @@ print(result.get("final_response"))
 | Tool Provider | `tools/provider.py` | UnifiedToolProvider (local + remote) |
 | MCP | `mcp/` | External tool protocol |
 | Context | `context/` | DataChunk/DataSummary for citations |
+| Resilience | `core/resilience.py` | Fault tolerance (retry, circuit breaker, timeout) |
 
 ### New Features Summary
 
@@ -950,6 +1116,7 @@ print(result.get("final_response"))
 | **Extended Thinking** | Supervisor, planner, and coder use thinking mode for complex reasoning |
 | **Token Tracking** | Full token usage tracking across all LLM calls (input, output, thinking) |
 | **Model Configuration** | Centralized model registry with aliases and thinking support |
+| **Fault Tolerance** | Retry, circuit breaker, timeout patterns via hyx for all remote calls |
 
 ---
 
