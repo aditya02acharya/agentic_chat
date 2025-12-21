@@ -1,4 +1,10 @@
-"""MCP client for communicating with MCP servers."""
+"""MCP client for communicating with MCP servers.
+
+Resilience patterns applied:
+- Retry with exponential backoff for transient failures
+- Circuit breaker to prevent cascade failures to unhealthy servers
+- Timeout to bound operation duration
+"""
 
 import asyncio
 import time
@@ -6,9 +12,16 @@ from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator
 
 import httpx
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
-from agentic_chatbot.core.exceptions import MCPError, TransientError
+from agentic_chatbot.core.exceptions import MCPError
+from agentic_chatbot.core.resilience import (
+    mcp_retry,
+    mcp_circuit_breaker,
+    TransientError,
+    RateLimitError,
+    BreakerOpen,
+    ResilienceConfig,
+)
 from agentic_chatbot.mcp.models import (
     ToolResult,
     ToolResultStatus,
@@ -98,14 +111,13 @@ class MCPClient:
             await self._client.aclose()
             self._client = None
 
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=1, max=10),
-        retry=retry_if_exception_type(TransientError),
-    )
+    @mcp_retry
+    @mcp_circuit_breaker
     async def list_tools(self) -> list[ToolSummary]:
         """
         Get list of tools from the server.
+
+        Resilience: Retry with exponential backoff + circuit breaker.
 
         Returns:
             List of tool summaries
@@ -130,18 +142,19 @@ class MCPClient:
         except httpx.ConnectError as e:
             raise TransientError(f"Connection error: {e}") from e
         except httpx.HTTPStatusError as e:
+            if e.response.status_code == 429:
+                raise RateLimitError(f"Rate limited: {e}") from e
             if e.response.status_code >= 500:
                 raise TransientError(f"Server error: {e}") from e
             raise MCPError(f"Failed to list tools: {e}") from e
 
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=1, max=10),
-        retry=retry_if_exception_type(TransientError),
-    )
+    @mcp_retry
+    @mcp_circuit_breaker
     async def get_tool_schema(self, tool_name: str) -> ToolSchema:
         """
         Get full schema for a tool.
+
+        Resilience: Retry with exponential backoff + circuit breaker.
 
         Args:
             tool_name: Name of the tool
@@ -167,15 +180,14 @@ class MCPClient:
         except httpx.ConnectError as e:
             raise TransientError(f"Connection error: {e}") from e
         except httpx.HTTPStatusError as e:
+            if e.response.status_code == 429:
+                raise RateLimitError(f"Rate limited: {e}") from e
             if e.response.status_code >= 500:
                 raise TransientError(f"Server error: {e}") from e
             raise MCPError(f"Failed to get tool schema: {e}", tool_name=tool_name) from e
 
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=1, max=10),
-        retry=retry_if_exception_type(TransientError),
-    )
+    @mcp_retry
+    @mcp_circuit_breaker
     async def call_tool(
         self,
         tool_name: str,
@@ -183,6 +195,8 @@ class MCPClient:
     ) -> ToolResult:
         """
         Call a tool and get the result (non-streaming).
+
+        Resilience: Retry with exponential backoff + circuit breaker.
 
         Args:
             tool_name: Name of the tool
@@ -233,12 +247,24 @@ class MCPClient:
             raise TransientError(f"Connection error: {e}") from e
         except httpx.HTTPStatusError as e:
             duration_ms = (time.time() - start_time) * 1000
+            if e.response.status_code == 429:
+                raise RateLimitError(f"Rate limited: {e}") from e
             if e.response.status_code >= 500:
                 raise TransientError(f"Server error: {e}") from e
             return ToolResult(
                 tool_name=tool_name,
                 status=ToolResultStatus.ERROR,
                 error=str(e),
+                duration_ms=duration_ms,
+            )
+        except BreakerOpen as e:
+            # Circuit breaker is open - server is unhealthy
+            duration_ms = (time.time() - start_time) * 1000
+            logger.warning(f"Circuit breaker open for tool {tool_name}: {e}")
+            return ToolResult(
+                tool_name=tool_name,
+                status=ToolResultStatus.ERROR,
+                error=f"Service unavailable (circuit breaker open): {e}",
                 duration_ms=duration_ms,
             )
 
@@ -294,9 +320,12 @@ class MCPClient:
 
         yield event_generator()
 
+    @mcp_retry
     async def health_check(self) -> bool:
         """
         Check if the server is healthy.
+
+        Resilience: Retry with exponential backoff.
 
         Returns:
             True if healthy, False otherwise
@@ -305,5 +334,8 @@ class MCPClient:
             client = await self._get_client()
             response = await client.get("/health", timeout=5.0)
             return response.status_code == 200
+        except TransientError:
+            # Re-raise for retry
+            raise
         except Exception:
             return False

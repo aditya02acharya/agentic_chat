@@ -1,11 +1,25 @@
-"""Anthropic direct API provider with extended thinking support."""
+"""Anthropic direct API provider with extended thinking support.
+
+Resilience patterns applied:
+- Retry with exponential backoff for transient failures
+- Circuit breaker to prevent cascade failures to overloaded API
+- Timeout to bound operation duration
+"""
 
 from typing import AsyncIterator, Any
 
 from anthropic import AsyncAnthropic
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from agentic_chatbot.config.models import ThinkingConfig, TokenUsage
+from agentic_chatbot.core.resilience import (
+    llm_retry,
+    llm_circuit_breaker,
+    llm_timeout,
+    wrap_anthropic_errors,
+    TransientError,
+    RateLimitError,
+    BreakerOpen,
+)
 from agentic_chatbot.utils.providers.base import BaseLLMProvider, LLMResponse
 from agentic_chatbot.utils.logging import get_logger
 
@@ -40,11 +54,10 @@ class AnthropicProvider(BaseLLMProvider):
     def provider_name(self) -> str:
         return "anthropic"
 
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=1, max=10),
-        retry=retry_if_exception_type((TimeoutError, ConnectionError)),
-    )
+    @llm_retry
+    @llm_circuit_breaker
+    @llm_timeout
+    @wrap_anthropic_errors
     async def complete(
         self,
         prompt: str,
@@ -153,6 +166,9 @@ class AnthropicProvider(BaseLLMProvider):
             thinking_content=thinking_content,
         )
 
+    @llm_retry
+    @llm_circuit_breaker
+    @wrap_anthropic_errors
     async def stream(
         self,
         prompt: str,
@@ -165,6 +181,9 @@ class AnthropicProvider(BaseLLMProvider):
     ) -> AsyncIterator[str]:
         """
         Stream response from Anthropic API.
+
+        Resilience: Retry with exponential backoff + circuit breaker.
+        Note: No timeout on stream as responses can be legitimately long.
 
         Note: Extended thinking content is not streamed, only the final response.
         For thinking content, use complete() instead.

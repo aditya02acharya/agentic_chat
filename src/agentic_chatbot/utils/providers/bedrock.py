@@ -1,10 +1,23 @@
-"""AWS Bedrock provider for Claude models using Converse API."""
+"""AWS Bedrock provider for Claude models using Converse API.
+
+Resilience patterns applied:
+- Retry with exponential backoff for transient failures
+- Circuit breaker to prevent cascade failures to overloaded API
+- Timeout to bound operation duration
+"""
 
 from typing import AsyncIterator, Any
 
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-
 from agentic_chatbot.config.models import ThinkingConfig, TokenUsage
+from agentic_chatbot.core.resilience import (
+    llm_retry,
+    llm_circuit_breaker,
+    llm_timeout,
+    wrap_aws_errors,
+    TransientError,
+    RateLimitError,
+    BreakerOpen,
+)
 from agentic_chatbot.utils.providers.base import BaseLLMProvider, LLMResponse
 from agentic_chatbot.utils.logging import get_logger
 
@@ -92,11 +105,10 @@ class BedrockProvider(BaseLLMProvider):
             return None
         return [{"text": system}]
 
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=1, max=10),
-        retry=retry_if_exception_type((TimeoutError, ConnectionError)),
-    )
+    @llm_retry
+    @llm_circuit_breaker
+    @llm_timeout
+    @wrap_aws_errors
     async def complete(
         self,
         prompt: str,
@@ -189,6 +201,9 @@ class BedrockProvider(BaseLLMProvider):
             provider=self.provider_name,
         )
 
+    @llm_retry
+    @llm_circuit_breaker
+    @wrap_aws_errors
     async def stream(
         self,
         prompt: str,
@@ -199,7 +214,12 @@ class BedrockProvider(BaseLLMProvider):
         thinking: ThinkingConfig | None = None,
         **kwargs: Any,
     ) -> AsyncIterator[str]:
-        """Stream response from Bedrock Converse API."""
+        """
+        Stream response from Bedrock Converse API.
+
+        Resilience: Retry with exponential backoff + circuit breaker.
+        Note: No timeout on stream as responses can be legitimately long.
+        """
         resolved_model = self.resolve_model(model)
 
         if thinking and thinking.enabled:

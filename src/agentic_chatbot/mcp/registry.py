@@ -1,4 +1,9 @@
-"""MCP server registry for tool discovery and caching."""
+"""MCP server registry for tool discovery and caching.
+
+Resilience patterns applied:
+- Retry with exponential backoff for transient failures
+- Circuit breaker to prevent cascade failures to unhealthy servers
+"""
 
 import asyncio
 from datetime import datetime
@@ -7,6 +12,14 @@ from typing import Any
 import httpx
 
 from agentic_chatbot.core.exceptions import ToolNotFoundError, ServerNotFoundError
+from agentic_chatbot.core.resilience import (
+    mcp_retry,
+    mcp_circuit_breaker,
+    TransientError,
+    RateLimitError,
+    BreakerOpen,
+    ResilienceConfig,
+)
 from agentic_chatbot.mcp.models import (
     MCPServerInfo,
     ToolSummary,
@@ -162,8 +175,14 @@ class MCPServerRegistry:
         age = (datetime.utcnow() - self._last_refresh).total_seconds()
         return age > self._cache_ttl
 
+    @mcp_retry
+    @mcp_circuit_breaker
     async def _refresh(self) -> None:
-        """Refresh server and tool caches from discovery service."""
+        """
+        Refresh server and tool caches from discovery service.
+
+        Resilience: Retry with exponential backoff + circuit breaker.
+        """
         logger.info("Refreshing MCP server registry", discovery_url=self._discovery_url)
 
         try:
@@ -201,13 +220,36 @@ class MCPServerRegistry:
                 tools=len(self._tool_summaries),
             )
 
+        except httpx.TimeoutException as e:
+            logger.error("Timeout refreshing registry", error=str(e))
+            raise TransientError(f"Timeout refreshing registry: {e}") from e
+        except httpx.ConnectError as e:
+            logger.error("Connection error refreshing registry", error=str(e))
+            raise TransientError(f"Connection error: {e}") from e
+        except httpx.HTTPStatusError as e:
+            logger.error("HTTP error refreshing registry", error=str(e))
+            if e.response.status_code == 429:
+                raise RateLimitError(f"Rate limited: {e}") from e
+            if e.response.status_code >= 500:
+                raise TransientError(f"Server error: {e}") from e
+            raise
+        except BreakerOpen as e:
+            logger.warning("Circuit breaker open for registry refresh", error=str(e))
+            raise
         except Exception as e:
             logger.error("Failed to refresh registry", error=str(e))
             # Don't update last_refresh so we retry on next access
             raise
 
+    @mcp_retry
     async def _fetch_server_tools(self, server: MCPServerInfo) -> None:
-        """Fetch tool summaries from a server including messaging capabilities."""
+        """
+        Fetch tool summaries from a server including messaging capabilities.
+
+        Resilience: Retry with exponential backoff.
+        Note: No circuit breaker here as we're iterating over servers
+        and one failure shouldn't break the whole refresh.
+        """
         try:
             client = await self._get_http_client()
             response = await client.get(f"{server.url}/tools")
@@ -231,6 +273,20 @@ class MCPServerRegistry:
                 self._tool_summaries[tool_name] = summary
                 self._tool_to_server[tool_name] = server.id
 
+        except httpx.TimeoutException as e:
+            logger.warning(
+                "Timeout fetching tools from server",
+                server_id=server.id,
+                error=str(e),
+            )
+            raise TransientError(f"Timeout fetching tools: {e}") from e
+        except httpx.ConnectError as e:
+            logger.warning(
+                "Connection error fetching tools from server",
+                server_id=server.id,
+                error=str(e),
+            )
+            raise TransientError(f"Connection error: {e}") from e
         except Exception as e:
             logger.warning(
                 "Failed to fetch tools from server",
@@ -274,8 +330,14 @@ class MCPServerRegistry:
             supports_streaming=messaging_data.get("supports_streaming", False),
         )
 
+    @mcp_retry
+    @mcp_circuit_breaker
     async def _fetch_tool_schema(self, server_id: str, tool_name: str) -> ToolSchema:
-        """Fetch full tool schema from server including messaging capabilities."""
+        """
+        Fetch full tool schema from server including messaging capabilities.
+
+        Resilience: Retry with exponential backoff + circuit breaker.
+        """
         server = self._servers.get(server_id)
         if not server:
             raise ServerNotFoundError(server_id)
@@ -299,6 +361,43 @@ class MCPServerRegistry:
                 messaging=messaging,
             )
 
+        except httpx.TimeoutException as e:
+            logger.error(
+                "Timeout fetching tool schema",
+                server_id=server_id,
+                tool_name=tool_name,
+                error=str(e),
+            )
+            raise TransientError(f"Timeout fetching schema: {e}") from e
+        except httpx.ConnectError as e:
+            logger.error(
+                "Connection error fetching tool schema",
+                server_id=server_id,
+                tool_name=tool_name,
+                error=str(e),
+            )
+            raise TransientError(f"Connection error: {e}") from e
+        except httpx.HTTPStatusError as e:
+            logger.error(
+                "HTTP error fetching tool schema",
+                server_id=server_id,
+                tool_name=tool_name,
+                status_code=e.response.status_code,
+                error=str(e),
+            )
+            if e.response.status_code == 429:
+                raise RateLimitError(f"Rate limited: {e}") from e
+            if e.response.status_code >= 500:
+                raise TransientError(f"Server error: {e}") from e
+            raise ToolNotFoundError(tool_name) from e
+        except BreakerOpen as e:
+            logger.warning(
+                "Circuit breaker open for schema fetch",
+                server_id=server_id,
+                tool_name=tool_name,
+                error=str(e),
+            )
+            raise
         except Exception as e:
             logger.error(
                 "Failed to fetch tool schema",
