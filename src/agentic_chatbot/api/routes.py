@@ -19,12 +19,19 @@ from agentic_chatbot.api.models import (
     ElicitationResponseResult,
     PendingElicitationResponse,
     PendingElicitationsResponse,
+    DocumentUploadRequest,
+    DocumentUploadResponse,
+    DocumentStatusResponse,
+    DocumentSummaryResponse,
+    DocumentListResponse,
+    DocumentDeleteResponse,
 )
 from agentic_chatbot.api.dependencies import (
     MCPRegistryDep,
     MCPSessionManagerDep,
     ElicitationManagerDep,
     ToolProviderDep,
+    DocumentServiceDep,
 )
 from agentic_chatbot.api.sse import event_generator_with_task
 from agentic_chatbot.events.emitter import EventEmitter
@@ -437,3 +444,197 @@ async def cancel_elicitation(
             elicitation_id=elicitation_id,
             message="Elicitation not found or already responded",
         )
+
+
+# =============================================================================
+# DOCUMENT ENDPOINTS
+# =============================================================================
+
+
+@router.post("/documents", response_model=DocumentUploadResponse)
+async def upload_document(
+    request: Request,
+    upload_request: DocumentUploadRequest,
+    document_service: DocumentServiceDep,
+) -> DocumentUploadResponse:
+    """
+    Upload a document for conversation context.
+
+    Documents are processed asynchronously:
+    1. Document is saved and chunked
+    2. Each chunk is summarized by LLM
+    3. Overall summary is generated
+
+    The supervisor can use summaries to decide which documents
+    to load into context for answering questions.
+
+    Limits:
+    - Maximum 5 documents per conversation
+    - Maximum 1MB per document
+    - Text files only (text/plain, text/markdown)
+    """
+    if not document_service:
+        raise HTTPException(
+            status_code=503,
+            detail="Document service not available",
+        )
+
+    try:
+        # Create document
+        document_id = await document_service.create_document(
+            conversation_id=upload_request.conversation_id,
+            filename=upload_request.filename,
+            content=upload_request.content,
+            content_type=upload_request.content_type,
+        )
+
+        # Get metadata for response
+        metadata = await document_service.get_metadata(
+            upload_request.conversation_id,
+            document_id,
+        )
+
+        # Start background processing
+        asyncio.create_task(
+            document_service.process_document(
+                upload_request.conversation_id,
+                document_id,
+            )
+        )
+
+        return DocumentUploadResponse(
+            document_id=document_id,
+            conversation_id=upload_request.conversation_id,
+            filename=upload_request.filename,
+            status=metadata.status.value,
+            size_bytes=metadata.size_bytes,
+            message="Document uploaded, processing started",
+        )
+
+    except Exception as e:
+        logger.error(f"Document upload failed: {e}", exc_info=True)
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get(
+    "/documents/{conversation_id}",
+    response_model=DocumentListResponse,
+)
+async def list_documents(
+    conversation_id: str,
+    document_service: DocumentServiceDep,
+) -> DocumentListResponse:
+    """
+    List all documents for a conversation.
+
+    Returns summaries and processing status for each document.
+    """
+    if not document_service:
+        raise HTTPException(
+            status_code=503,
+            detail="Document service not available",
+        )
+
+    try:
+        summaries = await document_service.get_summaries(conversation_id)
+
+        documents = [
+            DocumentSummaryResponse(
+                document_id=s.document_id,
+                filename=s.filename,
+                status=s.status.value,
+                overall_summary=s.overall_summary,
+                key_topics=s.key_topics,
+                document_type=s.document_type,
+                relevance_hints=s.relevance_hints,
+                chunk_count=s.chunk_count,
+                total_tokens=s.total_tokens,
+                processing_progress=s.processing_progress,
+            )
+            for s in summaries
+        ]
+
+        return DocumentListResponse(
+            conversation_id=conversation_id,
+            documents=documents,
+            count=len(documents),
+        )
+
+    except Exception as e:
+        logger.error(f"List documents failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get(
+    "/documents/{conversation_id}/{document_id}/status",
+    response_model=DocumentStatusResponse,
+)
+async def get_document_status(
+    conversation_id: str,
+    document_id: str,
+    document_service: DocumentServiceDep,
+) -> DocumentStatusResponse:
+    """
+    Get processing status for a specific document.
+
+    Useful for polling during processing.
+    """
+    if not document_service:
+        raise HTTPException(
+            status_code=503,
+            detail="Document service not available",
+        )
+
+    try:
+        metadata = await document_service.get_metadata(
+            conversation_id,
+            document_id,
+        )
+
+        return DocumentStatusResponse(
+            document_id=document_id,
+            filename=metadata.filename,
+            status=metadata.status.value,
+            processing_progress=metadata.processing_progress,
+            error_message=metadata.error_message,
+        )
+
+    except Exception as e:
+        if "not found" in str(e).lower():
+            raise HTTPException(status_code=404, detail=str(e))
+        logger.error(f"Get document status failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete(
+    "/documents/{conversation_id}/{document_id}",
+    response_model=DocumentDeleteResponse,
+)
+async def delete_document(
+    conversation_id: str,
+    document_id: str,
+    document_service: DocumentServiceDep,
+) -> DocumentDeleteResponse:
+    """
+    Delete a document from a conversation.
+    """
+    if not document_service:
+        raise HTTPException(
+            status_code=503,
+            detail="Document service not available",
+        )
+
+    try:
+        await document_service.delete_document(conversation_id, document_id)
+
+        return DocumentDeleteResponse(
+            success=True,
+            document_id=document_id,
+            message="Document deleted",
+        )
+
+    except Exception as e:
+        if "not found" in str(e).lower():
+            raise HTTPException(status_code=404, detail=str(e))
+        logger.error(f"Delete document failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))

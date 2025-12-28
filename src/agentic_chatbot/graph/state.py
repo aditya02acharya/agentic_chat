@@ -36,6 +36,11 @@ from agentic_chatbot.data.sourced import SourcedContent, ContentSummary
 from agentic_chatbot.data.execution import ExecutionOutput, TaskInfo
 from agentic_chatbot.data.directive import Directive, DirectiveType, DirectiveRecord
 
+# Document types (optional import for type hints)
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from agentic_chatbot.documents.models import DocumentSummary, LoadedDocument
+
 
 # =============================================================================
 # DECISION AND RESULT MODELS
@@ -262,6 +267,55 @@ def reduce_token_usage(
     return left + right
 
 
+def reduce_document_summaries(
+    left: list[Any] | None,
+    right: list[Any] | None,
+) -> list[Any]:
+    """
+    Reducer for document summaries.
+
+    Merges by document_id to avoid duplicates.
+    Right values override left for the same document_id.
+    """
+    if not left:
+        left = []
+    if not right:
+        return list(left)
+
+    # Create lookup by document_id
+    by_id = {s.document_id: s for s in left}
+
+    # Update or add from right
+    for summary in right:
+        by_id[summary.document_id] = summary
+
+    return list(by_id.values())
+
+
+def reduce_loaded_documents(
+    left: list[Any] | None,
+    right: list[Any] | None,
+) -> list[Any]:
+    """
+    Reducer for loaded documents.
+
+    Merges by document_id. Right values override left for the same document_id.
+    """
+    if not left:
+        left = []
+    if not right:
+        return list(left)
+
+    # Create lookup by document_id
+    by_id = {d.document_id: d for d in left}
+
+    # Update or add from right
+    for doc in right:
+        by_id[doc.document_id] = doc
+
+    return list(by_id.values())
+
+
 # =============================================================================
 # MAIN STATE DEFINITION
 # =============================================================================
@@ -345,6 +399,19 @@ class ChatState(TypedDict, total=False):
 
     # Current directive (replaces current_decision for new code)
     current_directive: Directive | None
+
+    # -------------------------------------------------------------------------
+    # DOCUMENT CONTEXT
+    # Documents uploaded by user for conversation context
+    # -------------------------------------------------------------------------
+
+    # Document summaries for supervisor decision-making
+    # These are lightweight summaries used to decide which documents to load
+    document_summaries: Annotated[list[Any], reduce_document_summaries]
+
+    # Loaded document content for context
+    # These are full or partial documents loaded based on supervisor decisions
+    loaded_documents: Annotated[list[Any], reduce_loaded_documents]
 
     # -------------------------------------------------------------------------
     # OUTPUT
@@ -454,6 +521,10 @@ def create_initial_state(
         source_counter={},
         current_directive=None,
 
+        # Document context
+        document_summaries=[],
+        loaded_documents=[],
+
         # Output
         final_response="",
         clarify_question=None,
@@ -538,3 +609,75 @@ def get_citation_blocks(state: ChatState) -> str:
     """Get all citation blocks for footnotes."""
     sourced = state.get("sourced_contents", [])
     return "\n\n".join(sc.citation_block for sc in sourced)
+
+
+def get_document_summaries_text(state: ChatState) -> str:
+    """
+    Get formatted document summaries for supervisor context.
+
+    Returns a text representation of all document summaries that helps
+    the supervisor decide which documents to load.
+    """
+    summaries = state.get("document_summaries", [])
+    if not summaries:
+        return "No documents uploaded for this conversation."
+
+    lines = [f"## Uploaded Documents ({len(summaries)} total)\n"]
+
+    for summary in summaries:
+        lines.append(f"### [{summary.document_id}] {summary.filename}")
+        lines.append(f"**Status:** {summary.status.value}")
+
+        if summary.status.value == "ready":
+            lines.append(f"**Type:** {summary.document_type}")
+            lines.append(f"**Summary:** {summary.overall_summary}")
+            lines.append(f"**Topics:** {', '.join(summary.key_topics)}")
+            lines.append(f"**Size:** {summary.chunk_count} chunks, ~{summary.total_tokens} tokens")
+            if summary.relevance_hints:
+                lines.append(f"**When to use:** {summary.relevance_hints}")
+        else:
+            lines.append(f"**Progress:** {summary.processing_progress:.0%}")
+
+        lines.append("")  # Blank line between documents
+
+    return "\n".join(lines)
+
+
+def get_loaded_documents_text(state: ChatState) -> str:
+    """
+    Get formatted loaded document content for context assembly.
+
+    Returns the full content of all loaded documents.
+    """
+    documents = state.get("loaded_documents", [])
+    if not documents:
+        return ""
+
+    lines = ["## Document Content\n"]
+
+    for doc in documents:
+        lines.append(f"### {doc.filename} (ID: {doc.document_id})")
+        if not doc.is_complete:
+            lines.append(f"*Partial content: chunks {doc.chunks_loaded}*")
+        lines.append("")
+        lines.append(doc.content)
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def get_document_context(state: ChatState) -> str:
+    """
+    Get combined document context for supervisor/synthesizer.
+
+    Returns both summaries and loaded content formatted for context.
+    """
+    summaries_text = get_document_summaries_text(state)
+    loaded_text = get_loaded_documents_text(state)
+
+    if not loaded_text:
+        return summaries_text
+
+    return f"{summaries_text}\n\n{loaded_text}"

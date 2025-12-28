@@ -51,6 +51,7 @@ from agentic_chatbot.graph.state import (
     get_summaries_text,
     get_sourced_contents,
     get_citation_blocks,
+    get_document_summaries_text,
 )
 from agentic_chatbot.operators.registry import OperatorRegistry
 from agentic_chatbot.operators.context import OperatorContext, MessagingContext
@@ -222,6 +223,9 @@ async def supervisor_node(state: ChatState) -> dict[str, Any]:
     # This keeps supervisor context lean while having all decision-relevant info
     data_summaries_text = get_summaries_text(state)
 
+    # Get document summaries (if any documents are uploaded)
+    document_context = get_document_summaries_text(state)
+
     # Format action history
     action_history = state.get("action_history", [])
     actions_text = (
@@ -234,6 +238,7 @@ async def supervisor_node(state: ChatState) -> dict[str, Any]:
     prompt = SUPERVISOR_DECISION_PROMPT.format(
         query=state.get("user_query", ""),
         conversation_context=conversation_context,
+        document_context=document_context,  # Document summaries
         tool_results=data_summaries_text,  # Summaries, not raw data
         actions_this_turn=actions_text,
     )

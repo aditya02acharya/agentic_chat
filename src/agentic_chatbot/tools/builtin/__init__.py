@@ -6,12 +6,18 @@ from agentic_chatbot.tools.builtin.introspection import (
     ListToolsTool,
     ListOperatorsTool,
 )
+from agentic_chatbot.tools.builtin.load_document import (
+    LoadDocumentTool,
+    ListDocumentsTool,
+)
 
 __all__ = [
     "SelfInfoTool",
     "CapabilitiesTool",
     "ListToolsTool",
     "ListOperatorsTool",
+    "LoadDocumentTool",
+    "ListDocumentsTool",
 ]
 
 
@@ -25,3 +31,4 @@ def register_builtin_tools() -> None:
     from agentic_chatbot.tools.builtin import self_info  # noqa: F401
     from agentic_chatbot.tools.builtin import capabilities  # noqa: F401
     from agentic_chatbot.tools.builtin import introspection  # noqa: F401
+    from agentic_chatbot.tools.builtin import load_document  # noqa: F401

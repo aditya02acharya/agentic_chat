@@ -2,12 +2,15 @@
 
 import asyncio
 import signal
-from typing import Set
+from typing import Set, TYPE_CHECKING
 
 from agentic_chatbot.config.settings import get_settings
 from agentic_chatbot.mcp.manager import MCPClientManager
 from agentic_chatbot.mcp.registry import MCPServerRegistry
 from agentic_chatbot.utils.logging import get_logger, configure_logging
+
+if TYPE_CHECKING:
+    from agentic_chatbot.documents.service import DocumentService
 
 
 logger = get_logger(__name__)
@@ -28,6 +31,7 @@ class Application:
         """Initialize application."""
         self.mcp_client_manager: MCPClientManager | None = None
         self.mcp_server_registry: MCPServerRegistry | None = None
+        self.document_service: "DocumentService | None" = None
         self._active_requests: Set[str] = set()
         self._shutdown_event = asyncio.Event()
         self._is_shutting_down = False
@@ -57,6 +61,27 @@ class Application:
             logger.info("MCP registry initialized")
         except Exception as e:
             logger.warning(f"MCP registry warmup failed: {e}")
+
+        # Initialize document service
+        try:
+            from agentic_chatbot.documents.storage import LocalDocumentStorage
+            from agentic_chatbot.documents.service import DocumentService
+            from agentic_chatbot.utils.llm import LLMClient
+
+            storage = LocalDocumentStorage(
+                base_path=settings.document_storage_path
+                if hasattr(settings, "document_storage_path")
+                else "./storage/documents"
+            )
+            llm_client = LLMClient()
+            self.document_service = DocumentService(
+                storage=storage,
+                llm_client=llm_client,
+            )
+            logger.info("Document service initialized")
+        except Exception as e:
+            logger.warning(f"Document service initialization failed: {e}")
+            self.document_service = None
 
         logger.info("Application started")
 

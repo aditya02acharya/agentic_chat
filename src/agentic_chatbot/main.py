@@ -46,6 +46,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Store references in app state
     app.state.mcp_server_registry = app_instance.mcp_server_registry
     app.state.mcp_client_manager = app_instance.mcp_client_manager
+    app.state.document_service = app_instance.document_service
     app.state.active_requests = app_instance.active_requests
     app.state.is_shutting_down = False
 

@@ -138,3 +138,72 @@ class PendingElicitationsResponse(BaseModel):
 
     elicitations: list[PendingElicitationResponse] = Field(default_factory=list)
     count: int = Field(0, description="Number of pending elicitations")
+
+
+# =============================================================================
+# DOCUMENT MODELS
+# =============================================================================
+
+
+class DocumentUploadRequest(BaseModel):
+    """Request body for document upload."""
+
+    conversation_id: str = Field(..., description="Conversation to attach document to")
+    filename: str = Field(..., description="Original filename")
+    content: str = Field(..., description="Document text content")
+    content_type: str = Field(
+        "text/plain",
+        description="MIME type (text/plain or text/markdown)",
+    )
+
+
+class DocumentUploadResponse(BaseModel):
+    """Response for document upload."""
+
+    document_id: str = Field(..., description="Unique document identifier")
+    conversation_id: str = Field(..., description="Conversation ID")
+    filename: str = Field(..., description="Original filename")
+    status: str = Field(..., description="Processing status")
+    size_bytes: int = Field(..., description="Document size in bytes")
+    message: str = Field("", description="Additional information")
+
+
+class DocumentStatusResponse(BaseModel):
+    """Document processing status."""
+
+    document_id: str = Field(..., description="Document identifier")
+    filename: str = Field(..., description="Original filename")
+    status: str = Field(..., description="Processing status")
+    processing_progress: float = Field(0.0, description="Progress 0.0-1.0")
+    error_message: str | None = Field(None, description="Error if failed")
+
+
+class DocumentSummaryResponse(BaseModel):
+    """Document summary for API response."""
+
+    document_id: str = Field(..., description="Document identifier")
+    filename: str = Field(..., description="Original filename")
+    status: str = Field(..., description="Processing status")
+    overall_summary: str = Field("", description="Document summary")
+    key_topics: list[str] = Field(default_factory=list, description="Key topics")
+    document_type: str = Field("unknown", description="Document type")
+    relevance_hints: str = Field("", description="When to use this document")
+    chunk_count: int = Field(0, description="Number of chunks")
+    total_tokens: int = Field(0, description="Estimated token count")
+    processing_progress: float = Field(0.0, description="Progress 0.0-1.0")
+
+
+class DocumentListResponse(BaseModel):
+    """Response listing all documents for a conversation."""
+
+    conversation_id: str = Field(..., description="Conversation identifier")
+    documents: list[DocumentSummaryResponse] = Field(default_factory=list)
+    count: int = Field(0, description="Number of documents")
+
+
+class DocumentDeleteResponse(BaseModel):
+    """Response for document deletion."""
+
+    success: bool = Field(..., description="Whether deletion succeeded")
+    document_id: str = Field(..., description="Deleted document ID")
+    message: str = Field("", description="Additional information")

@@ -59,6 +59,7 @@ class UnifiedToolProvider:
         local_registry: type[LocalToolRegistry] | None = None,
         mcp_registry: "MCPServerRegistry | None" = None,
         operator_registry: "type[OperatorRegistry] | None" = None,
+        document_service: Any | None = None,
     ):
         """
         Initialize the unified tool provider.
@@ -67,10 +68,12 @@ class UnifiedToolProvider:
             local_registry: LocalToolRegistry class (not instance)
             mcp_registry: MCPServerRegistry instance for remote tools
             operator_registry: OperatorRegistry class for introspection tools
+            document_service: DocumentService instance for document loading tools
         """
         self._local = local_registry or LocalToolRegistry
         self._mcp = mcp_registry
         self._operator_registry = operator_registry
+        self._document_service = document_service
 
     @property
     def has_local(self) -> bool:
@@ -81,6 +84,11 @@ class UnifiedToolProvider:
     def has_remote(self) -> bool:
         """Check if remote MCP tools are available."""
         return self._mcp is not None
+
+    @property
+    def has_documents(self) -> bool:
+        """Check if document service is available."""
+        return self._document_service is not None
 
     async def get_all_summaries(self) -> list[ToolSummary]:
         """
@@ -202,6 +210,8 @@ class UnifiedToolProvider:
             operator_registry=self._operator_registry,
             mcp_registry=self._mcp,
             local_tool_registry=self._local,
+            # Document service for document loading tools
+            document_service=self._document_service,
         )
 
         return await self._local.execute(name, params, context)
