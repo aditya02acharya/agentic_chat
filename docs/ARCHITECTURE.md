@@ -17,7 +17,8 @@ A step-by-step guide to understanding the LangGraph-based agentic chatbot backen
 11. [Step 8: Understanding Local Tools](#step-8-understanding-local-tools)
 12. [Step 9: Understanding the Flow](#step-9-understanding-the-flow)
 13. [Step 10: Understanding Resilience Patterns](#step-10-understanding-resilience-patterns)
-14. [Debugging Tips](#debugging-tips)
+14. [Step 11: Understanding Document Context](#step-11-understanding-document-context)
+15. [Debugging Tips](#debugging-tips)
 
 ---
 
@@ -90,7 +91,19 @@ src/agentic_chatbot/
 │   └── builtin/           # Built-in tools
 │       ├── self_info.py   # Bot version, capabilities, release notes
 │       ├── capabilities.py # Detailed feature list
-│       └── introspection.py # list_tools, list_operators
+│       ├── introspection.py # list_tools, list_operators
+│       └── load_document.py # Document loading tools
+│
+├── documents/              # 🆕 Document upload and context management
+│   ├── models.py          # DocumentStatus, DocumentChunk, DocumentSummary
+│   ├── config.py          # ChunkConfig, DocumentConfig
+│   ├── chunker.py         # Semantic document chunking with overlap
+│   ├── summarizer.py      # LLM-based chunk and document summarization
+│   ├── processor.py       # Async processing pipeline
+│   ├── service.py         # High-level DocumentService API
+│   └── storage/           # Storage backends (abstract + implementations)
+│       ├── base.py        # Abstract DocumentStorage interface
+│       └── local.py       # Local filesystem implementation
 │
 ├── mcp/                    # MCP Protocol integration
 │   ├── callbacks.py       # Callback handlers + ElicitationManager
@@ -1027,6 +1040,231 @@ class MCPClient:
 
 ---
 
+## Step 11: Understanding Document Context
+
+**Files:** `src/agentic_chatbot/documents/`
+
+The document module enables users to upload documents that provide conversation-specific context.
+
+### Why Document Context?
+
+| Problem | Solution |
+|---------|----------|
+| Large documents don't fit in context | Chunking with summarization |
+| Irrelevant documents waste tokens | Supervisor decides which to load |
+| Information at chunk boundaries | Overlapping chunks preserve context |
+| Slow processing blocks chat | Async background processing |
+
+### Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    DOCUMENT PROCESSING FLOW                  │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│  Upload ──► Storage ──► Chunker ──► Summarizer ──► Ready    │
+│    │           │           │            │             │      │
+│    ▼           ▼           ▼            ▼             ▼      │
+│  API      metadata.json  chunks/    summary.json  Supervisor │
+│           original.txt   000.json               sees summary │
+│                          001.json                            │
+│                          ...                                 │
+│                                                              │
+│  User Question ──► Supervisor ──► load_document ──► Answer   │
+│                        │              │                      │
+│                        ▼              ▼                      │
+│                  Check summaries  Load full content          │
+│                  for relevance   or specific chunks          │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Key Components
+
+| Component | File | Purpose |
+|-----------|------|---------|
+| **DocumentService** | `service.py` | High-level API for upload, process, load |
+| **DocumentProcessor** | `processor.py` | Async pipeline (chunk → summarize → store) |
+| **DocumentChunker** | `chunker.py` | Semantic splitting with overlap |
+| **DocumentSummarizer** | `summarizer.py` | LLM-based chunk and document summaries |
+| **DocumentStorage** | `storage/base.py` | Abstract interface for persistence |
+| **LocalDocumentStorage** | `storage/local.py` | Filesystem implementation |
+
+### Document States
+
+```python
+class DocumentStatus(str, Enum):
+    UPLOADING = "uploading"     # Initial upload
+    CHUNKING = "chunking"       # Being split into chunks
+    SUMMARIZING = "summarizing" # Chunks being summarized
+    READY = "ready"             # Fully processed, available
+    ERROR = "error"             # Processing failed
+```
+
+### Processing Pipeline
+
+```python
+class DocumentProcessor:
+    async def process_document(self, conversation_id: str, document_id: str):
+        # 1. Update status to CHUNKING
+        await self._storage.update_status(document_id, DocumentStatus.CHUNKING)
+
+        # 2. Load and chunk content
+        content = await self._storage.load_content(document_id)
+        chunks = self._chunker.chunk_document(content)
+        await self._storage.save_chunks(document_id, chunks)
+
+        # 3. Update status to SUMMARIZING
+        await self._storage.update_status(document_id, DocumentStatus.SUMMARIZING)
+
+        # 4. Summarize chunks in parallel (semaphore-controlled)
+        async with asyncio.Semaphore(MAX_CONCURRENT):
+            summaries = await asyncio.gather(*[
+                self._summarizer.summarize_chunk(chunk)
+                for chunk in chunks
+            ])
+
+        # 5. Aggregate into document summary
+        doc_summary = await self._summarizer.aggregate_summaries(chunks)
+
+        # 6. Update status to READY
+        await self._storage.update_status(document_id, DocumentStatus.READY)
+```
+
+### Chunking Strategy
+
+Documents are split at semantic boundaries with overlap:
+
+```python
+@dataclass
+class ChunkConfig:
+    CHUNK_SIZE: int = 4000           # ~1000 tokens per chunk
+    CHUNK_OVERLAP: int = 500         # Overlap to preserve context
+    MIN_CHUNK_SIZE: int = 500        # Don't create tiny chunks
+    MAX_CHUNKS_PER_DOC: int = 50     # Limit chunks per document
+    SPLIT_PATTERNS: tuple = (        # Priority order for splits
+        "\n\n\n",  # Section breaks
+        "\n\n",    # Paragraphs
+        "\n",      # Lines
+        ". ",      # Sentences
+        " ",       # Words (last resort)
+    )
+```
+
+### Supervisor Integration
+
+The supervisor prompt includes document context:
+
+```python
+SUPERVISOR_DECISION_PROMPT = """User Query: {query}
+
+Conversation Context:
+{conversation_context}
+
+Document Context:
+{document_context}  # ← Summaries injected here
+
+Tool Results So Far:
+{tool_results}
+...
+Remember:
+- PRIORITY: Check document summaries first - if relevant documents exist,
+  load them before using external tools
+"""
+```
+
+### Graph State Integration
+
+Document fields in ChatState:
+
+```python
+class ChatState(TypedDict, total=False):
+    # ... existing fields ...
+
+    # Document summaries for supervisor decision-making
+    document_summaries: Annotated[list[Any], reduce_document_summaries]
+
+    # Loaded document content for context
+    loaded_documents: Annotated[list[Any], reduce_loaded_documents]
+```
+
+### Local Tools for Documents
+
+| Tool | Purpose |
+|------|---------|
+| `list_documents` | Get all document summaries for conversation |
+| `load_document` | Load full or partial document content |
+
+```python
+@LocalToolRegistry.register
+class LoadDocumentTool(LocalTool):
+    name = "load_document"
+    description = "Load document content into context"
+
+    async def execute(self, context: LocalToolContext) -> ToolResult:
+        doc_service = context.document_service
+        document_ids = context.params.get("document_ids", [])
+
+        # Wait for documents if still processing
+        await doc_service.wait_for_documents(document_ids)
+
+        # Load full documents or specific chunks
+        loaded = await doc_service.load_full_document(doc_id)
+        return self.success(loaded.content)
+```
+
+### API Endpoints
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/documents` | POST | Upload document |
+| `/documents/{conv_id}` | GET | List documents |
+| `/documents/{conv_id}/{doc_id}/status` | GET | Get processing status |
+| `/documents/{conv_id}/{doc_id}` | DELETE | Delete document |
+
+### Storage Structure
+
+```
+storage/documents/{conversation_id}/{document_id}/
+├── original.txt       # Raw document content
+├── metadata.json      # DocumentMetadata
+├── summary.json       # DocumentSummary (after processing)
+└── chunks/
+    ├── 000.json       # First chunk with summary
+    ├── 001.json       # Second chunk with summary
+    └── ...
+```
+
+### Error Handling
+
+The processor uses resilience patterns for summarization:
+
+```python
+class DocumentSummarizer:
+    @llm_retry
+    @llm_circuit_breaker
+    @llm_timeout
+    async def summarize_chunk(self, content: str) -> ChunkSummaryResult:
+        # LLM call with fault tolerance
+        ...
+```
+
+### Configuration
+
+```python
+@dataclass
+class DocumentConfig:
+    MAX_DOCUMENTS_PER_CONVERSATION: int = 5
+    MAX_DOCUMENT_SIZE_BYTES: int = 1_000_000  # 1MB
+    ALLOWED_CONTENT_TYPES: tuple = ("text/plain", "text/markdown")
+    SUMMARIZATION_MODEL: str = "haiku"  # Fast model for summaries
+    MAX_CONCURRENT_SUMMARIZATIONS: int = 5
+    DOCUMENT_CONTEXT_PRIORITY: int = 900  # High priority in context
+    DEFAULT_WAIT_TIMEOUT: float = 30.0  # Max wait for processing
+```
+
+---
+
 ## Debugging Tips
 
 ### 1. Check Events in Browser
@@ -1103,6 +1341,7 @@ print(result.get("final_response"))
 | MCP | `mcp/` | External tool protocol |
 | Context | `context/` | DataChunk/DataSummary for citations |
 | Resilience | `core/resilience.py` | Fault tolerance (retry, circuit breaker, timeout) |
+| Documents | `documents/` | Document upload, chunking, summarization |
 
 ### New Features Summary
 
@@ -1117,6 +1356,7 @@ print(result.get("final_response"))
 | **Token Tracking** | Full token usage tracking across all LLM calls (input, output, thinking) |
 | **Model Configuration** | Centralized model registry with aliases and thinking support |
 | **Fault Tolerance** | Retry, circuit breaker, timeout patterns via hyx for all remote calls |
+| **Document Context** | Upload documents with auto-summarization for conversation context |
 
 ---
 

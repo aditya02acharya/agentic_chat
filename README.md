@@ -26,6 +26,7 @@ A ReACT-based agentic chatbot backend built with **LangGraph v1.x**, featuring e
 - **UnifiedToolProvider**: Single interface for local, MCP, and operator tools
 - **SSE Streaming**: Real-time progress updates via Server-Sent Events
 - **Direct Response**: Operators can bypass writer to send content directly to users
+- **Document Context**: Upload documents for conversation-specific context with auto-summarization
 
 ### Reliability & Fault Tolerance
 - **Resilience Patterns**: Retry, circuit breaker, and timeout via [hyx](https://github.com/roma-glushko/hyx) library
@@ -181,6 +182,43 @@ List available tools (local + MCP + operators).
 #### POST /api/v1/elicitation/respond
 Submit user response to a tool's input request.
 
+### Document Endpoints
+
+#### POST /api/v1/documents
+Upload a document for conversation context.
+
+```bash
+curl -X POST http://localhost:8000/api/v1/documents \
+  -H "Content-Type: application/json" \
+  -d '{
+    "conversation_id": "conv-123",
+    "filename": "report.txt",
+    "content": "Document content here...",
+    "content_type": "text/plain"
+  }'
+```
+
+Response:
+```json
+{
+  "document_id": "doc-abc",
+  "conversation_id": "conv-123",
+  "filename": "report.txt",
+  "status": "uploading",
+  "size_bytes": 1024,
+  "message": "Document uploaded, processing started"
+}
+```
+
+#### GET /api/v1/documents/{conversation_id}
+List all documents for a conversation with summaries.
+
+#### GET /api/v1/documents/{conversation_id}/{document_id}/status
+Get processing status (uploading → chunking → summarizing → ready).
+
+#### DELETE /api/v1/documents/{conversation_id}/{document_id}
+Delete a document from conversation.
+
 ## Project Structure
 
 ```
@@ -203,7 +241,19 @@ src/agentic_chatbot/
 │   └── builtin/            # Built-in tools
 │       ├── self_info.py    # Bot version, capabilities
 │       ├── capabilities.py # Detailed feature list
-│       └── introspection.py# list_tools, list_operators
+│       ├── introspection.py# list_tools, list_operators
+│       └── load_document.py# Document loading tools
+│
+├── documents/              # Document upload and context
+│   ├── models.py           # DocumentStatus, DocumentChunk, etc.
+│   ├── config.py           # ChunkConfig, DocumentConfig
+│   ├── chunker.py          # Semantic document chunking
+│   ├── summarizer.py       # LLM-based summarization
+│   ├── processor.py        # Async processing pipeline
+│   ├── service.py          # High-level DocumentService
+│   └── storage/            # Storage backends
+│       ├── base.py         # Abstract storage interface
+│       └── local.py        # Local filesystem storage
 │
 ├── operators/              # Operators (Strategy pattern)
 │   ├── base.py             # BaseOperator with messaging attributes
@@ -305,7 +355,7 @@ class TokenUsage:
 
 ## Local Tools
 
-Zero-latency tools for self-awareness:
+Zero-latency tools for self-awareness and document access:
 
 | Tool | Description |
 |------|-------------|
@@ -313,6 +363,8 @@ Zero-latency tools for self-awareness:
 | `list_capabilities` | Detailed feature list |
 | `list_tools` | All available tools |
 | `list_operators` | Registered operators |
+| `list_documents` | List uploaded documents and summaries |
+| `load_document` | Load document content into context |
 
 ## Resilience Patterns
 
@@ -364,6 +416,39 @@ make format
 
 # Type checking
 make typecheck
+```
+
+## Document Context
+
+Upload documents to provide conversation-specific context. Documents are automatically chunked and summarized.
+
+### How It Works
+
+1. **Upload**: Client uploads document via `POST /api/v1/documents`
+2. **Chunking**: Document split into overlapping chunks (4000 chars, 500 overlap)
+3. **Summarization**: Each chunk summarized by LLM (haiku for speed)
+4. **Ready**: Supervisor sees document summaries in context
+5. **Loading**: Supervisor loads full documents when relevant to query
+
+### Configuration
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `MAX_DOCUMENTS_PER_CONVERSATION` | 5 | Max documents per conversation |
+| `MAX_DOCUMENT_SIZE_BYTES` | 1MB | Max document size |
+| `CHUNK_SIZE` | 4000 | Characters per chunk |
+| `CHUNK_OVERLAP` | 500 | Overlap between chunks |
+| `DOCUMENT_CONTEXT_PRIORITY` | 900 | High priority in context |
+
+### Supervisor Integration
+
+The supervisor prompt includes document summaries and prioritizes document loading:
+
+```
+Document Context:
+- Use "list_documents" to see document summaries
+- Use "load_document" to load content when relevant
+- Documents should be given HIGH PRIORITY
 ```
 
 ## Design Patterns
