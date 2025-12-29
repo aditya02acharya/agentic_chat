@@ -8,6 +8,7 @@ from agentic_chatbot.config.settings import get_settings
 from agentic_chatbot.mcp.manager import MCPClientManager
 from agentic_chatbot.mcp.registry import MCPServerRegistry
 from agentic_chatbot.utils.logging import get_logger, configure_logging
+from agentic_chatbot.api.rate_limit import get_rate_limiter
 
 if TYPE_CHECKING:
     from agentic_chatbot.documents.service import DocumentService
@@ -101,6 +102,9 @@ class Application:
             logger.warning(f"Cognition service initialization failed: {e}")
             self.cognition_service = None
 
+        # Start rate limiter cleanup task
+        await get_rate_limiter().start_cleanup_task()
+
         logger.info("Application started")
 
     async def shutdown(self, timeout: float = 30.0) -> None:
@@ -109,12 +113,15 @@ class Application:
 
         1. Stop accepting new requests
         2. Wait for in-flight requests (with timeout)
-        3. Close MCP clients
-        4. Final cleanup
+        3. Wait for background tasks (document processing)
+        4. Close MCP clients
+        5. Final cleanup
 
         Args:
             timeout: Maximum time to wait for requests to complete
         """
+        from agentic_chatbot.api.routes import cleanup_background_tasks
+
         logger.info("Shutdown initiated...")
         self._is_shutting_down = True
         self._shutdown_event.set()
@@ -125,14 +132,20 @@ class Application:
             try:
                 await asyncio.wait_for(
                     self._wait_for_requests(),
-                    timeout=timeout,
+                    timeout=timeout / 2,  # Split timeout between requests and tasks
                 )
             except asyncio.TimeoutError:
-                logger.warning("Timeout waiting for requests, forcing shutdown")
+                logger.warning("Timeout waiting for requests, continuing shutdown")
+
+        # Wait for background tasks (document processing)
+        await cleanup_background_tasks(timeout=timeout / 4)
 
         # Shutdown cognition service (allows background tasks to complete)
         if self.cognition_service:
             await self.cognition_service.shutdown()
+
+        # Stop rate limiter cleanup task
+        await get_rate_limiter().stop_cleanup_task()
 
         # Close MCP client manager
         if self.mcp_client_manager:

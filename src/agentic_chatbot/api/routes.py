@@ -1,12 +1,14 @@
 """FastAPI routes for the chat API."""
 
 import asyncio
+import uuid
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from agentic_chatbot import __version__
+from agentic_chatbot.api.rate_limit import get_rate_limiter
 from agentic_chatbot.api.models import (
     ChatRequest,
     ChatResponse,
@@ -49,6 +51,80 @@ router = APIRouter()
 
 # Maximum time for graph execution (5 minutes)
 GRAPH_EXECUTION_TIMEOUT = 300.0
+
+# Background task tracking for graceful shutdown
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _generate_request_id(conversation_id: str) -> str:
+    """Generate a unique request ID using UUID4."""
+    return f"{conversation_id}_{uuid.uuid4().hex[:12]}"
+
+
+def _sanitize_error_message(error: Exception) -> str:
+    """
+    Sanitize error message for client response.
+
+    Hides internal details while providing useful feedback.
+    """
+    error_str = str(error).lower()
+
+    # Map known error patterns to user-friendly messages
+    if "connection" in error_str or "network" in error_str:
+        return "A network error occurred. Please try again."
+    elif "timeout" in error_str:
+        return "The request timed out. Please try again."
+    elif "not found" in error_str:
+        return str(error)  # Keep "not found" messages
+    elif "limit" in error_str or "exceeded" in error_str:
+        return str(error)  # Keep limit messages
+    elif "validation" in error_str or "invalid" in error_str:
+        return str(error)  # Keep validation messages
+    elif "permission" in error_str or "unauthorized" in error_str:
+        return "You don't have permission to perform this action."
+    else:
+        # Generic message for unexpected errors
+        return "An unexpected error occurred. Please try again later."
+
+
+def _track_background_task(task: asyncio.Task) -> None:
+    """Track a background task for graceful shutdown."""
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
+async def cleanup_background_tasks(timeout: float = 5.0) -> int:
+    """
+    Wait for background tasks to complete during shutdown.
+
+    Args:
+        timeout: Maximum time to wait for tasks
+
+    Returns:
+        Number of tasks that were cancelled
+    """
+    if not _background_tasks:
+        return 0
+
+    logger.info(f"Waiting for {len(_background_tasks)} background tasks...")
+
+    # Wait for tasks with timeout
+    done, pending = await asyncio.wait(
+        _background_tasks,
+        timeout=timeout,
+        return_when=asyncio.ALL_COMPLETED,
+    )
+
+    # Cancel any tasks that didn't finish
+    cancelled = 0
+    for task in pending:
+        task.cancel()
+        cancelled += 1
+
+    if cancelled:
+        logger.warning(f"Cancelled {cancelled} background tasks that didn't complete")
+
+    return cancelled
 
 
 @router.get("/health", response_model=HealthResponse)
@@ -139,13 +215,16 @@ async def chat(
     2. Collect user input
     3. Submit response via POST /elicitation/respond
     """
+    # Check rate limit
+    await get_rate_limiter().check(request)
+
     # Check if shutdown is in progress
     if getattr(request.app.state, "is_shutting_down", False):
         raise HTTPException(status_code=503, detail="Service is shutting down")
 
     # Create request context
     event_queue: asyncio.Queue[Event] = asyncio.Queue()
-    request_id = f"{chat_request.conversation_id}_{asyncio.get_event_loop().time()}"
+    request_id = _generate_request_id(chat_request.conversation_id)
 
     # Create event emitter for this request
     emitter = EventEmitter(event_queue)
@@ -260,11 +339,14 @@ async def chat_sync(
     Note: Elicitation requests cannot be handled in sync mode
     as they require interactive user input.
     """
+    # Check rate limit
+    await get_rate_limiter().check(request)
+
     # Check if shutdown is in progress
     if getattr(request.app.state, "is_shutting_down", False):
         raise HTTPException(status_code=503, detail="Service is shutting down")
 
-    request_id = f"{chat_request.conversation_id}_{asyncio.get_event_loop().time()}"
+    request_id = _generate_request_id(chat_request.conversation_id)
 
     # Create event emitter (events go to queue but aren't streamed)
     event_queue: asyncio.Queue[Event] = asyncio.Queue()
@@ -344,7 +426,7 @@ async def chat_sync(
 
     except Exception as e:
         logger.error(f"Chat error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_sanitize_error_message(e))
 
 
 # =============================================================================
@@ -480,6 +562,9 @@ async def upload_document(
     - Maximum 1MB per document
     - Text files only (text/plain, text/markdown)
     """
+    # Check rate limit
+    await get_rate_limiter().check(request)
+
     if not document_service:
         raise HTTPException(
             status_code=503,
@@ -501,13 +586,14 @@ async def upload_document(
             document_id,
         )
 
-        # Start background processing
-        asyncio.create_task(
+        # Start background processing with task tracking
+        task = asyncio.create_task(
             document_service.process_document(
                 upload_request.conversation_id,
                 document_id,
             )
         )
+        _track_background_task(task)
 
         return DocumentUploadResponse(
             document_id=document_id,
@@ -520,7 +606,7 @@ async def upload_document(
 
     except Exception as e:
         logger.error(f"Document upload failed: {e}", exc_info=True)
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=_sanitize_error_message(e))
 
 
 @router.get(
@@ -569,7 +655,7 @@ async def list_documents(
 
     except Exception as e:
         logger.error(f"List documents failed: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_sanitize_error_message(e))
 
 
 @router.get(
@@ -610,7 +696,7 @@ async def get_document_status(
         if "not found" in str(e).lower():
             raise HTTPException(status_code=404, detail=str(e))
         logger.error(f"Get document status failed: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_sanitize_error_message(e))
 
 
 @router.delete(
@@ -644,4 +730,4 @@ async def delete_document(
         if "not found" in str(e).lower():
             raise HTTPException(status_code=404, detail=str(e))
         logger.error(f"Delete document failed: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_sanitize_error_message(e))

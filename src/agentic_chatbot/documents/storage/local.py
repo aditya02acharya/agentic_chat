@@ -22,6 +22,11 @@ from agentic_chatbot.utils.logging import get_logger
 logger = get_logger(__name__)
 
 
+class PathTraversalError(Exception):
+    """Raised when path traversal attack is detected."""
+    pass
+
+
 class LocalDocumentStorage(DocumentStorage):
     """
     Local filesystem document storage.
@@ -46,12 +51,75 @@ class LocalDocumentStorage(DocumentStorage):
         Args:
             base_path: Base directory for document storage
         """
-        self._base_path = Path(base_path)
+        self._base_path = Path(base_path).resolve()
         self._lock = asyncio.Lock()
+
+    def _sanitize_path_component(self, component: str) -> str:
+        """
+        Sanitize a path component to prevent traversal attacks.
+
+        Args:
+            component: Path component (conversation_id or document_id)
+
+        Returns:
+            Sanitized component
+
+        Raises:
+            PathTraversalError: If component contains traversal patterns
+        """
+        # Check for null bytes
+        if "\x00" in component:
+            raise PathTraversalError(f"Invalid path component: contains null byte")
+
+        # Check for path traversal patterns
+        if ".." in component or "/" in component or "\\" in component:
+            raise PathTraversalError(f"Invalid path component: contains traversal pattern")
+
+        # Check for hidden files (starting with .)
+        if component.startswith("."):
+            raise PathTraversalError(f"Invalid path component: cannot start with dot")
+
+        # Check for empty component
+        if not component or component.isspace():
+            raise PathTraversalError(f"Invalid path component: empty or whitespace")
+
+        return component
+
+    def _get_safe_path(self, *components: str) -> Path:
+        """
+        Build a safe path from components.
+
+        Validates that the resulting path is within the base directory.
+
+        Args:
+            *components: Path components to join
+
+        Returns:
+            Safe path within base directory
+
+        Raises:
+            PathTraversalError: If path escapes base directory
+        """
+        # Sanitize each component
+        sanitized = [self._sanitize_path_component(c) for c in components]
+
+        # Build the path
+        result = self._base_path
+        for component in sanitized:
+            result = result / component
+
+        # Resolve to absolute path and verify it's within base
+        resolved = result.resolve()
+        if not str(resolved).startswith(str(self._base_path)):
+            raise PathTraversalError(
+                f"Path traversal detected: result path escapes base directory"
+            )
+
+        return resolved
 
     def _get_doc_path(self, conversation_id: str, document_id: str) -> Path:
         """Get path to document directory."""
-        return self._base_path / conversation_id / document_id
+        return self._get_safe_path(conversation_id, document_id)
 
     def _get_chunks_path(self, conversation_id: str, document_id: str) -> Path:
         """Get path to chunks directory."""
@@ -265,12 +333,26 @@ class LocalDocumentStorage(DocumentStorage):
             data = json.loads(await f.read())
             return DocumentSummary.from_dict(data)
 
+    def _get_conversation_path(self, conversation_id: str) -> Path:
+        """Get safe path to conversation directory."""
+        sanitized = self._sanitize_path_component(conversation_id)
+        result = self._base_path / sanitized
+        resolved = result.resolve()
+
+        # Verify it's within base directory
+        if not str(resolved).startswith(str(self._base_path)):
+            raise PathTraversalError(
+                f"Path traversal detected: conversation path escapes base directory"
+            )
+
+        return resolved
+
     async def load_all_summaries(
         self,
         conversation_id: str,
     ) -> list[DocumentSummary]:
         """Load all document summaries for a conversation."""
-        conv_path = self._base_path / conversation_id
+        conv_path = self._get_conversation_path(conversation_id)
 
         if not conv_path.exists():
             return []
@@ -284,14 +366,18 @@ class LocalDocumentStorage(DocumentStorage):
 
             document_id = doc_dir.name
 
-            # Try to load summary
-            summary = await self.load_summary(conversation_id, document_id)
+            # Skip hidden directories
+            if document_id.startswith("."):
+                continue
 
-            if summary:
-                summaries.append(summary)
-            else:
-                # Create minimal summary from metadata
-                try:
+            # Try to load summary
+            try:
+                summary = await self.load_summary(conversation_id, document_id)
+
+                if summary:
+                    summaries.append(summary)
+                else:
+                    # Create minimal summary from metadata
                     metadata = await self.load_metadata(conversation_id, document_id)
                     summaries.append(
                         DocumentSummary(
@@ -302,8 +388,8 @@ class LocalDocumentStorage(DocumentStorage):
                             error_message=metadata.error_message,
                         )
                     )
-                except FileNotFoundError:
-                    pass
+            except (FileNotFoundError, PathTraversalError):
+                pass
 
         return summaries
 
@@ -332,14 +418,15 @@ class LocalDocumentStorage(DocumentStorage):
         conversation_id: str,
     ) -> int:
         """Count documents in a conversation."""
-        conv_path = self._base_path / conversation_id
+        conv_path = self._get_conversation_path(conversation_id)
 
         if not conv_path.exists():
             return 0
 
         count = 0
         for item in conv_path.iterdir():
-            if item.is_dir():
+            # Skip hidden directories
+            if item.is_dir() and not item.name.startswith("."):
                 count += 1
 
         return count
@@ -369,7 +456,7 @@ class LocalDocumentStorage(DocumentStorage):
         conversation_id: str,
     ) -> list[str]:
         """List all document IDs in a conversation."""
-        conv_path = self._base_path / conversation_id
+        conv_path = self._get_conversation_path(conversation_id)
 
         if not conv_path.exists():
             return []
@@ -377,5 +464,5 @@ class LocalDocumentStorage(DocumentStorage):
         return [
             item.name
             for item in conv_path.iterdir()
-            if item.is_dir()
+            if item.is_dir() and not item.name.startswith(".")
         ]
