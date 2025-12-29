@@ -27,6 +27,7 @@ A ReACT-based agentic chatbot backend built with **LangGraph v1.x**, featuring e
 - **SSE Streaming**: Real-time progress updates via Server-Sent Events
 - **Direct Response**: Operators can bypass writer to send content directly to users
 - **Document Context**: Upload documents for conversation-specific context with auto-summarization
+- **System 3 Cognition**: Meta-cognitive layer with user modeling, episodic memory, and persistent identity
 
 ### Reliability & Fault Tolerance
 - **Resilience Patterns**: Retry, circuit breaker, and timeout via [hyx](https://github.com/roma-glushko/hyx) library
@@ -255,6 +256,17 @@ src/agentic_chatbot/
 │       ├── base.py         # Abstract storage interface
 │       └── local.py        # Local filesystem storage
 │
+├── cognition/              # System 3 Meta-Cognitive Layer
+│   ├── models.py           # UserProfile, EpisodicMemory, IdentityState
+│   ├── config.py           # CognitionSettings
+│   ├── storage.py          # PostgreSQL storage layer
+│   ├── task_queue.py       # Background task queue (1 worker)
+│   ├── theory_of_mind.py   # User modeling and preferences
+│   ├── episodic_memory.py  # Cross-conversation memory
+│   ├── identity.py         # Learning goals and metrics
+│   ├── meta_monitor.py     # Self-reflection and confidence
+│   └── service.py          # CognitionService (unified interface)
+│
 ├── operators/              # Operators (Strategy pattern)
 │   ├── base.py             # BaseOperator with messaging attributes
 │   ├── context.py          # OperatorContext + MessagingContext
@@ -450,6 +462,61 @@ Document Context:
 - Use "load_document" to load content when relevant
 - Documents should be given HIGH PRIORITY
 ```
+
+## System 3 Cognition
+
+Meta-cognitive layer providing persistent learning, user modeling, and self-reflection.
+
+### Components
+
+| Component | Purpose |
+|-----------|---------|
+| **TheoryOfMind** | User modeling (expertise, style, interests) |
+| **EpisodicMemory** | Cross-conversation memory with deduplication |
+| **Identity** | Learning goals and performance metrics |
+| **MetaMonitor** | Confidence scoring and error pattern analysis |
+| **TaskQueue** | PostgreSQL-backed background processing (1 worker) |
+
+### How It Works
+
+1. **Context Loading** (fast, <100ms): When a request arrives with `user_id`, the service loads user profile and relevant memories
+2. **Prompt Enrichment**: Cognitive context is injected into supervisor prompt for personalized responses
+3. **Response**: User gets immediate response (no blocking)
+4. **Background Learning**: After response, learning task is enqueued (non-blocking)
+5. **Memory Processing**: Background worker updates user profile, creates/merges memories
+
+### API Usage
+
+Pass `user_id` in chat requests to enable cognition features:
+
+```bash
+curl -X POST http://localhost:8000/api/v1/chat \
+  -H "Content-Type: application/json" \
+  -d '{
+    "conversation_id": "conv-123",
+    "message": "What is Python?",
+    "user_id": "user-456"
+  }'
+```
+
+### Configuration
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `COGNITION_ENABLED` | true | Enable/disable cognition |
+| `COGNITION_DB_HOST` | localhost | PostgreSQL host |
+| `COGNITION_DB_PORT` | 5432 | PostgreSQL port |
+| `MAX_MEMORIES_PER_USER` | 100 | Memory limit per user |
+| `MEMORY_TTL_DAYS` | 90 | Memory expiration |
+| `SIMILARITY_THRESHOLD` | 0.7 | Deduplication threshold |
+| `CONTEXT_LOAD_TIMEOUT_MS` | 100 | Max context load time |
+
+### Memory Deduplication
+
+Similar memories are merged instead of duplicated using Jaccard similarity on topics:
+- Similarity >= 0.7 triggers merge
+- Merged memories combine summaries and increase access count
+- Prevents memory bloat from repeated similar conversations
 
 ## Design Patterns
 

@@ -11,6 +11,7 @@ from agentic_chatbot.utils.logging import get_logger, configure_logging
 
 if TYPE_CHECKING:
     from agentic_chatbot.documents.service import DocumentService
+    from agentic_chatbot.cognition.service import CognitionService
 
 
 logger = get_logger(__name__)
@@ -32,6 +33,7 @@ class Application:
         self.mcp_client_manager: MCPClientManager | None = None
         self.mcp_server_registry: MCPServerRegistry | None = None
         self.document_service: "DocumentService | None" = None
+        self.cognition_service: "CognitionService | None" = None
         self._active_requests: Set[str] = set()
         self._shutdown_event = asyncio.Event()
         self._is_shutting_down = False
@@ -83,6 +85,22 @@ class Application:
             logger.warning(f"Document service initialization failed: {e}")
             self.document_service = None
 
+        # Initialize cognition service (System 3)
+        try:
+            from agentic_chatbot.cognition.service import CognitionService
+            from agentic_chatbot.cognition.config import get_cognition_settings
+
+            cognition_settings = get_cognition_settings()
+            if cognition_settings.cognition_enabled:
+                self.cognition_service = CognitionService(cognition_settings)
+                await self.cognition_service.initialize()
+                logger.info("Cognition service initialized")
+            else:
+                logger.info("Cognition service disabled")
+        except Exception as e:
+            logger.warning(f"Cognition service initialization failed: {e}")
+            self.cognition_service = None
+
         logger.info("Application started")
 
     async def shutdown(self, timeout: float = 30.0) -> None:
@@ -111,6 +129,10 @@ class Application:
                 )
             except asyncio.TimeoutError:
                 logger.warning("Timeout waiting for requests, forcing shutdown")
+
+        # Shutdown cognition service (allows background tasks to complete)
+        if self.cognition_service:
+            await self.cognition_service.shutdown()
 
         # Close MCP client manager
         if self.mcp_client_manager:

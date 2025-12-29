@@ -32,6 +32,7 @@ from agentic_chatbot.api.dependencies import (
     ElicitationManagerDep,
     ToolProviderDep,
     DocumentServiceDep,
+    CognitionServiceDep,
 )
 from agentic_chatbot.api.sse import event_generator_with_task
 from agentic_chatbot.events.emitter import EventEmitter
@@ -115,6 +116,7 @@ async def chat(
     mcp_session_manager: MCPSessionManagerDep,
     elicitation_manager: ElicitationManagerDep,
     tool_provider: ToolProviderDep,
+    cognition_service: CognitionServiceDep,
 ) -> StreamingResponse:
     """
     Main chat endpoint with SSE streaming.
@@ -169,6 +171,8 @@ async def chat(
         tool_provider=tool_provider,
         user_context=chat_request.context,
         requested_model=chat_request.model,
+        user_id=chat_request.user_id,
+        cognition_service=cognition_service,
     )
 
     # Track request
@@ -245,6 +249,7 @@ async def chat_sync(
     mcp_session_manager: MCPSessionManagerDep,
     elicitation_manager: ElicitationManagerDep,
     tool_provider: ToolProviderDep,
+    cognition_service: CognitionServiceDep,
 ) -> ChatResponse:
     """
     Non-streaming chat endpoint.
@@ -286,6 +291,8 @@ async def chat_sync(
         tool_provider=tool_provider,
         user_context=chat_request.context,
         requested_model=chat_request.model,
+        user_id=chat_request.user_id,
+        cognition_service=cognition_service,
     )
 
     try:

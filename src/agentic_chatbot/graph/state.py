@@ -40,6 +40,8 @@ from agentic_chatbot.data.directive import Directive, DirectiveType, DirectiveRe
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from agentic_chatbot.documents.models import DocumentSummary, LoadedDocument
+    from agentic_chatbot.cognition.models import CognitiveContext
+    from agentic_chatbot.cognition.service import CognitionService
 
 
 # =============================================================================
@@ -342,6 +344,7 @@ class ChatState(TypedDict, total=False):
     user_query: str  # The user's message
     conversation_id: str  # Unique conversation identifier
     request_id: str  # Unique request identifier
+    user_id: str | None  # User identifier for cognition/personalization
     user_context: dict[str, Any]  # Additional context from the user
     requested_model: str | None  # Model requested by user for response generation
 
@@ -414,6 +417,13 @@ class ChatState(TypedDict, total=False):
     loaded_documents: Annotated[list[Any], reduce_loaded_documents]
 
     # -------------------------------------------------------------------------
+    # COGNITIVE CONTEXT (System 3)
+    # Meta-cognitive layer for personalization and learning
+    # -------------------------------------------------------------------------
+    cognitive_context: Any | None  # CognitiveContext from cognition module
+    cognition_service: Any | None  # CognitionService for background learning
+
+    # -------------------------------------------------------------------------
     # OUTPUT
     # -------------------------------------------------------------------------
     final_response: str  # Final response to user
@@ -464,6 +474,8 @@ def create_initial_state(
     tool_provider: Any = None,
     user_context: dict[str, Any] | None = None,
     requested_model: str | None = None,
+    user_id: str | None = None,
+    cognition_service: Any = None,
 ) -> ChatState:
     """
     Create initial state for a new chat request.
@@ -481,6 +493,8 @@ def create_initial_state(
         elicitation_manager: Manager for user input requests
         user_context: Additional context from user
         requested_model: Model ID requested by user for response generation
+        user_id: User identifier for cognition/personalization
+        cognition_service: CognitionService for System 3 features
 
     Returns:
         Initialized ChatState
@@ -490,6 +504,7 @@ def create_initial_state(
         user_query=user_query,
         conversation_id=conversation_id,
         request_id=request_id,
+        user_id=user_id,
         user_context=user_context or {},
         requested_model=requested_model,
 
@@ -524,6 +539,10 @@ def create_initial_state(
         # Document context
         document_summaries=[],
         loaded_documents=[],
+
+        # Cognitive context (System 3)
+        cognitive_context=None,
+        cognition_service=cognition_service,
 
         # Output
         final_response="",
@@ -681,3 +700,21 @@ def get_document_context(state: ChatState) -> str:
         return summaries_text
 
     return f"{summaries_text}\n\n{loaded_text}"
+
+
+def get_cognitive_context_text(state: ChatState) -> str:
+    """
+    Get formatted cognitive context for supervisor prompt.
+
+    Returns user profile, relevant memories, and identity insights
+    formatted for context injection.
+    """
+    cognitive_context = state.get("cognitive_context")
+    if not cognitive_context:
+        return ""
+
+    # Use the CognitiveContext's built-in formatting
+    if hasattr(cognitive_context, "to_supervisor_text"):
+        return cognitive_context.to_supervisor_text()
+
+    return ""

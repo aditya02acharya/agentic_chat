@@ -18,7 +18,8 @@ A step-by-step guide to understanding the LangGraph-based agentic chatbot backen
 12. [Step 9: Understanding the Flow](#step-9-understanding-the-flow)
 13. [Step 10: Understanding Resilience Patterns](#step-10-understanding-resilience-patterns)
 14. [Step 11: Understanding Document Context](#step-11-understanding-document-context)
-15. [Debugging Tips](#debugging-tips)
+15. [Step 12: Understanding System 3 Cognition](#step-12-understanding-system-3-cognition)
+16. [Debugging Tips](#debugging-tips)
 
 ---
 
@@ -94,7 +95,7 @@ src/agentic_chatbot/
 │       ├── introspection.py # list_tools, list_operators
 │       └── load_document.py # Document loading tools
 │
-├── documents/              # 🆕 Document upload and context management
+├── documents/              # Document upload and context management
 │   ├── models.py          # DocumentStatus, DocumentChunk, DocumentSummary
 │   ├── config.py          # ChunkConfig, DocumentConfig
 │   ├── chunker.py         # Semantic document chunking with overlap
@@ -104,6 +105,17 @@ src/agentic_chatbot/
 │   └── storage/           # Storage backends (abstract + implementations)
 │       ├── base.py        # Abstract DocumentStorage interface
 │       └── local.py       # Local filesystem implementation
+│
+├── cognition/              # 🆕 System 3 Meta-Cognitive Layer
+│   ├── models.py          # UserProfile, EpisodicMemory, IdentityState
+│   ├── config.py          # CognitionSettings
+│   ├── storage.py         # PostgreSQL storage layer
+│   ├── task_queue.py      # Background task queue (1 worker)
+│   ├── theory_of_mind.py  # User modeling and preferences
+│   ├── episodic_memory.py # Cross-conversation memory
+│   ├── identity.py        # Learning goals and metrics
+│   ├── meta_monitor.py    # Self-reflection and confidence
+│   └── service.py         # CognitionService (unified interface)
 │
 ├── mcp/                    # MCP Protocol integration
 │   ├── callbacks.py       # Callback handlers + ElicitationManager
@@ -1265,6 +1277,388 @@ class DocumentConfig:
 
 ---
 
+## Step 12: Understanding System 3 Cognition
+
+**Files:** `src/agentic_chatbot/cognition/`
+
+The cognition module implements a meta-cognitive layer (System 3) that provides persistent learning, user modeling, and self-reflection capabilities.
+
+### Why System 3?
+
+| Problem | Solution |
+|---------|----------|
+| No memory across conversations | Episodic memory with deduplication |
+| Generic responses for all users | Theory of Mind (user modeling) |
+| No learning from interactions | Background learning via task queue |
+| System doesn't know itself | Identity tracking (goals, metrics) |
+
+### Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        SYSTEM 3 COGNITION FLOW                               │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Request                                                                     │
+│     │                                                                        │
+│     ▼                                                                        │
+│  ┌─────────────────┐     Fast (<100ms)    ┌─────────────────┐               │
+│  │ CognitionService│─────────────────────►│ CognitiveContext│               │
+│  │  get_context()  │                      │  - UserProfile   │               │
+│  └─────────────────┘                      │  - Memories      │               │
+│           │                               │  - Identity      │               │
+│           │                               └────────┬─────────┘               │
+│           │                                        │                         │
+│           │                                        ▼                         │
+│           │                               ┌─────────────────┐               │
+│           │                               │ Supervisor Node │               │
+│           │                               │ (enriched prompt)│               │
+│           │                               └────────┬─────────┘               │
+│           │                                        │                         │
+│           │                                        ▼                         │
+│           │                               ┌─────────────────┐               │
+│           │                               │    Response     │◄── Returns    │
+│           │                               │                 │    immediately │
+│           │                               └────────┬─────────┘               │
+│           │                                        │                         │
+│           ▼                                        ▼                         │
+│  ┌─────────────────┐    Non-blocking     ┌─────────────────┐               │
+│  │ CognitionService│◄────────────────────│  Stream Node    │               │
+│  │enqueue_learning()                     │ (after response) │               │
+│  └────────┬────────┘                     └─────────────────┘               │
+│           │                                                                  │
+│           ▼                                                                  │
+│  ┌─────────────────┐         ┌─────────────────┐                           │
+│  │  PostgreSQL     │────────►│  Task Queue     │                           │
+│  │  Task Table     │  claim  │  (1 worker)     │                           │
+│  └─────────────────┘         └────────┬────────┘                           │
+│                                       │                                     │
+│                    ┌──────────────────┼──────────────────┐                 │
+│                    ▼                  ▼                  ▼                 │
+│           ┌──────────────┐  ┌──────────────┐  ┌──────────────┐            │
+│           │Theory of Mind│  │  Episodic    │  │   Identity   │            │
+│           │(user profile)│  │   Memory     │  │  (metrics)   │            │
+│           └──────────────┘  └──────────────┘  └──────────────┘            │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Key Design Principles
+
+1. **Non-blocking**: Response returns immediately; learning happens in background
+2. **Fast Context Loading**: Context loads within 100ms timeout
+3. **Deduplication**: Similar memories are merged, not duplicated
+4. **Graceful Degradation**: If cognition fails, system works without it
+
+### Components
+
+| Component | File | Purpose |
+|-----------|------|---------|
+| **CognitionService** | `service.py` | Unified interface for all operations |
+| **TheoryOfMind** | `theory_of_mind.py` | User modeling (expertise, style, interests) |
+| **EpisodicMemory** | `episodic_memory.py` | Cross-conversation memory with dedup |
+| **Identity** | `identity.py` | Learning goals, performance metrics |
+| **MetaMonitor** | `meta_monitor.py` | Confidence scoring, error patterns |
+| **CognitionStorage** | `storage.py` | PostgreSQL persistence layer |
+| **CognitionTaskQueue** | `task_queue.py` | Background task processing (1 worker) |
+
+### CognitionService Interface
+
+```python
+class CognitionService:
+    # Fast, synchronous - for request enrichment
+    async def get_context(
+        self,
+        user_id: str,
+        query: str,
+    ) -> CognitiveContext:
+        """Load context within 100ms timeout."""
+        ...
+
+    # Fast, non-blocking - for background learning
+    async def enqueue_learning(
+        self,
+        user_id: str,
+        conversation_id: str,
+        messages: list[dict],
+        outcome: str | None = None,
+    ) -> str | None:
+        """Enqueue task and return immediately."""
+        ...
+```
+
+### Theory of Mind (User Modeling)
+
+Builds user profiles from interaction patterns:
+
+```python
+@dataclass
+class UserProfile:
+    user_id: str
+    expertise_level: str = "intermediate"  # novice, intermediate, expert
+    communication_style: str = "detailed"   # concise, detailed, technical
+    domain_interests: list[str] = field(default_factory=list)
+    interaction_patterns: dict[str, Any] = field(default_factory=dict)
+    preferences: dict[str, Any] = field(default_factory=dict)
+
+    def to_context_text(self) -> str:
+        """Format for supervisor prompt injection."""
+        return f"""User Profile:
+- Expertise: {self.expertise_level}
+- Style preference: {self.communication_style}
+- Interests: {', '.join(self.domain_interests[:5])}"""
+```
+
+Expertise is inferred from signals in messages:
+- **Novice signals**: "what is", "how do I", "explain", "beginner"
+- **Expert signals**: "implementation", "optimize", "architecture", technical terms
+
+### Episodic Memory
+
+Stores cross-conversation memories with deduplication:
+
+```python
+@dataclass
+class EpisodicMemory:
+    memory_id: str
+    user_id: str
+    conversation_id: str
+    summary: str
+    outcome: str  # success, partial, failure
+    topics: list[str]
+    importance: float  # 0-1 score
+    access_count: int
+    created_at: datetime
+    last_accessed: datetime
+```
+
+**Deduplication**: Uses Jaccard similarity on topics:
+```python
+def _calculate_topic_similarity(self, topics1: list[str], topics2: list[str]) -> float:
+    set1, set2 = set(topics1), set(topics2)
+    intersection = len(set1 & set2)
+    union = len(set1 | set2)
+    return intersection / union if union > 0 else 0.0
+
+# If similarity >= 0.7, memories are merged instead of duplicated
+```
+
+**Pruning**: Keeps memories within limits:
+- Max 100 memories per user
+- 90-day TTL for old memories
+- Low importance (<0.3) memories pruned first
+
+### Background Task Queue
+
+PostgreSQL-backed queue with atomic task claiming:
+
+```python
+class CognitionTaskQueue:
+    async def enqueue(
+        self,
+        task_type: TaskType,
+        payload: dict,
+        delay_seconds: int = 0,
+    ) -> str:
+        """Insert task into cognition_tasks table."""
+        ...
+
+    async def _claim_next_task(self) -> LearningTask | None:
+        """Atomic claim using FOR UPDATE SKIP LOCKED."""
+        query = """
+        UPDATE cognition_tasks
+        SET status = 'processing', started_at = NOW()
+        WHERE id = (
+            SELECT id FROM cognition_tasks
+            WHERE status = 'pending'
+            AND scheduled_for <= NOW()
+            ORDER BY created_at
+            FOR UPDATE SKIP LOCKED
+            LIMIT 1
+        )
+        RETURNING *
+        """
+        ...
+```
+
+**Retry Logic**: Failed tasks retry with exponential backoff (max 3 attempts).
+
+**Graceful Shutdown**: Worker completes current task before stopping.
+
+### PostgreSQL Schema
+
+```sql
+-- User profiles for Theory of Mind
+CREATE TABLE IF NOT EXISTS user_profiles (
+    user_id VARCHAR(255) PRIMARY KEY,
+    expertise_level VARCHAR(50) DEFAULT 'intermediate',
+    communication_style VARCHAR(50) DEFAULT 'detailed',
+    domain_interests JSONB DEFAULT '[]',
+    interaction_patterns JSONB DEFAULT '{}',
+    preferences JSONB DEFAULT '{}',
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Cross-conversation episodic memories
+CREATE TABLE IF NOT EXISTS episodic_memories (
+    memory_id VARCHAR(255) PRIMARY KEY,
+    user_id VARCHAR(255) NOT NULL,
+    conversation_id VARCHAR(255) NOT NULL,
+    summary TEXT NOT NULL,
+    outcome VARCHAR(50) NOT NULL,
+    topics JSONB DEFAULT '[]',
+    importance FLOAT DEFAULT 0.5,
+    access_count INT DEFAULT 0,
+    created_at TIMESTAMP DEFAULT NOW(),
+    last_accessed TIMESTAMP DEFAULT NOW()
+);
+
+-- System identity state
+CREATE TABLE IF NOT EXISTS identity_state (
+    id VARCHAR(50) PRIMARY KEY DEFAULT 'singleton',
+    learning_goals JSONB DEFAULT '[]',
+    knowledge_gaps JSONB DEFAULT '[]',
+    performance_metrics JSONB DEFAULT '{}',
+    core_values JSONB DEFAULT '{}',
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Background task queue
+CREATE TABLE IF NOT EXISTS cognition_tasks (
+    id VARCHAR(255) PRIMARY KEY,
+    task_type VARCHAR(100) NOT NULL,
+    payload JSONB NOT NULL,
+    status VARCHAR(50) DEFAULT 'pending',
+    attempts INT DEFAULT 0,
+    max_attempts INT DEFAULT 3,
+    scheduled_for TIMESTAMP DEFAULT NOW(),
+    created_at TIMESTAMP DEFAULT NOW(),
+    started_at TIMESTAMP,
+    completed_at TIMESTAMP,
+    error_message TEXT
+);
+
+-- Indexes for efficient queries
+CREATE INDEX idx_memories_user_id ON episodic_memories(user_id);
+CREATE INDEX idx_memories_topics ON episodic_memories USING GIN(topics);
+CREATE INDEX idx_tasks_status ON cognition_tasks(status, scheduled_for);
+```
+
+### Graph Integration
+
+The cognition service integrates with the graph at two points:
+
+**1. Initialize Node** (context loading):
+```python
+async def initialize_node(state: ChatState) -> dict[str, Any]:
+    # Load cognitive context if user_id provided
+    cognition_service = state.get("cognition_service")
+    user_id = state.get("user_id")
+
+    if cognition_service and user_id:
+        query = state.get("user_query", "")
+        cognitive_context = await cognition_service.get_context(user_id, query)
+        return {"cognitive_context": cognitive_context, ...}
+
+    return {...}
+```
+
+**2. Stream Node** (learning enqueue):
+```python
+async def stream_node(state: ChatState) -> dict[str, Any]:
+    # ... stream response ...
+
+    # Enqueue learning (non-blocking)
+    await _enqueue_cognitive_learning(state, outcome="success")
+
+    return {...}
+```
+
+### Supervisor Prompt Injection
+
+Cognitive context is injected into the supervisor prompt:
+
+```python
+# In supervisor_node
+cognitive_text = state.get("cognitive_context", CognitiveContext()).to_context_text()
+
+prompt = SUPERVISOR_DECISION_PROMPT.format(
+    query=user_query,
+    cognitive_context=cognitive_text,  # Injected here
+    conversation_context=conversation_context,
+    ...
+)
+```
+
+The context includes:
+- User profile (expertise, style, interests)
+- Relevant memories from past conversations
+- Identity summary (if applicable)
+
+### Configuration
+
+```python
+class CognitionSettings(BaseSettings):
+    # Enable/disable
+    cognition_enabled: bool = True
+    theory_of_mind_enabled: bool = True
+    episodic_memory_enabled: bool = True
+    identity_enabled: bool = True
+
+    # PostgreSQL connection
+    cognition_db_host: str = "localhost"
+    cognition_db_port: int = 5432
+    cognition_db_name: str = "cognition"
+    cognition_db_user: str = "postgres"
+    cognition_db_password: str = ""
+
+    # Memory limits
+    max_memories_per_user: int = 100
+    memory_ttl_days: int = 90
+    similarity_threshold: float = 0.7  # For deduplication
+    min_importance_threshold: float = 0.3  # For pruning
+
+    # Task queue
+    task_poll_interval_seconds: float = 1.0
+    task_max_retries: int = 3
+
+    # Performance
+    context_load_timeout_ms: int = 100  # Fast context loading
+```
+
+### API Changes
+
+The chat request now accepts `user_id`:
+
+```python
+class ChatRequest(BaseModel):
+    conversation_id: str
+    message: str
+    user_id: str | None = None  # For cognition features
+    context: dict[str, Any] | None = None
+    model: str | None = None
+```
+
+### FastAPI Lifespan Integration
+
+```python
+# In main.py
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    app_instance = Application()
+    await app_instance.startup()
+    app.state.cognition_service = app_instance.cognition_service
+
+    yield
+
+    # Shutdown (worker completes current task)
+    await app_instance.shutdown()
+```
+
+---
+
 ## Debugging Tips
 
 ### 1. Check Events in Browser
@@ -1342,6 +1736,7 @@ print(result.get("final_response"))
 | Context | `context/` | DataChunk/DataSummary for citations |
 | Resilience | `core/resilience.py` | Fault tolerance (retry, circuit breaker, timeout) |
 | Documents | `documents/` | Document upload, chunking, summarization |
+| Cognition | `cognition/` | System 3 meta-cognitive layer (user modeling, memory) |
 
 ### New Features Summary
 
@@ -1357,6 +1752,7 @@ print(result.get("final_response"))
 | **Model Configuration** | Centralized model registry with aliases and thinking support |
 | **Fault Tolerance** | Retry, circuit breaker, timeout patterns via hyx for all remote calls |
 | **Document Context** | Upload documents with auto-summarization for conversation context |
+| **System 3 Cognition** | Meta-cognitive layer with user modeling, episodic memory, and identity |
 
 ---
 

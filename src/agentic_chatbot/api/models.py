@@ -16,6 +16,7 @@ class ChatRequest(BaseModel):
 
     conversation_id: str = Field(..., description="Unique conversation identifier")
     message: str = Field(..., description="User's message")
+    user_id: str | None = Field(None, description="User identifier for personalization and memory")
     context: dict[str, Any] | None = Field(None, description="Additional context")
     model: str | None = Field(
         None,
