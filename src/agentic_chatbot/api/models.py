@@ -68,14 +68,32 @@ class ChatHistoryResponse(BaseModel):
 
 
 class TokenUsageResponse(BaseModel):
-    """Token usage information."""
+    """
+    Two-level token usage information.
 
-    input_tokens: int = Field(0, description="Number of input tokens")
-    output_tokens: int = Field(0, description="Number of output tokens")
-    thinking_tokens: int = Field(0, description="Number of thinking tokens (extended thinking)")
-    cache_read_tokens: int = Field(0, description="Number of cached tokens read")
-    cache_write_tokens: int = Field(0, description="Number of tokens written to cache")
-    total_tokens: int = Field(0, description="Total tokens used")
+    Level 1 (Conversation-level metrics for UI):
+    - user_input_tokens: Tokens from user's message
+    - final_output_tokens: Tokens in final response
+    - intermediate_tokens: Tokens used in agent's intermediate operations
+    - total_tokens: Sum of all tokens
+
+    Level 2 (Detailed breakdown):
+    - input_tokens, output_tokens, etc.: Full breakdown
+    - For OTEL traces, see telemetry/tracing endpoints
+    """
+
+    # Level 1: Conversation-level metrics (UI display)
+    user_input_tokens: int = Field(0, description="Tokens from user's input message")
+    final_output_tokens: int = Field(0, description="Tokens in final response to user")
+    intermediate_tokens: int = Field(0, description="Tokens used in intermediate agent operations")
+    total_tokens: int = Field(0, description="Total tokens across all operations")
+
+    # Detailed breakdown (for debugging/cost analysis)
+    input_tokens: int = Field(0, description="All input tokens (cumulative)")
+    output_tokens: int = Field(0, description="All output tokens (cumulative)")
+    thinking_tokens: int = Field(0, description="Extended thinking tokens")
+    cache_read_tokens: int = Field(0, description="Cached tokens read")
+    cache_write_tokens: int = Field(0, description="Tokens written to cache")
 
 
 class ChatResponse(BaseModel):

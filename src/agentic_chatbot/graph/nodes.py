@@ -203,6 +203,7 @@ async def initialize_node(state: ChatState) -> dict[str, Any]:
     - Validates input
     - Sets up initial state values
     - Adds user message to conversation history
+    - Tracks user input tokens (Level 1: conversation-level metric)
     - Loads cognitive context (System 3) if available
     """
     logger.info("Initializing chat session", request_id=state.get("request_id"))
@@ -217,9 +218,14 @@ async def initialize_node(state: ChatState) -> dict[str, Any]:
     # Add user message to conversation
     user_message = HumanMessage(content=user_query)
 
+    # Track user input tokens (Level 1: Conversation-level metric for UI)
+    # Use simple heuristic: ~4 chars per token
+    user_input_token_count = len(user_query) // 4
+
     result: dict[str, Any] = {
         "messages": [user_message],
         "iteration": 0,
+        "token_usage": TokenUsage(user_input_tokens=user_input_token_count),
     }
 
     # Load cognitive context (System 3) if available
@@ -1230,10 +1236,12 @@ async def write_node(state: ChatState) -> dict[str, Any]:
         response = await client.complete(prompt, model=requested_model)
         final = response.content
 
-        # Track token usage for writer
+        # Track token usage for writer (including Level 1: final_output_tokens)
+        final_output_token_count = response.usage.output_tokens
         writer_token_usage = TokenUsage(
             input_tokens=response.usage.input_tokens,
             output_tokens=response.usage.output_tokens,
+            final_output_tokens=final_output_token_count,  # Level 1: Track final response tokens
         )
 
         logger.info(
@@ -1241,6 +1249,7 @@ async def write_node(state: ChatState) -> dict[str, Any]:
             model=requested_model,
             input_tokens=response.usage.input_tokens,
             output_tokens=response.usage.output_tokens,
+            final_output_tokens=final_output_token_count,
         )
 
     # Add footnote references if we have sourced contents and citations were used

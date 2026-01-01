@@ -4,6 +4,9 @@ Resilience patterns applied:
 - Retry with exponential backoff for transient failures
 - Circuit breaker to prevent cascade failures to overloaded API
 - Timeout to bound operation duration
+
+Observability:
+- OpenTelemetry tracing for detailed LLM call metrics (Level 2 tracking)
 """
 
 from typing import AsyncIterator, Any
@@ -22,6 +25,7 @@ from agentic_chatbot.core.resilience import (
 )
 from agentic_chatbot.utils.providers.base import BaseLLMProvider, LLMResponse
 from agentic_chatbot.utils.logging import get_logger
+from agentic_chatbot.telemetry import trace_llm_call
 
 
 logger = get_logger(__name__)
@@ -66,6 +70,10 @@ class AnthropicProvider(BaseLLMProvider):
         max_tokens: int = 4096,
         temperature: float = 0.0,
         thinking: ThinkingConfig | None = None,
+        # OTEL tracing params (Level 2: detailed tracking)
+        operation: str = "llm_call",
+        conversation_id: str = "",
+        request_id: str = "",
         **kwargs: Any,
     ) -> LLMResponse:
         """
@@ -78,6 +86,9 @@ class AnthropicProvider(BaseLLMProvider):
             max_tokens: Maximum output tokens
             temperature: Sampling temperature (ignored if thinking enabled)
             thinking: Extended thinking configuration
+            operation: Operation type for OTEL tracing (e.g., "supervisor", "writer")
+            conversation_id: Conversation ID for OTEL tracing
+            request_id: Request ID for OTEL tracing
             **kwargs: Additional API parameters
 
         Returns:
@@ -123,48 +134,69 @@ class AnthropicProvider(BaseLLMProvider):
         # Add any additional kwargs
         api_params.update(kwargs)
 
-        response = await self._client.messages.create(**api_params)
-
-        # Extract content and thinking from response
-        content = ""
-        thinking_content = ""
-
-        for block in response.content:
-            if block.type == "thinking":
-                thinking_content = block.thinking
-            elif block.type == "text":
-                content = block.text
-
-        # Build token usage
-        usage = TokenUsage(
-            input_tokens=response.usage.input_tokens,
-            output_tokens=response.usage.output_tokens,
-        )
-
-        # Check for cache tokens (if using prompt caching)
-        if hasattr(response.usage, "cache_read_input_tokens"):
-            usage.cache_read_tokens = response.usage.cache_read_input_tokens or 0
-        if hasattr(response.usage, "cache_creation_input_tokens"):
-            usage.cache_write_tokens = response.usage.cache_creation_input_tokens or 0
-
-        logger.debug(
-            "Anthropic response received",
+        # Level 2: OTEL tracing for detailed LLM call metrics
+        with trace_llm_call(
+            operation=operation,
             model=resolved_model,
-            input_tokens=usage.input_tokens,
-            output_tokens=usage.output_tokens,
-            thinking_tokens=usage.thinking_tokens,
-            stop_reason=response.stop_reason,
-            has_thinking=bool(thinking_content),
-        )
-
-        return LLMResponse(
-            content=content,
-            model=resolved_model,
-            usage=usage,
-            stop_reason=response.stop_reason,
+            conversation_id=conversation_id,
+            request_id=request_id,
             provider=self.provider_name,
-            thinking_content=thinking_content,
-        )
+        ) as trace_attrs:
+            # Populate tracing attributes
+            trace_attrs.thinking_enabled = thinking.enabled if thinking else False
+            trace_attrs.streaming = False
+            trace_attrs.temperature = api_params.get("temperature", temperature)
+
+            # Make API call
+            response = await self._client.messages.create(**api_params)
+
+            # Extract content and thinking from response
+            content = ""
+            thinking_content = ""
+
+            for block in response.content:
+                if block.type == "thinking":
+                    thinking_content = block.thinking
+                elif block.type == "text":
+                    content = block.text
+
+            # Build token usage
+            usage = TokenUsage(
+                input_tokens=response.usage.input_tokens,
+                output_tokens=response.usage.output_tokens,
+            )
+
+            # Check for cache tokens (if using prompt caching)
+            if hasattr(response.usage, "cache_read_input_tokens"):
+                usage.cache_read_tokens = response.usage.cache_read_input_tokens or 0
+            if hasattr(response.usage, "cache_creation_input_tokens"):
+                usage.cache_write_tokens = response.usage.cache_creation_input_tokens or 0
+
+            # Populate OTEL trace attributes (Level 2: detailed per-call metrics)
+            trace_attrs.input_tokens = usage.input_tokens
+            trace_attrs.output_tokens = usage.output_tokens
+            trace_attrs.thinking_tokens = usage.thinking_tokens
+            trace_attrs.cache_read_tokens = usage.cache_read_tokens
+            trace_attrs.cache_write_tokens = usage.cache_write_tokens
+
+            logger.debug(
+                "Anthropic response received",
+                model=resolved_model,
+                input_tokens=usage.input_tokens,
+                output_tokens=usage.output_tokens,
+                thinking_tokens=usage.thinking_tokens,
+                stop_reason=response.stop_reason,
+                has_thinking=bool(thinking_content),
+            )
+
+            return LLMResponse(
+                content=content,
+                model=resolved_model,
+                usage=usage,
+                stop_reason=response.stop_reason,
+                provider=self.provider_name,
+                thinking_content=thinking_content,
+            )
 
     @llm_retry
     @llm_circuit_breaker

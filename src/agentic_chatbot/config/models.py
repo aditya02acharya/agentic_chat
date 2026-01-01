@@ -88,17 +88,45 @@ class ThinkingConfig:
 
 @dataclass
 class TokenUsage:
-    """Token usage tracking."""
+    """
+    Two-level token usage tracking.
 
-    input_tokens: int = 0
-    output_tokens: int = 0
+    Level 1 - Conversation-level metrics (for UI display):
+    - user_input_tokens: Tokens from user's message
+    - final_output_tokens: Tokens in final response to user
+    - intermediate_tokens: All tokens from agent's intermediate operations
+    - total_tokens: Sum of all tokens
+
+    Level 2 - Detailed trace (for OTEL/audit):
+    - Tracked via OTEL spans (see telemetry/tracing.py)
+    - Each LLM call creates a span with detailed metrics
+    """
+
+    # Level 1: Conversation-level aggregates (for UI)
+    user_input_tokens: int = 0  # User message input tokens
+    final_output_tokens: int = 0  # Final response output tokens
+
+    # Intermediate agent operations (cumulative)
+    input_tokens: int = 0  # All input tokens (including intermediate)
+    output_tokens: int = 0  # All output tokens (including intermediate)
     thinking_tokens: int = 0  # Extended thinking tokens
-    cache_read_tokens: int = 0
-    cache_write_tokens: int = 0
+    cache_read_tokens: int = 0  # Cached tokens read
+    cache_write_tokens: int = 0  # Tokens written to cache
+
+    @property
+    def intermediate_tokens(self) -> int:
+        """
+        Tokens used in intermediate operations (agent reasoning, tool calls, etc).
+
+        Calculated as: total - (user_input + final_output)
+        """
+        total = self.total_tokens
+        user_and_final = self.user_input_tokens + self.final_output_tokens
+        return max(0, total - user_and_final)
 
     @property
     def total_tokens(self) -> int:
-        """Total tokens used."""
+        """Total tokens used across all operations."""
         return (
             self.input_tokens
             + self.output_tokens
@@ -110,6 +138,8 @@ class TokenUsage:
     def __add__(self, other: "TokenUsage") -> "TokenUsage":
         """Add two token usages together."""
         return TokenUsage(
+            user_input_tokens=self.user_input_tokens + other.user_input_tokens,
+            final_output_tokens=self.final_output_tokens + other.final_output_tokens,
             input_tokens=self.input_tokens + other.input_tokens,
             output_tokens=self.output_tokens + other.output_tokens,
             thinking_tokens=self.thinking_tokens + other.thinking_tokens,
@@ -118,14 +148,19 @@ class TokenUsage:
         )
 
     def to_dict(self) -> dict[str, int]:
-        """Convert to dictionary."""
+        """Convert to dictionary for API response."""
         return {
+            # Level 1: Conversation-level metrics
+            "user_input_tokens": self.user_input_tokens,
+            "final_output_tokens": self.final_output_tokens,
+            "intermediate_tokens": self.intermediate_tokens,
+            "total_tokens": self.total_tokens,
+            # Detailed breakdown
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
             "thinking_tokens": self.thinking_tokens,
             "cache_read_tokens": self.cache_read_tokens,
             "cache_write_tokens": self.cache_write_tokens,
-            "total_tokens": self.total_tokens,
         }
 
 
