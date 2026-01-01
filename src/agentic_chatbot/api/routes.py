@@ -308,6 +308,7 @@ async def chat(
 
     # Start graph execution
     task = asyncio.create_task(run_graph())
+    _track_background_task(task)
 
     return StreamingResponse(
         event_generator_with_task(event_queue, task),

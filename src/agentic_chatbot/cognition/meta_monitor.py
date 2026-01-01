@@ -71,6 +71,9 @@ class MetaMonitor:
     for improving system performance over time.
     """
 
+    # Maximum number of error patterns to track (prevent unbounded growth)
+    MAX_ERROR_PATTERNS = 100
+
     def __init__(self, storage: CognitionStorage):
         """
         Initialize meta monitor.
@@ -187,6 +190,16 @@ class MetaMonitor:
             if len(pattern.examples) < 5:
                 pattern.examples.append(error_message[:100])
         else:
+            # Check if we need to prune before adding new pattern
+            if len(self._error_patterns) >= self.MAX_ERROR_PATTERNS:
+                # Remove least frequent patterns (keep top 80%)
+                sorted_patterns = sorted(
+                    self._error_patterns.items(),
+                    key=lambda x: x[1].frequency
+                )
+                keep_count = int(self.MAX_ERROR_PATTERNS * 0.8)
+                self._error_patterns = dict(sorted_patterns[-keep_count:])
+
             self._error_patterns[error_type] = ErrorPattern(
                 pattern_type=error_type,
                 frequency=1,
