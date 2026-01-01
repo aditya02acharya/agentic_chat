@@ -4,7 +4,10 @@ import asyncio
 from typing import Callable, Awaitable
 
 from agentic_chatbot.events.models import Event
+from agentic_chatbot.utils.logging import get_logger
 
+
+logger = get_logger(__name__)
 
 EventHandler = Callable[[Event], Awaitable[None]] | Callable[[Event], None]
 
@@ -56,9 +59,14 @@ class EventEmitter:
                     await handler(event)
                 else:
                     handler(event)
-            except Exception:
-                # Don't let handler errors break event flow
-                pass
+            except Exception as e:
+                # Log error but don't let handler errors break event flow
+                logger.error(
+                    "Event handler error",
+                    event_type=event.event_type,
+                    error=str(e),
+                    exc_info=True,
+                )
 
     def emit_sync(self, event: Event) -> None:
         """

@@ -23,6 +23,13 @@ Guidelines:
 - For complex multi-step tasks with known steps, use CREATE_WORKFLOW
 - When the request is ambiguous or needs clarification, use CLARIFY
 
+Document Context:
+- The user may have uploaded documents for this conversation
+- Use the "list_documents" tool to see document summaries
+- Use the "load_document" tool to load document content when relevant
+- Documents should be given HIGH PRIORITY - if a document's summary suggests it may answer the query, load it
+- Document summaries include topics and relevance hints to help you decide
+
 Task Delegation (for CALL_TOOL and CREATE_WORKFLOW):
 When delegating to operators, provide:
 - task_description: Clear, reformulated description of what the operator should do
@@ -39,6 +46,9 @@ SUPERVISOR_DECISION_PROMPT = """User Query: {query}
 Conversation Context:
 {conversation_context}
 
+Document Context:
+{document_context}
+
 Tool Results So Far:
 {tool_results}
 
@@ -52,6 +62,7 @@ Remember:
 - If you need more data, use CALL_TOOL with the appropriate operator
 - If this requires multiple coordinated steps, use CREATE_WORKFLOW
 - If the request is unclear, use CLARIFY
+- PRIORITY: Check document summaries first - if relevant documents exist, load them before using external tools
 
 Respond with valid JSON matching the SupervisorDecision schema."""
 

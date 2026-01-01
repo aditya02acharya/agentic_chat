@@ -7,6 +7,12 @@ Key Concepts:
 - State is a shared memory object that flows through all nodes
 - Reducers (operator.add) define how new data combines with existing data
 - For lists: append behavior; for strings: concatenation
+
+Data Model:
+- ContentBlock: Atomic unit of information (from data.content)
+- SourcedContent: ContentBlock with provenance (from data.sourced)
+- Directive: Supervisor decision (from data.directive)
+- ExecutionOutput: Operator/tool result (from data.execution)
 """
 
 from __future__ import annotations
@@ -22,7 +28,20 @@ from langchain_core.messages import BaseMessage, AnyMessage
 from agentic_chatbot.events.emitter import EventEmitter
 from agentic_chatbot.mcp.callbacks import MCPCallbacks, ElicitationManager
 from agentic_chatbot.core.workflow import WorkflowDefinition, WorkflowResult
-from agentic_chatbot.context.models import TaskContext, DataChunk, DataSummary, DataStore
+from agentic_chatbot.config.models import TokenUsage
+
+# New unified data model
+from agentic_chatbot.data.content import ContentBlock
+from agentic_chatbot.data.sourced import SourcedContent, ContentSummary
+from agentic_chatbot.data.execution import ExecutionOutput, TaskInfo
+from agentic_chatbot.data.directive import Directive, DirectiveType, DirectiveRecord
+
+# Document types (optional import for type hints)
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from agentic_chatbot.documents.models import DocumentSummary, LoadedDocument
+    from agentic_chatbot.cognition.models import CognitiveContext
+    from agentic_chatbot.cognition.service import CognitionService
 
 
 # =============================================================================
@@ -31,7 +50,12 @@ from agentic_chatbot.context.models import TaskContext, DataChunk, DataSummary, 
 
 
 class SupervisorDecision(BaseModel):
-    """Schema for Supervisor's action decision."""
+    """
+    Schema for Supervisor's action decision.
+
+    DEPRECATED: Use Directive from agentic_chatbot.data.directive instead.
+    Kept for backward compatibility during migration.
+    """
 
     action: Literal["ANSWER", "CALL_TOOL", "CREATE_WORKFLOW", "CLARIFY"]
     reasoning: str = Field(..., description="Explanation of the decision")
@@ -59,18 +83,43 @@ class SupervisorDecision(BaseModel):
     # For CLARIFY
     question: str | None = Field(None, description="Clarification question for CLARIFY action")
 
-    def to_task_context(self, original_query: str = "") -> TaskContext:
-        """Convert decision to TaskContext for operator."""
-        return TaskContext(
-            task_description=self.task_description or self.reasoning,
+    def to_task_info(self, original_query: str = "") -> TaskInfo:
+        """Convert decision to TaskInfo for operator."""
+        return TaskInfo(
+            description=self.task_description or self.reasoning,
             goal=self.task_goal or "Complete the requested operation",
             scope=self.task_scope or "",
-            original_query_summary=original_query[:200] if original_query else "",
+            original_query=original_query[:200] if original_query else "",
+        )
+
+    def to_directive(self) -> Directive:
+        """Convert to new Directive type."""
+        action_map = {
+            "ANSWER": DirectiveType.ANSWER,
+            "CALL_TOOL": DirectiveType.CALL_OPERATOR,
+            "CREATE_WORKFLOW": DirectiveType.CREATE_WORKFLOW,
+            "CLARIFY": DirectiveType.CLARIFY,
+        }
+        return Directive(
+            directive_type=action_map[self.action],
+            reasoning=self.reasoning,
+            response=self.response,
+            operator=self.operator,
+            params=self.params or {},
+            task=self.to_task_info() if self.operator else None,
+            goal=self.goal,
+            steps=self.steps or [],
+            question=self.question,
         )
 
 
 class ToolResult(BaseModel):
-    """Result from a tool execution."""
+    """
+    Result from a tool execution.
+
+    DEPRECATED: Use ExecutionOutput from agentic_chatbot.data.execution instead.
+    Kept for backward compatibility during migration.
+    """
 
     tool_name: str
     success: bool
@@ -172,11 +221,11 @@ def reduce_workflow_steps(
     return list(steps_by_id.values())
 
 
-def reduce_data_chunks(
-    left: list[DataChunk] | None,
-    right: list[DataChunk] | None,
-) -> list[DataChunk]:
-    """Reducer for data chunks - appends new chunks."""
+def reduce_sourced_contents(
+    left: list[SourcedContent] | None,
+    right: list[SourcedContent] | None,
+) -> list[SourcedContent]:
+    """Reducer for sourced contents - appends new items."""
     if not left:
         left = []
     if not right:
@@ -184,16 +233,89 @@ def reduce_data_chunks(
     return left + right
 
 
-def reduce_data_summaries(
-    left: list[DataSummary] | None,
-    right: list[DataSummary] | None,
-) -> list[DataSummary]:
-    """Reducer for data summaries - appends new summaries."""
+def reduce_execution_outputs(
+    left: list[ExecutionOutput] | None,
+    right: list[ExecutionOutput] | None,
+) -> list[ExecutionOutput]:
+    """Reducer for execution outputs - appends new results."""
     if not left:
         left = []
     if not right:
         right = []
     return left + right
+
+
+def reduce_directive_records(
+    left: list[DirectiveRecord] | None,
+    right: list[DirectiveRecord] | None,
+) -> list[DirectiveRecord]:
+    """Reducer for directive records - appends new records."""
+    if not left:
+        left = []
+    if not right:
+        right = []
+    return left + right
+
+
+def reduce_token_usage(
+    left: TokenUsage | None,
+    right: TokenUsage | None,
+) -> TokenUsage:
+    """Reducer for token usage - accumulates all token counts."""
+    if not left:
+        left = TokenUsage()
+    if not right:
+        return left
+    return left + right
+
+
+def reduce_document_summaries(
+    left: list[Any] | None,
+    right: list[Any] | None,
+) -> list[Any]:
+    """
+    Reducer for document summaries.
+
+    Merges by document_id to avoid duplicates.
+    Right values override left for the same document_id.
+    """
+    if not left:
+        left = []
+    if not right:
+        return list(left)
+
+    # Create lookup by document_id
+    by_id = {s.document_id: s for s in left}
+
+    # Update or add from right
+    for summary in right:
+        by_id[summary.document_id] = summary
+
+    return list(by_id.values())
+
+
+def reduce_loaded_documents(
+    left: list[Any] | None,
+    right: list[Any] | None,
+) -> list[Any]:
+    """
+    Reducer for loaded documents.
+
+    Merges by document_id. Right values override left for the same document_id.
+    """
+    if not left:
+        left = []
+    if not right:
+        return list(left)
+
+    # Create lookup by document_id
+    by_id = {d.document_id: d for d in left}
+
+    # Update or add from right
+    for doc in right:
+        by_id[doc.document_id] = doc
+
+    return list(by_id.values())
 
 
 # =============================================================================
@@ -222,7 +344,9 @@ class ChatState(TypedDict, total=False):
     user_query: str  # The user's message
     conversation_id: str  # Unique conversation identifier
     request_id: str  # Unique request identifier
+    user_id: str | None  # User identifier for cognition/personalization
     user_context: dict[str, Any]  # Additional context from the user
+    requested_model: str | None  # Model requested by user for response generation
 
     # -------------------------------------------------------------------------
     # CONVERSATION HISTORY
@@ -256,21 +380,48 @@ class ChatState(TypedDict, total=False):
     reflection: ReflectionResult | None
 
     # -------------------------------------------------------------------------
-    # CONTEXT OPTIMIZATION (new)
-    # Separates supervisor context (summaries) from synthesizer context (raw data)
+    # UNIFIED DATA MODEL
+    # Uses SourcedContent as the atomic unit with provenance tracking
     # -------------------------------------------------------------------------
 
-    # Task context for operators (reformulated task, not full conversation)
-    current_task_context: TaskContext | None
+    # Current task delegation info (from supervisor's directive)
+    current_task: TaskInfo | None
 
-    # Raw data chunks with source tracking (for synthesizer/writer citations)
-    data_chunks: Annotated[list[DataChunk], reduce_data_chunks]
+    # Sourced contents with provenance tracking (replaces data_chunks + data_summaries)
+    # Each SourcedContent contains: content (ContentBlock) + source + optional summary
+    sourced_contents: Annotated[list[SourcedContent], reduce_sourced_contents]
 
-    # LLM-generated summaries (for supervisor decision-making)
-    data_summaries: Annotated[list[DataSummary], reduce_data_summaries]
+    # Execution outputs from operators/tools (replaces tool_results for new code)
+    execution_outputs: Annotated[list[ExecutionOutput], reduce_execution_outputs]
+
+    # Directive history (replaces action_history for new code)
+    directive_history: Annotated[list[DirectiveRecord], reduce_directive_records]
 
     # Source counter for generating unique citation IDs
     source_counter: dict[str, int]
+
+    # Current directive (replaces current_decision for new code)
+    current_directive: Directive | None
+
+    # -------------------------------------------------------------------------
+    # DOCUMENT CONTEXT
+    # Documents uploaded by user for conversation context
+    # -------------------------------------------------------------------------
+
+    # Document summaries for supervisor decision-making
+    # These are lightweight summaries used to decide which documents to load
+    document_summaries: Annotated[list[Any], reduce_document_summaries]
+
+    # Loaded document content for context
+    # These are full or partial documents loaded based on supervisor decisions
+    loaded_documents: Annotated[list[Any], reduce_loaded_documents]
+
+    # -------------------------------------------------------------------------
+    # COGNITIVE CONTEXT (System 3)
+    # Meta-cognitive layer for personalization and learning
+    # -------------------------------------------------------------------------
+    cognitive_context: Any | None  # CognitiveContext from cognition module
+    cognition_service: Any | None  # CognitionService for background learning
 
     # -------------------------------------------------------------------------
     # OUTPUT
@@ -282,6 +433,12 @@ class ChatState(TypedDict, total=False):
     # Direct response tracking (operator/tool bypassed writer)
     sent_direct_response: bool  # Whether operator sent response directly to user
     direct_response_contents: list[Any]  # Content items sent directly
+
+    # -------------------------------------------------------------------------
+    # TOKEN TRACKING
+    # Accumulates all token usage across the entire request
+    # -------------------------------------------------------------------------
+    token_usage: Annotated[TokenUsage, reduce_token_usage]
 
     # -------------------------------------------------------------------------
     # RUNTIME CONTEXT (not persisted to checkpointer)
@@ -316,6 +473,9 @@ def create_initial_state(
     elicitation_manager: ElicitationManager | None = None,
     tool_provider: Any = None,
     user_context: dict[str, Any] | None = None,
+    requested_model: str | None = None,
+    user_id: str | None = None,
+    cognition_service: Any = None,
 ) -> ChatState:
     """
     Create initial state for a new chat request.
@@ -332,6 +492,9 @@ def create_initial_state(
         tool_provider: UnifiedToolProvider for local + remote tools
         elicitation_manager: Manager for user input requests
         user_context: Additional context from user
+        requested_model: Model ID requested by user for response generation
+        user_id: User identifier for cognition/personalization
+        cognition_service: CognitionService for System 3 features
 
     Returns:
         Initialized ChatState
@@ -341,7 +504,9 @@ def create_initial_state(
         user_query=user_query,
         conversation_id=conversation_id,
         request_id=request_id,
+        user_id=user_id,
         user_context=user_context or {},
+        requested_model=requested_model,
 
         # Conversation
         messages=[],
@@ -363,11 +528,21 @@ def create_initial_state(
         workflow_result=None,
         reflection=None,
 
-        # Context optimization
-        current_task_context=None,
-        data_chunks=[],
-        data_summaries=[],
+        # Unified data model
+        current_task=None,
+        sourced_contents=[],
+        execution_outputs=[],
+        directive_history=[],
         source_counter={},
+        current_directive=None,
+
+        # Document context
+        document_summaries=[],
+        loaded_documents=[],
+
+        # Cognitive context (System 3)
+        cognitive_context=None,
+        cognition_service=cognition_service,
 
         # Output
         final_response="",
@@ -377,6 +552,9 @@ def create_initial_state(
         # Direct response tracking
         sent_direct_response=False,
         direct_response_contents=[],
+
+        # Token tracking
+        token_usage=TokenUsage(),
 
         # Runtime context
         event_emitter=event_emitter,
@@ -426,13 +604,117 @@ def generate_source_id(state: ChatState, source_type: str) -> tuple[str, dict[st
 
 def get_summaries_text(state: ChatState) -> str:
     """Get formatted summaries for supervisor context."""
-    summaries = state.get("data_summaries", [])
-    if not summaries:
+    sourced = state.get("sourced_contents", [])
+    if not sourced:
         return "No data collected yet."
 
-    return "\n\n".join(s.to_supervisor_text() for s in summaries)
+    texts = []
+    for sc in sourced:
+        texts.append(sc.to_supervisor_text())
+    return "\n\n".join(texts)
 
 
-def get_data_chunks(state: ChatState) -> list[DataChunk]:
-    """Get all data chunks for synthesizer/writer."""
-    return state.get("data_chunks", [])
+def get_sourced_contents(state: ChatState) -> list[SourcedContent]:
+    """Get all sourced contents for synthesizer/writer."""
+    return state.get("sourced_contents", [])
+
+
+def get_execution_outputs(state: ChatState) -> list[ExecutionOutput]:
+    """Get all execution outputs."""
+    return state.get("execution_outputs", [])
+
+
+def get_citation_blocks(state: ChatState) -> str:
+    """Get all citation blocks for footnotes."""
+    sourced = state.get("sourced_contents", [])
+    return "\n\n".join(sc.citation_block for sc in sourced)
+
+
+def get_document_summaries_text(state: ChatState) -> str:
+    """
+    Get formatted document summaries for supervisor context.
+
+    Returns a text representation of all document summaries that helps
+    the supervisor decide which documents to load.
+    """
+    summaries = state.get("document_summaries", [])
+    if not summaries:
+        return "No documents uploaded for this conversation."
+
+    lines = [f"## Uploaded Documents ({len(summaries)} total)\n"]
+
+    for summary in summaries:
+        lines.append(f"### [{summary.document_id}] {summary.filename}")
+        lines.append(f"**Status:** {summary.status.value}")
+
+        if summary.status.value == "ready":
+            lines.append(f"**Type:** {summary.document_type}")
+            lines.append(f"**Summary:** {summary.overall_summary}")
+            lines.append(f"**Topics:** {', '.join(summary.key_topics)}")
+            lines.append(f"**Size:** {summary.chunk_count} chunks, ~{summary.total_tokens} tokens")
+            if summary.relevance_hints:
+                lines.append(f"**When to use:** {summary.relevance_hints}")
+        else:
+            lines.append(f"**Progress:** {summary.processing_progress:.0%}")
+
+        lines.append("")  # Blank line between documents
+
+    return "\n".join(lines)
+
+
+def get_loaded_documents_text(state: ChatState) -> str:
+    """
+    Get formatted loaded document content for context assembly.
+
+    Returns the full content of all loaded documents.
+    """
+    documents = state.get("loaded_documents", [])
+    if not documents:
+        return ""
+
+    lines = ["## Document Content\n"]
+
+    for doc in documents:
+        lines.append(f"### {doc.filename} (ID: {doc.document_id})")
+        if not doc.is_complete:
+            lines.append(f"*Partial content: chunks {doc.chunks_loaded}*")
+        lines.append("")
+        lines.append(doc.content)
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def get_document_context(state: ChatState) -> str:
+    """
+    Get combined document context for supervisor/synthesizer.
+
+    Returns both summaries and loaded content formatted for context.
+    """
+    summaries_text = get_document_summaries_text(state)
+    loaded_text = get_loaded_documents_text(state)
+
+    if not loaded_text:
+        return summaries_text
+
+    return f"{summaries_text}\n\n{loaded_text}"
+
+
+def get_cognitive_context_text(state: ChatState) -> str:
+    """
+    Get formatted cognitive context for supervisor prompt.
+
+    Returns user profile, relevant memories, and identity insights
+    formatted for context injection.
+    """
+    cognitive_context = state.get("cognitive_context")
+    if not cognitive_context:
+        return ""
+
+    # Use the CognitiveContext's built-in formatting
+    if hasattr(cognitive_context, "to_supervisor_text"):
+        return cognitive_context.to_supervisor_text()
+
+    return ""

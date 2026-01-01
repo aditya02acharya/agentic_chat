@@ -7,6 +7,10 @@ from agentic_chatbot.operators.base import BaseOperator, OperatorType
 from agentic_chatbot.operators.context import OperatorContext, OperatorResult
 from agentic_chatbot.operators.registry import OperatorRegistry
 
+# New unified data model
+from agentic_chatbot.data.execution import ExecutionInput, ExecutionOutput
+from agentic_chatbot.data.content import TextContent, ContentBlock
+
 if TYPE_CHECKING:
     from agentic_chatbot.mcp.session import MCPSession
 
@@ -28,20 +32,20 @@ class WebSearcherOperator(BaseOperator):
     mcp_tools = ["web_search", "news_search"]
     context_requirements = ["query", "tools.schema(web_search)"]
 
-    async def execute(
+    async def run(
         self,
-        context: OperatorContext,
+        input: ExecutionInput,
         mcp_session: "MCPSession | None" = None,
-    ) -> OperatorResult:
+    ) -> ExecutionOutput:
         """
-        Execute web search.
+        Execute web search using unified data model.
 
         Args:
-            context: Operator context with query
+            input: ExecutionInput with query
             mcp_session: Required MCP session
 
         Returns:
-            OperatorResult with search results
+            ExecutionOutput with search results as ContentBlock
 
         Raises:
             OperatorError: If MCP session not provided
@@ -51,22 +55,20 @@ class WebSearcherOperator(BaseOperator):
 
         try:
             # Determine which search tool to use
-            search_type = context.extra.get("search_type", "web")
+            search_type = input.get("search_type", "web")
             tool_name = "news_search" if search_type == "news" else "web_search"
 
             # Call the web search tool
             result = await mcp_session.call_tool(
                 tool_name,
                 {
-                    "query": context.query,
-                    "num_results": context.extra.get("num_results", 10),
+                    "query": input.query,
+                    "num_results": input.get("num_results", 10),
                 },
             )
 
             if not result.status.value == "success":
-                return OperatorResult.error_result(
-                    error=result.error or "Web search failed",
-                )
+                return ExecutionOutput.error(result.error or "Web search failed")
 
             # Extract text content
             output = result.combined_text
@@ -74,12 +76,14 @@ class WebSearcherOperator(BaseOperator):
                 # Handle JSON response
                 for content in result.contents:
                     if content.content_type == "application/json":
-                        output = content.data
+                        output = str(content.data)
                         break
 
-            return OperatorResult.success_result(
-                output=output,
-                contents=result.contents,
+            # Convert MCP ToolContent to ContentBlock
+            contents = [TextContent.markdown(output)] if output else []
+
+            return ExecutionOutput.success(
+                contents[0] if contents else TextContent.plain("No results found"),
                 metadata={
                     "tool": tool_name,
                     "duration_ms": result.duration_ms,
@@ -87,6 +91,30 @@ class WebSearcherOperator(BaseOperator):
             )
 
         except Exception as e:
-            return OperatorResult.error_result(
-                error=f"Web search failed: {str(e)}",
+            return ExecutionOutput.error(f"Web search failed: {str(e)}")
+
+    async def execute(
+        self,
+        context: OperatorContext,
+        mcp_session: "MCPSession | None" = None,
+    ) -> OperatorResult:
+        """
+        Legacy interface - converts to new run() interface.
+
+        DEPRECATED: Use run() with ExecutionInput instead.
+        """
+        exec_input = ExecutionInput(
+            query=context.query,
+            extra=context.extra,
+            step_results={},
+        )
+
+        output = await self.run(exec_input, mcp_session)
+
+        if output.success:
+            return OperatorResult.success_result(
+                output=output.text,
+                metadata=output.metadata,
             )
+        else:
+            return OperatorResult.error_result(error=output.error)

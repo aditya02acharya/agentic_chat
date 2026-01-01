@@ -43,6 +43,9 @@ class LocalToolContext(BaseModel):
     mcp_registry: Any | None = None
     local_tool_registry: Any | None = None
 
+    # Document service for document loading tools
+    document_service: Any | None = None
+
 
 class LocalTool(ABC):
     """

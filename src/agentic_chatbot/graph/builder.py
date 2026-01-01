@@ -203,6 +203,12 @@ async def create_chat_graph_with_sqlite(db_path: str = ":memory:") -> CompiledSt
     """
     Create chat graph with SQLite checkpointer.
 
+    WARNING: This function creates a graph with an async checkpointer.
+    The checkpointer connection is established but the caller is responsible
+    for managing its lifecycle. For production use, prefer
+    `create_chat_graph_with_sqlite_managed()` which returns both the graph
+    and checkpointer for proper cleanup.
+
     Args:
         db_path: Path to SQLite database file, or ":memory:" for in-memory
 
@@ -212,11 +218,49 @@ async def create_chat_graph_with_sqlite(db_path: str = ":memory:") -> CompiledSt
     try:
         from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
-        async with AsyncSqliteSaver.from_conn_string(db_path) as checkpointer:
-            return create_chat_graph(checkpointer=checkpointer)
+        # NOTE: Using setup() instead of context manager since we return the graph
+        # The checkpointer will be closed when the application shuts down
+        checkpointer = AsyncSqliteSaver.from_conn_string(db_path)
+        await checkpointer.setup()
+        return create_chat_graph(checkpointer=checkpointer)
     except ImportError:
         logger.warning("langgraph-checkpoint-sqlite not installed, using MemorySaver")
         return create_chat_graph_with_memory()
+
+
+async def create_chat_graph_with_sqlite_managed(
+    db_path: str = ":memory:",
+) -> tuple[CompiledStateGraph, Any]:
+    """
+    Create chat graph with SQLite checkpointer, returning both for lifecycle management.
+
+    Use this for production to ensure proper cleanup:
+
+    ```python
+    graph, checkpointer = await create_chat_graph_with_sqlite_managed("chat.db")
+    try:
+        # Use graph...
+        await graph.ainvoke(state, config)
+    finally:
+        await checkpointer.conn.close()  # Cleanup
+    ```
+
+    Args:
+        db_path: Path to SQLite database file, or ":memory:" for in-memory
+
+    Returns:
+        Tuple of (compiled graph, checkpointer) - caller must close checkpointer
+    """
+    try:
+        from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+
+        checkpointer = AsyncSqliteSaver.from_conn_string(db_path)
+        await checkpointer.setup()
+        return create_chat_graph(checkpointer=checkpointer), checkpointer
+    except ImportError:
+        logger.warning("langgraph-checkpoint-sqlite not installed, using MemorySaver")
+        checkpointer = MemorySaver()
+        return create_chat_graph(checkpointer=checkpointer), checkpointer
 
 
 # =============================================================================

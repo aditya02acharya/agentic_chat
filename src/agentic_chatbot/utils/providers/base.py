@@ -1,8 +1,14 @@
 """Base interface for LLM providers."""
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from typing import AsyncIterator
+from dataclasses import dataclass, field
+from typing import AsyncIterator, Any
+
+from agentic_chatbot.config.models import (
+    ModelRegistry,
+    ThinkingConfig,
+    TokenUsage,
+)
 
 
 @dataclass
@@ -11,10 +17,21 @@ class LLMResponse:
 
     content: str
     model: str
-    input_tokens: int
-    output_tokens: int
-    stop_reason: str
+    usage: TokenUsage = field(default_factory=TokenUsage)
+    stop_reason: str = ""
     provider: str = "unknown"
+
+    # Thinking mode outputs
+    thinking_content: str = ""  # The model's thinking process (if enabled)
+
+    # Legacy fields for backwards compatibility
+    @property
+    def input_tokens(self) -> int:
+        return self.usage.input_tokens
+
+    @property
+    def output_tokens(self) -> int:
+        return self.usage.output_tokens
 
 
 class BaseLLMProvider(ABC):
@@ -23,14 +40,12 @@ class BaseLLMProvider(ABC):
 
     All providers (Anthropic, Bedrock, OpenAI, etc.) implement this interface
     to ensure consistent behavior across the application.
-    """
 
-    # Model aliases mapping - override in subclasses if different
-    MODEL_ALIASES: dict[str, str] = {
-        "haiku": "claude-3-haiku-20240307",
-        "sonnet": "claude-3-5-sonnet-20241022",
-        "opus": "claude-3-opus-20240229",
-    }
+    Supports:
+    - Model resolution via ModelRegistry
+    - Extended thinking mode
+    - Comprehensive token tracking
+    """
 
     @property
     @abstractmethod
@@ -39,8 +54,29 @@ class BaseLLMProvider(ABC):
         ...
 
     def resolve_model(self, model: str) -> str:
-        """Resolve model alias to full model ID."""
-        return self.MODEL_ALIASES.get(model, model)
+        """
+        Resolve model alias to provider-specific model ID.
+
+        Args:
+            model: Model ID or alias (e.g., "sonnet", "haiku", "thinking")
+
+        Returns:
+            Provider-specific model ID
+        """
+        config = ModelRegistry.get(model)
+        if config:
+            return config.get_provider_id(self.provider_name)
+        # Fall back to direct model ID
+        return model
+
+    def get_model_config(self, model: str):
+        """Get model configuration."""
+        from agentic_chatbot.config.models import get_model
+
+        try:
+            return get_model(model)
+        except ValueError:
+            return None
 
     @abstractmethod
     async def complete(
@@ -50,6 +86,8 @@ class BaseLLMProvider(ABC):
         model: str = "sonnet",
         max_tokens: int = 4096,
         temperature: float = 0.0,
+        thinking: ThinkingConfig | None = None,
+        **kwargs: Any,
     ) -> LLMResponse:
         """
         Call LLM and get complete response.
@@ -60,9 +98,11 @@ class BaseLLMProvider(ABC):
             model: Model name or alias
             max_tokens: Maximum tokens to generate
             temperature: Sampling temperature
+            thinking: Extended thinking configuration
+            **kwargs: Additional provider-specific parameters
 
         Returns:
-            LLMResponse with content and metadata
+            LLMResponse with content, usage, and optional thinking
         """
         ...
 
@@ -74,6 +114,8 @@ class BaseLLMProvider(ABC):
         model: str = "sonnet",
         max_tokens: int = 4096,
         temperature: float = 0.0,
+        thinking: ThinkingConfig | None = None,
+        **kwargs: Any,
     ) -> AsyncIterator[str]:
         """
         Stream LLM response.
@@ -84,6 +126,8 @@ class BaseLLMProvider(ABC):
             model: Model name or alias
             max_tokens: Maximum tokens to generate
             temperature: Sampling temperature
+            thinking: Extended thinking configuration
+            **kwargs: Additional provider-specific parameters
 
         Yields:
             Response text chunks

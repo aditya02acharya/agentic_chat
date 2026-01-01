@@ -8,6 +8,10 @@ from agentic_chatbot.operators.context import OperatorContext, OperatorResult
 from agentic_chatbot.operators.registry import OperatorRegistry
 from agentic_chatbot.utils.llm import LLMClient
 
+# New unified data model
+from agentic_chatbot.data.execution import ExecutionInput, ExecutionOutput
+from agentic_chatbot.data.content import TextContent
+
 if TYPE_CHECKING:
     from agentic_chatbot.mcp.session import MCPSession
 
@@ -30,32 +34,35 @@ class AnalyzerOperator(BaseOperator):
     model = "sonnet"
     context_requirements = ["query", "data"]
 
-    async def execute(
+    async def run(
         self,
-        context: OperatorContext,
+        input: ExecutionInput,
         mcp_session: "MCPSession | None" = None,
-    ) -> OperatorResult:
+    ) -> ExecutionOutput:
         """
-        Execute data analysis.
+        Execute data analysis using unified data model.
 
         Args:
-            context: Operator context with query and data to analyze
+            input: ExecutionInput with query and data to analyze
             mcp_session: Not used (pure LLM operator)
 
         Returns:
-            OperatorResult with analysis
+            ExecutionOutput with analysis as ContentBlock
         """
         client = LLMClient()
 
         # Get data to analyze
-        data = context.extra.get("data", "")
-        if not data and context.step_results:
+        data = input.get("data", "")
+        if not data and input.step_results:
             import json
-
-            data = json.dumps(context.step_results, indent=2)
+            # Convert step results to JSON for analysis
+            data = json.dumps(
+                {k: v.text for k, v in input.step_results.items()},
+                indent=2,
+            )
 
         prompt = ANALYZER_PROMPT.format(
-            query=context.query,
+            query=input.query,
             data=data,
         )
 
@@ -66,14 +73,42 @@ class AnalyzerOperator(BaseOperator):
                 model=self.model or "sonnet",
             )
 
-            return OperatorResult.success_result(
-                output=response.content,
-                input_tokens=response.input_tokens,
-                output_tokens=response.output_tokens,
+            return ExecutionOutput.success(
+                TextContent.markdown(response.content),
+                input_tokens=response.usage.input_tokens,
+                output_tokens=response.usage.output_tokens,
                 metadata={"model": response.model},
             )
 
         except Exception as e:
-            return OperatorResult.error_result(
-                error=f"Analysis failed: {str(e)}",
+            return ExecutionOutput.error(f"Analysis failed: {str(e)}")
+
+    async def execute(
+        self,
+        context: OperatorContext,
+        mcp_session: "MCPSession | None" = None,
+    ) -> OperatorResult:
+        """
+        Legacy interface - converts to new run() interface.
+
+        DEPRECATED: Use run() with ExecutionInput instead.
+        """
+        # Convert context to ExecutionInput and call run()
+        exec_input = ExecutionInput(
+            query=context.query,
+            extra=context.extra,
+            step_results={},  # Legacy context doesn't have typed step results
+        )
+
+        output = await self.run(exec_input, mcp_session)
+
+        # Convert ExecutionOutput back to OperatorResult
+        if output.success:
+            return OperatorResult.success_result(
+                output=output.text,
+                input_tokens=output.input_tokens,
+                output_tokens=output.output_tokens,
+                metadata=output.metadata,
             )
+        else:
+            return OperatorResult.error_result(error=output.error)

@@ -8,6 +8,10 @@ from agentic_chatbot.operators.context import OperatorContext, OperatorResult
 from agentic_chatbot.operators.registry import OperatorRegistry
 from agentic_chatbot.utils.llm import LLMClient
 
+# New unified data model
+from agentic_chatbot.data.execution import ExecutionInput, ExecutionOutput
+from agentic_chatbot.data.content import TextContent
+
 if TYPE_CHECKING:
     from agentic_chatbot.mcp.session import MCPSession
 
@@ -30,31 +34,31 @@ class WriterOperator(BaseOperator):
     model = "sonnet"
     context_requirements = ["query", "content"]
 
-    async def execute(
+    async def run(
         self,
-        context: OperatorContext,
+        input: ExecutionInput,
         mcp_session: "MCPSession | None" = None,
-    ) -> OperatorResult:
+    ) -> ExecutionOutput:
         """
-        Execute response formatting.
+        Execute response formatting using unified data model.
 
         Args:
-            context: Operator context with query and content to format
+            input: ExecutionInput with query and content to format
             mcp_session: Not used (pure LLM operator)
 
         Returns:
-            OperatorResult with formatted response
+            ExecutionOutput with formatted response as ContentBlock
         """
         client = LLMClient()
 
         # Get content to format
-        content = context.extra.get("content", "")
-        if not content and context.step_results:
+        content = input.get("content", "")
+        if not content and input.step_results:
             # Use step results if content not explicitly provided
-            content = "\n\n".join(str(v) for v in context.step_results.values())
+            content = "\n\n".join(v.text for v in input.step_results.values())
 
         prompt = WRITER_PROMPT.format(
-            query=context.query,
+            query=input.query,
             content=content,
         )
 
@@ -65,14 +69,40 @@ class WriterOperator(BaseOperator):
                 model=self.model or "sonnet",
             )
 
-            return OperatorResult.success_result(
-                output=response.content,
-                input_tokens=response.input_tokens,
-                output_tokens=response.output_tokens,
+            return ExecutionOutput.success(
+                TextContent.markdown(response.content),
+                input_tokens=response.usage.input_tokens,
+                output_tokens=response.usage.output_tokens,
                 metadata={"model": response.model},
             )
 
         except Exception as e:
-            return OperatorResult.error_result(
-                error=f"Writing failed: {str(e)}",
+            return ExecutionOutput.error(f"Writing failed: {str(e)}")
+
+    async def execute(
+        self,
+        context: OperatorContext,
+        mcp_session: "MCPSession | None" = None,
+    ) -> OperatorResult:
+        """
+        Legacy interface - converts to new run() interface.
+
+        DEPRECATED: Use run() with ExecutionInput instead.
+        """
+        exec_input = ExecutionInput(
+            query=context.query,
+            extra=context.extra,
+            step_results={},
+        )
+
+        output = await self.run(exec_input, mcp_session)
+
+        if output.success:
+            return OperatorResult.success_result(
+                output=output.text,
+                input_tokens=output.input_tokens,
+                output_tokens=output.output_tokens,
+                metadata=output.metadata,
             )
+        else:
+            return OperatorResult.error_result(error=output.error)

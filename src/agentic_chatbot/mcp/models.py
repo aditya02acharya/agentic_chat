@@ -1,9 +1,20 @@
-"""MCP data models for tool communication."""
+"""MCP data models for tool communication.
+
+These models handle the MCP protocol layer. For internal processing,
+use ContentBlock from agentic_chatbot.data.content as the atomic unit.
+
+Conversion:
+- ToolContent.to_content_block() -> ContentBlock (MCP -> internal)
+- ContentBlock -> ToolContent.from_content_block() (internal -> MCP)
+"""
 
 from enum import Enum
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from pydantic import BaseModel, Field
+
+if TYPE_CHECKING:
+    from agentic_chatbot.data.content import ContentBlock
 
 
 # =============================================================================
@@ -241,6 +252,36 @@ class ToolContent(BaseModel):
         """Create interactive widget content."""
         return cls(content_type=ContentType.WIDGET.value, data=widget_spec)
 
+    def to_content_block(self) -> "ContentBlock":
+        """
+        Convert ToolContent to ContentBlock (internal atomic unit).
+
+        This allows MCP tool results to be processed using the unified
+        data model internally.
+        """
+        from agentic_chatbot.data.content import ContentBlock
+
+        return ContentBlock.create(
+            content_type=self.content_type,
+            data=self.data,
+            encoding=self.encoding,
+            metadata=self.metadata,
+        )
+
+    @classmethod
+    def from_content_block(cls, block: "ContentBlock") -> "ToolContent":
+        """
+        Convert ContentBlock to ToolContent (for MCP protocol).
+
+        This allows internal ContentBlocks to be sent via MCP protocol.
+        """
+        return cls(
+            content_type=block.content_type.value if hasattr(block.content_type, "value") else str(block.content_type),
+            data=block.data,
+            encoding=block.encoding,
+            metadata=dict(block.metadata) if block.metadata else {},
+        )
+
 
 class WidgetSpec(BaseModel):
     """Specification for interactive widgets returned by tools."""
@@ -319,6 +360,15 @@ class ToolResult(BaseModel):
     def error(cls, tool_name: str, error: str, **kwargs: Any) -> "ToolResult":
         """Create error result."""
         return cls(tool_name=tool_name, status=ToolResultStatus.ERROR, error=error, **kwargs)
+
+    def to_content_blocks(self) -> list["ContentBlock"]:
+        """
+        Convert all contents to ContentBlocks (internal atomic units).
+
+        This allows MCP tool results to be processed using the unified
+        data model internally.
+        """
+        return [c.to_content_block() for c in self.contents]
 
 
 class ToolCall(BaseModel):

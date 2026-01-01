@@ -2,12 +2,17 @@
 
 import asyncio
 import signal
-from typing import Set
+from typing import Set, TYPE_CHECKING
 
 from agentic_chatbot.config.settings import get_settings
 from agentic_chatbot.mcp.manager import MCPClientManager
 from agentic_chatbot.mcp.registry import MCPServerRegistry
 from agentic_chatbot.utils.logging import get_logger, configure_logging
+from agentic_chatbot.api.rate_limit import get_rate_limiter
+
+if TYPE_CHECKING:
+    from agentic_chatbot.documents.service import DocumentService
+    from agentic_chatbot.cognition.service import CognitionService
 
 
 logger = get_logger(__name__)
@@ -28,6 +33,8 @@ class Application:
         """Initialize application."""
         self.mcp_client_manager: MCPClientManager | None = None
         self.mcp_server_registry: MCPServerRegistry | None = None
+        self.document_service: "DocumentService | None" = None
+        self.cognition_service: "CognitionService | None" = None
         self._active_requests: Set[str] = set()
         self._shutdown_event = asyncio.Event()
         self._is_shutting_down = False
@@ -58,6 +65,46 @@ class Application:
         except Exception as e:
             logger.warning(f"MCP registry warmup failed: {e}")
 
+        # Initialize document service
+        try:
+            from agentic_chatbot.documents.storage import LocalDocumentStorage
+            from agentic_chatbot.documents.service import DocumentService
+            from agentic_chatbot.utils.llm import LLMClient
+
+            storage = LocalDocumentStorage(
+                base_path=settings.document_storage_path
+                if hasattr(settings, "document_storage_path")
+                else "./storage/documents"
+            )
+            llm_client = LLMClient()
+            self.document_service = DocumentService(
+                storage=storage,
+                llm_client=llm_client,
+            )
+            logger.info("Document service initialized")
+        except Exception as e:
+            logger.warning(f"Document service initialization failed: {e}")
+            self.document_service = None
+
+        # Initialize cognition service (System 3)
+        try:
+            from agentic_chatbot.cognition.service import CognitionService
+            from agentic_chatbot.cognition.config import get_cognition_settings
+
+            cognition_settings = get_cognition_settings()
+            if cognition_settings.cognition_enabled:
+                self.cognition_service = CognitionService(cognition_settings)
+                await self.cognition_service.initialize()
+                logger.info("Cognition service initialized")
+            else:
+                logger.info("Cognition service disabled")
+        except Exception as e:
+            logger.warning(f"Cognition service initialization failed: {e}")
+            self.cognition_service = None
+
+        # Start rate limiter cleanup task
+        await get_rate_limiter().start_cleanup_task()
+
         logger.info("Application started")
 
     async def shutdown(self, timeout: float = 30.0) -> None:
@@ -66,12 +113,15 @@ class Application:
 
         1. Stop accepting new requests
         2. Wait for in-flight requests (with timeout)
-        3. Close MCP clients
-        4. Final cleanup
+        3. Wait for background tasks (document processing)
+        4. Close MCP clients
+        5. Final cleanup
 
         Args:
             timeout: Maximum time to wait for requests to complete
         """
+        from agentic_chatbot.api.routes import cleanup_background_tasks
+
         logger.info("Shutdown initiated...")
         self._is_shutting_down = True
         self._shutdown_event.set()
@@ -82,10 +132,20 @@ class Application:
             try:
                 await asyncio.wait_for(
                     self._wait_for_requests(),
-                    timeout=timeout,
+                    timeout=timeout / 2,  # Split timeout between requests and tasks
                 )
             except asyncio.TimeoutError:
-                logger.warning("Timeout waiting for requests, forcing shutdown")
+                logger.warning("Timeout waiting for requests, continuing shutdown")
+
+        # Wait for background tasks (document processing)
+        await cleanup_background_tasks(timeout=timeout / 4)
+
+        # Shutdown cognition service (allows background tasks to complete)
+        if self.cognition_service:
+            await self.cognition_service.shutdown()
+
+        # Stop rate limiter cleanup task
+        await get_rate_limiter().stop_cleanup_task()
 
         # Close MCP client manager
         if self.mcp_client_manager:

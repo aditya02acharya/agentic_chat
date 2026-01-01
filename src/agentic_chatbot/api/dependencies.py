@@ -1,6 +1,6 @@
 """FastAPI dependency injection."""
 
-from typing import Annotated
+from typing import Annotated, TYPE_CHECKING
 
 from fastapi import Depends, Request
 
@@ -12,6 +12,10 @@ from agentic_chatbot.mcp.session import MCPSessionManager
 from agentic_chatbot.tools.provider import UnifiedToolProvider
 from agentic_chatbot.tools.registry import LocalToolRegistry
 from agentic_chatbot.operators.registry import OperatorRegistry
+
+if TYPE_CHECKING:
+    from agentic_chatbot.documents.service import DocumentService
+    from agentic_chatbot.cognition.service import CognitionService
 
 
 def get_app_settings() -> Settings:
@@ -52,6 +56,7 @@ async def get_elicitation_manager(request: Request) -> ElicitationManager:
 
 
 async def get_tool_provider(
+    request: Request,
     mcp_registry: Annotated[MCPServerRegistry | None, Depends(get_mcp_registry)],
 ) -> UnifiedToolProvider:
     """
@@ -63,11 +68,38 @@ async def get_tool_provider(
 
     This gives the supervisor a unified interface to all tools.
     """
+    # Get document service from app state
+    document_service = getattr(request.app.state, "document_service", None)
+
     return UnifiedToolProvider(
         local_registry=LocalToolRegistry,
         mcp_registry=mcp_registry,
         operator_registry=OperatorRegistry,
+        document_service=document_service,
     )
+
+
+async def get_document_service(request: Request) -> "DocumentService | None":
+    """
+    Get DocumentService from application state.
+
+    The DocumentService is initialized during startup if document
+    feature is enabled. It provides document upload, processing,
+    and retrieval capabilities.
+    """
+    return getattr(request.app.state, "document_service", None)
+
+
+async def get_cognition_service(request: Request) -> "CognitionService | None":
+    """
+    Get CognitionService from application state.
+
+    The CognitionService provides System 3 meta-cognitive features:
+    - User profiles (Theory of Mind)
+    - Episodic memory (cross-conversation)
+    - Identity and learning goals
+    """
+    return getattr(request.app.state, "cognition_service", None)
 
 
 # Type aliases for dependency injection
@@ -77,3 +109,5 @@ MCPClientManagerDep = Annotated[MCPClientManager | None, Depends(get_mcp_client_
 MCPSessionManagerDep = Annotated[MCPSessionManager | None, Depends(get_mcp_session_manager)]
 ElicitationManagerDep = Annotated[ElicitationManager, Depends(get_elicitation_manager)]
 ToolProviderDep = Annotated[UnifiedToolProvider, Depends(get_tool_provider)]
+DocumentServiceDep = Annotated["DocumentService | None", Depends(get_document_service)]
+CognitionServiceDep = Annotated["CognitionService | None", Depends(get_cognition_service)]

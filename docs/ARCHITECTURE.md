@@ -16,7 +16,10 @@ A step-by-step guide to understanding the LangGraph-based agentic chatbot backen
 10. [Step 7: Understanding MCP Integration](#step-7-understanding-mcp-integration)
 11. [Step 8: Understanding Local Tools](#step-8-understanding-local-tools)
 12. [Step 9: Understanding the Flow](#step-9-understanding-the-flow)
-13. [Debugging Tips](#debugging-tips)
+13. [Step 10: Understanding Resilience Patterns](#step-10-understanding-resilience-patterns)
+14. [Step 11: Understanding Document Context](#step-11-understanding-document-context)
+15. [Step 12: Understanding System 3 Cognition](#step-12-understanding-system-3-cognition)
+16. [Debugging Tips](#debugging-tips)
 
 ---
 
@@ -37,6 +40,7 @@ This chatbot uses **LangGraph v1.x** to orchestrate a ReACT-style agent that can
 | Anthropic Claude | LLM for reasoning and generation |
 | MCP | Model Context Protocol for external tools |
 | Pydantic | Data validation and settings |
+| hyx | Fault tolerance patterns (retry, circuit breaker, timeout) |
 
 ---
 
@@ -88,7 +92,30 @@ src/agentic_chatbot/
 │   └── builtin/           # Built-in tools
 │       ├── self_info.py   # Bot version, capabilities, release notes
 │       ├── capabilities.py # Detailed feature list
-│       └── introspection.py # list_tools, list_operators
+│       ├── introspection.py # list_tools, list_operators
+│       └── load_document.py # Document loading tools
+│
+├── documents/              # Document upload and context management
+│   ├── models.py          # DocumentStatus, DocumentChunk, DocumentSummary
+│   ├── config.py          # ChunkConfig, DocumentConfig
+│   ├── chunker.py         # Semantic document chunking with overlap
+│   ├── summarizer.py      # LLM-based chunk and document summarization
+│   ├── processor.py       # Async processing pipeline
+│   ├── service.py         # High-level DocumentService API
+│   └── storage/           # Storage backends (abstract + implementations)
+│       ├── base.py        # Abstract DocumentStorage interface
+│       └── local.py       # Local filesystem implementation
+│
+├── cognition/              # 🆕 System 3 Meta-Cognitive Layer
+│   ├── models.py          # UserProfile, EpisodicMemory, IdentityState
+│   ├── config.py          # CognitionSettings
+│   ├── storage.py         # PostgreSQL storage layer
+│   ├── task_queue.py      # Background task queue (1 worker)
+│   ├── theory_of_mind.py  # User modeling and preferences
+│   ├── episodic_memory.py # Cross-conversation memory
+│   ├── identity.py        # Learning goals and metrics
+│   ├── meta_monitor.py    # Self-reflection and confidence
+│   └── service.py         # CognitionService (unified interface)
 │
 ├── mcp/                    # MCP Protocol integration
 │   ├── callbacks.py       # Callback handlers + ElicitationManager
@@ -104,11 +131,20 @@ src/agentic_chatbot/
 │
 ├── config/                 # Configuration
 │   ├── settings.py        # Environment settings
+│   ├── models.py          # Model registry + TokenUsage + ThinkingConfig
 │   └── prompts.py         # LLM prompt templates
 │
+├── core/                   # Core domain
+│   ├── exceptions.py      # Custom exceptions
+│   └── resilience.py      # Fault tolerance patterns (hyx)
+│
 └── utils/                  # Utilities
-    ├── llm.py             # LLM client wrapper
-    ├── structured_llm.py  # Structured output with validation
+    ├── llm.py             # LLM client wrapper with thinking support
+    ├── structured_llm.py  # Structured output with validation + token tracking
+    ├── providers/         # Multi-provider LLM support
+    │   ├── base.py        # BaseLLMProvider + LLMResponse
+    │   ├── anthropic.py   # Anthropic direct API with thinking
+    │   └── bedrock.py     # AWS Bedrock provider
     └── logging.py         # Logging configuration
 ```
 
@@ -147,14 +183,42 @@ def reduce_messages(left, right):
 
 | Section | Fields | Purpose |
 |---------|--------|---------|
-| Input | `user_query`, `conversation_id`, `request_id` | Initial request data |
+| Input | `user_query`, `conversation_id`, `request_id`, `requested_model` | Initial request data |
 | Conversation | `messages` | Chat history (uses reducer) |
 | Supervisor | `current_decision`, `iteration`, `action_history`, `current_task_context` | Decision-making state |
 | Execution | `tool_results`, `current_tool`, `workflow_steps` | Tool execution state |
 | Context | `data_chunks`, `data_summaries`, `source_counter` | Context optimization (citations) |
 | Messaging | `sent_direct_response`, `direct_response_contents` | Direct response tracking |
+| Token Tracking | `token_usage` | Accumulated token counts (uses reducer) |
 | Output | `final_response`, `clarify_question` | Final output data |
 | Runtime | `event_emitter`, `mcp_callbacks`, `tool_provider`, `elicitation_manager` | Runtime context (not persisted) |
+
+### Token Usage Tracking
+
+Token usage is tracked across all LLM calls using a reducer:
+
+```python
+@dataclass
+class TokenUsage:
+    input_tokens: int = 0
+    output_tokens: int = 0
+    thinking_tokens: int = 0      # Extended thinking tokens
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+
+    @property
+    def total(self) -> int:
+        return self.input_tokens + self.output_tokens + self.thinking_tokens
+
+    def __add__(self, other: "TokenUsage") -> "TokenUsage":
+        # Accumulates tokens from multiple calls
+        ...
+
+# In ChatState
+token_usage: Annotated[TokenUsage, reduce_token_usage]
+```
+
+Each node that calls an LLM returns `{"token_usage": usage}` which gets accumulated via the reducer.
 
 ### Helper Function
 
@@ -171,6 +235,7 @@ initial_state = create_initial_state(
     elicitation_manager=elicitation_manager,
     tool_provider=tool_provider,  # UnifiedToolProvider for local + remote tools
     user_context=user_context,
+    requested_model="sonnet",  # Model preference for response generation
 )
 ```
 
@@ -828,6 +893,772 @@ The supervisor can loop up to `max_iterations` (default 5):
 
 ---
 
+## Step 10: Understanding Resilience Patterns
+
+**File:** `src/agentic_chatbot/core/resilience.py`
+
+The resilience module provides fault tolerance for all remote calls using the **hyx** library.
+
+### Why Resilience Patterns?
+
+The chatbot makes many remote calls that can fail:
+- **MCP tool calls**: External services may be unavailable
+- **LLM API calls**: Rate limits, timeouts, server errors
+- **Registry refresh**: Discovery service may be down
+
+Without proper handling, a single failure can cascade and break the entire request.
+
+### Available Patterns
+
+| Pattern | Purpose | Use Case |
+|---------|---------|----------|
+| **Retry** | Automatically retry transient failures | Network timeouts, 5xx errors |
+| **Circuit Breaker** | Stop calling failing services temporarily | Prevent cascade failures |
+| **Timeout** | Bound operation duration | Prevent hanging requests |
+| **Bulkhead** | Limit concurrent operations | Resource protection |
+| **Fallback** | Graceful degradation | Return default on failure |
+
+### Pre-configured Decorators
+
+```python
+from agentic_chatbot.core.resilience import (
+    mcp_retry,
+    mcp_circuit_breaker,
+    llm_retry,
+    llm_circuit_breaker,
+    llm_timeout,
+)
+
+# MCP calls: retry + circuit breaker
+@mcp_retry
+@mcp_circuit_breaker
+async def call_mcp_tool(...):
+    ...
+
+# LLM calls: retry + circuit breaker + timeout
+@llm_retry
+@llm_circuit_breaker
+@llm_timeout
+async def call_llm_api(...):
+    ...
+```
+
+### Configuration
+
+Centralized configuration in `ResilienceConfig`:
+
+```python
+class ResilienceConfig:
+    # MCP Configuration
+    MCP_RETRY_ATTEMPTS: int = 3
+    MCP_RETRY_BACKOFF_BASE: float = 1.0  # seconds
+    MCP_RETRY_BACKOFF_MAX: float = 30.0  # seconds
+    MCP_CIRCUIT_FAILURE_THRESHOLD: int = 5
+    MCP_CIRCUIT_RECOVERY_TIME: float = 30.0  # seconds
+
+    # LLM Configuration
+    LLM_RETRY_ATTEMPTS: int = 3
+    LLM_RETRY_BACKOFF_BASE: float = 2.0  # longer for rate limits
+    LLM_RETRY_BACKOFF_MAX: float = 60.0  # seconds
+    LLM_CIRCUIT_FAILURE_THRESHOLD: int = 3
+    LLM_CIRCUIT_RECOVERY_TIME: float = 60.0  # seconds
+    LLM_TIMEOUT: float = 120.0  # seconds
+```
+
+### Custom Exception Types
+
+```python
+class TransientError(Exception):
+    """Error likely to succeed on retry (network issues, timeouts)."""
+    pass
+
+class RateLimitError(Exception):
+    """HTTP 429 or throttling errors."""
+    pass
+```
+
+### Error Wrapping Decorators
+
+Provider-specific errors are converted to resilience-aware exceptions:
+
+```python
+from agentic_chatbot.core.resilience import (
+    wrap_anthropic_errors,
+    wrap_aws_errors,
+    wrap_httpx_errors,
+)
+
+# Anthropic API errors → TransientError/RateLimitError
+@wrap_anthropic_errors
+async def call_anthropic(...):
+    ...
+
+# AWS/Bedrock errors → TransientError/RateLimitError
+@wrap_aws_errors
+async def call_bedrock(...):
+    ...
+
+# httpx errors → TransientError/RateLimitError
+@wrap_httpx_errors
+async def call_http(...):
+    ...
+```
+
+### Applied Locations
+
+| Component | File | Patterns Applied |
+|-----------|------|------------------|
+| MCP Client | `mcp/client.py` | retry, circuit breaker |
+| MCP Registry | `mcp/registry.py` | retry, circuit breaker |
+| Anthropic Provider | `utils/providers/anthropic.py` | retry, circuit breaker, timeout |
+| Bedrock Provider | `utils/providers/bedrock.py` | retry, circuit breaker, timeout |
+
+### Circuit Breaker States
+
+```
+CLOSED (normal) ──[failures exceed threshold]──► OPEN (failing)
+                                                      │
+                    ◄──[recovery time elapsed]────────┘
+                                                      │
+                                                      ▼
+                                                 HALF-OPEN
+                                                      │
+                    ◄──[success]──────────────────────┤
+                    ──[failure]───────────────────────►
+```
+
+### Example: MCP Client with Resilience
+
+```python
+class MCPClient:
+    @mcp_retry
+    @mcp_circuit_breaker
+    async def call_tool(self, name: str, params: dict) -> ToolResult:
+        try:
+            response = await self._session.call_tool(name, params)
+            return self._parse_result(response)
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 429:
+                raise RateLimitError(f"Rate limited: {e}") from e
+            if e.response.status_code >= 500:
+                raise TransientError(f"Server error: {e}") from e
+            raise
+        except BreakerOpen as e:
+            return ToolResult(
+                status=ToolResultStatus.ERROR,
+                error=f"Service unavailable (circuit breaker open): {e}",
+            )
+```
+
+---
+
+## Step 11: Understanding Document Context
+
+**Files:** `src/agentic_chatbot/documents/`
+
+The document module enables users to upload documents that provide conversation-specific context.
+
+### Why Document Context?
+
+| Problem | Solution |
+|---------|----------|
+| Large documents don't fit in context | Chunking with summarization |
+| Irrelevant documents waste tokens | Supervisor decides which to load |
+| Information at chunk boundaries | Overlapping chunks preserve context |
+| Slow processing blocks chat | Async background processing |
+
+### Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    DOCUMENT PROCESSING FLOW                  │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│  Upload ──► Storage ──► Chunker ──► Summarizer ──► Ready    │
+│    │           │           │            │             │      │
+│    ▼           ▼           ▼            ▼             ▼      │
+│  API      metadata.json  chunks/    summary.json  Supervisor │
+│           original.txt   000.json               sees summary │
+│                          001.json                            │
+│                          ...                                 │
+│                                                              │
+│  User Question ──► Supervisor ──► load_document ──► Answer   │
+│                        │              │                      │
+│                        ▼              ▼                      │
+│                  Check summaries  Load full content          │
+│                  for relevance   or specific chunks          │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Key Components
+
+| Component | File | Purpose |
+|-----------|------|---------|
+| **DocumentService** | `service.py` | High-level API for upload, process, load |
+| **DocumentProcessor** | `processor.py` | Async pipeline (chunk → summarize → store) |
+| **DocumentChunker** | `chunker.py` | Semantic splitting with overlap |
+| **DocumentSummarizer** | `summarizer.py` | LLM-based chunk and document summaries |
+| **DocumentStorage** | `storage/base.py` | Abstract interface for persistence |
+| **LocalDocumentStorage** | `storage/local.py` | Filesystem implementation |
+
+### Document States
+
+```python
+class DocumentStatus(str, Enum):
+    UPLOADING = "uploading"     # Initial upload
+    CHUNKING = "chunking"       # Being split into chunks
+    SUMMARIZING = "summarizing" # Chunks being summarized
+    READY = "ready"             # Fully processed, available
+    ERROR = "error"             # Processing failed
+```
+
+### Processing Pipeline
+
+```python
+class DocumentProcessor:
+    async def process_document(self, conversation_id: str, document_id: str):
+        # 1. Update status to CHUNKING
+        await self._storage.update_status(document_id, DocumentStatus.CHUNKING)
+
+        # 2. Load and chunk content
+        content = await self._storage.load_content(document_id)
+        chunks = self._chunker.chunk_document(content)
+        await self._storage.save_chunks(document_id, chunks)
+
+        # 3. Update status to SUMMARIZING
+        await self._storage.update_status(document_id, DocumentStatus.SUMMARIZING)
+
+        # 4. Summarize chunks in parallel (semaphore-controlled)
+        async with asyncio.Semaphore(MAX_CONCURRENT):
+            summaries = await asyncio.gather(*[
+                self._summarizer.summarize_chunk(chunk)
+                for chunk in chunks
+            ])
+
+        # 5. Aggregate into document summary
+        doc_summary = await self._summarizer.aggregate_summaries(chunks)
+
+        # 6. Update status to READY
+        await self._storage.update_status(document_id, DocumentStatus.READY)
+```
+
+### Chunking Strategy
+
+Documents are split at semantic boundaries with overlap:
+
+```python
+@dataclass
+class ChunkConfig:
+    CHUNK_SIZE: int = 4000           # ~1000 tokens per chunk
+    CHUNK_OVERLAP: int = 500         # Overlap to preserve context
+    MIN_CHUNK_SIZE: int = 500        # Don't create tiny chunks
+    MAX_CHUNKS_PER_DOC: int = 50     # Limit chunks per document
+    SPLIT_PATTERNS: tuple = (        # Priority order for splits
+        "\n\n\n",  # Section breaks
+        "\n\n",    # Paragraphs
+        "\n",      # Lines
+        ". ",      # Sentences
+        " ",       # Words (last resort)
+    )
+```
+
+### Supervisor Integration
+
+The supervisor prompt includes document context:
+
+```python
+SUPERVISOR_DECISION_PROMPT = """User Query: {query}
+
+Conversation Context:
+{conversation_context}
+
+Document Context:
+{document_context}  # ← Summaries injected here
+
+Tool Results So Far:
+{tool_results}
+...
+Remember:
+- PRIORITY: Check document summaries first - if relevant documents exist,
+  load them before using external tools
+"""
+```
+
+### Graph State Integration
+
+Document fields in ChatState:
+
+```python
+class ChatState(TypedDict, total=False):
+    # ... existing fields ...
+
+    # Document summaries for supervisor decision-making
+    document_summaries: Annotated[list[Any], reduce_document_summaries]
+
+    # Loaded document content for context
+    loaded_documents: Annotated[list[Any], reduce_loaded_documents]
+```
+
+### Local Tools for Documents
+
+| Tool | Purpose |
+|------|---------|
+| `list_documents` | Get all document summaries for conversation |
+| `load_document` | Load full or partial document content |
+
+```python
+@LocalToolRegistry.register
+class LoadDocumentTool(LocalTool):
+    name = "load_document"
+    description = "Load document content into context"
+
+    async def execute(self, context: LocalToolContext) -> ToolResult:
+        doc_service = context.document_service
+        document_ids = context.params.get("document_ids", [])
+
+        # Wait for documents if still processing
+        await doc_service.wait_for_documents(document_ids)
+
+        # Load full documents or specific chunks
+        loaded = await doc_service.load_full_document(doc_id)
+        return self.success(loaded.content)
+```
+
+### API Endpoints
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/documents` | POST | Upload document |
+| `/documents/{conv_id}` | GET | List documents |
+| `/documents/{conv_id}/{doc_id}/status` | GET | Get processing status |
+| `/documents/{conv_id}/{doc_id}` | DELETE | Delete document |
+
+### Storage Structure
+
+```
+storage/documents/{conversation_id}/{document_id}/
+├── original.txt       # Raw document content
+├── metadata.json      # DocumentMetadata
+├── summary.json       # DocumentSummary (after processing)
+└── chunks/
+    ├── 000.json       # First chunk with summary
+    ├── 001.json       # Second chunk with summary
+    └── ...
+```
+
+### Error Handling
+
+The processor uses resilience patterns for summarization:
+
+```python
+class DocumentSummarizer:
+    @llm_retry
+    @llm_circuit_breaker
+    @llm_timeout
+    async def summarize_chunk(self, content: str) -> ChunkSummaryResult:
+        # LLM call with fault tolerance
+        ...
+```
+
+### Configuration
+
+```python
+@dataclass
+class DocumentConfig:
+    MAX_DOCUMENTS_PER_CONVERSATION: int = 5
+    MAX_DOCUMENT_SIZE_BYTES: int = 1_000_000  # 1MB
+    ALLOWED_CONTENT_TYPES: tuple = ("text/plain", "text/markdown")
+    SUMMARIZATION_MODEL: str = "haiku"  # Fast model for summaries
+    MAX_CONCURRENT_SUMMARIZATIONS: int = 5
+    DOCUMENT_CONTEXT_PRIORITY: int = 900  # High priority in context
+    DEFAULT_WAIT_TIMEOUT: float = 30.0  # Max wait for processing
+```
+
+---
+
+## Step 12: Understanding System 3 Cognition
+
+**Files:** `src/agentic_chatbot/cognition/`
+
+The cognition module implements a meta-cognitive layer (System 3) that provides persistent learning, user modeling, and self-reflection capabilities.
+
+### Why System 3?
+
+| Problem | Solution |
+|---------|----------|
+| No memory across conversations | Episodic memory with deduplication |
+| Generic responses for all users | Theory of Mind (user modeling) |
+| No learning from interactions | Background learning via task queue |
+| System doesn't know itself | Identity tracking (goals, metrics) |
+
+### Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        SYSTEM 3 COGNITION FLOW                               │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Request                                                                     │
+│     │                                                                        │
+│     ▼                                                                        │
+│  ┌─────────────────┐     Fast (<100ms)    ┌─────────────────┐               │
+│  │ CognitionService│─────────────────────►│ CognitiveContext│               │
+│  │  get_context()  │                      │  - UserProfile   │               │
+│  └─────────────────┘                      │  - Memories      │               │
+│           │                               │  - Identity      │               │
+│           │                               └────────┬─────────┘               │
+│           │                                        │                         │
+│           │                                        ▼                         │
+│           │                               ┌─────────────────┐               │
+│           │                               │ Supervisor Node │               │
+│           │                               │ (enriched prompt)│               │
+│           │                               └────────┬─────────┘               │
+│           │                                        │                         │
+│           │                                        ▼                         │
+│           │                               ┌─────────────────┐               │
+│           │                               │    Response     │◄── Returns    │
+│           │                               │                 │    immediately │
+│           │                               └────────┬─────────┘               │
+│           │                                        │                         │
+│           ▼                                        ▼                         │
+│  ┌─────────────────┐    Non-blocking     ┌─────────────────┐               │
+│  │ CognitionService│◄────────────────────│  Stream Node    │               │
+│  │enqueue_learning()                     │ (after response) │               │
+│  └────────┬────────┘                     └─────────────────┘               │
+│           │                                                                  │
+│           ▼                                                                  │
+│  ┌─────────────────┐         ┌─────────────────┐                           │
+│  │  PostgreSQL     │────────►│  Task Queue     │                           │
+│  │  Task Table     │  claim  │  (1 worker)     │                           │
+│  └─────────────────┘         └────────┬────────┘                           │
+│                                       │                                     │
+│                    ┌──────────────────┼──────────────────┐                 │
+│                    ▼                  ▼                  ▼                 │
+│           ┌──────────────┐  ┌──────────────┐  ┌──────────────┐            │
+│           │Theory of Mind│  │  Episodic    │  │   Identity   │            │
+│           │(user profile)│  │   Memory     │  │  (metrics)   │            │
+│           └──────────────┘  └──────────────┘  └──────────────┘            │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Key Design Principles
+
+1. **Non-blocking**: Response returns immediately; learning happens in background
+2. **Fast Context Loading**: Context loads within 100ms timeout
+3. **Deduplication**: Similar memories are merged, not duplicated
+4. **Graceful Degradation**: If cognition fails, system works without it
+
+### Components
+
+| Component | File | Purpose |
+|-----------|------|---------|
+| **CognitionService** | `service.py` | Unified interface for all operations |
+| **TheoryOfMind** | `theory_of_mind.py` | User modeling (expertise, style, interests) |
+| **EpisodicMemory** | `episodic_memory.py` | Cross-conversation memory with dedup |
+| **Identity** | `identity.py` | Learning goals, performance metrics |
+| **MetaMonitor** | `meta_monitor.py` | Confidence scoring, error patterns |
+| **CognitionStorage** | `storage.py` | PostgreSQL persistence layer |
+| **CognitionTaskQueue** | `task_queue.py` | Background task processing (1 worker) |
+
+### CognitionService Interface
+
+```python
+class CognitionService:
+    # Fast, synchronous - for request enrichment
+    async def get_context(
+        self,
+        user_id: str,
+        query: str,
+    ) -> CognitiveContext:
+        """Load context within 100ms timeout."""
+        ...
+
+    # Fast, non-blocking - for background learning
+    async def enqueue_learning(
+        self,
+        user_id: str,
+        conversation_id: str,
+        messages: list[dict],
+        outcome: str | None = None,
+    ) -> str | None:
+        """Enqueue task and return immediately."""
+        ...
+```
+
+### Theory of Mind (User Modeling)
+
+Builds user profiles from interaction patterns:
+
+```python
+@dataclass
+class UserProfile:
+    user_id: str
+    expertise_level: str = "intermediate"  # novice, intermediate, expert
+    communication_style: str = "detailed"   # concise, detailed, technical
+    domain_interests: list[str] = field(default_factory=list)
+    interaction_patterns: dict[str, Any] = field(default_factory=dict)
+    preferences: dict[str, Any] = field(default_factory=dict)
+
+    def to_context_text(self) -> str:
+        """Format for supervisor prompt injection."""
+        return f"""User Profile:
+- Expertise: {self.expertise_level}
+- Style preference: {self.communication_style}
+- Interests: {', '.join(self.domain_interests[:5])}"""
+```
+
+Expertise is inferred from signals in messages:
+- **Novice signals**: "what is", "how do I", "explain", "beginner"
+- **Expert signals**: "implementation", "optimize", "architecture", technical terms
+
+### Episodic Memory
+
+Stores cross-conversation memories with deduplication:
+
+```python
+@dataclass
+class EpisodicMemory:
+    memory_id: str
+    user_id: str
+    conversation_id: str
+    summary: str
+    outcome: str  # success, partial, failure
+    topics: list[str]
+    importance: float  # 0-1 score
+    access_count: int
+    created_at: datetime
+    last_accessed: datetime
+```
+
+**Deduplication**: Uses Jaccard similarity on topics:
+```python
+def _calculate_topic_similarity(self, topics1: list[str], topics2: list[str]) -> float:
+    set1, set2 = set(topics1), set(topics2)
+    intersection = len(set1 & set2)
+    union = len(set1 | set2)
+    return intersection / union if union > 0 else 0.0
+
+# If similarity >= 0.7, memories are merged instead of duplicated
+```
+
+**Pruning**: Keeps memories within limits:
+- Max 100 memories per user
+- 90-day TTL for old memories
+- Low importance (<0.3) memories pruned first
+
+### Background Task Queue
+
+PostgreSQL-backed queue with atomic task claiming:
+
+```python
+class CognitionTaskQueue:
+    async def enqueue(
+        self,
+        task_type: TaskType,
+        payload: dict,
+        delay_seconds: int = 0,
+    ) -> str:
+        """Insert task into cognition_tasks table."""
+        ...
+
+    async def _claim_next_task(self) -> LearningTask | None:
+        """Atomic claim using FOR UPDATE SKIP LOCKED."""
+        query = """
+        UPDATE cognition_tasks
+        SET status = 'processing', started_at = NOW()
+        WHERE id = (
+            SELECT id FROM cognition_tasks
+            WHERE status = 'pending'
+            AND scheduled_for <= NOW()
+            ORDER BY created_at
+            FOR UPDATE SKIP LOCKED
+            LIMIT 1
+        )
+        RETURNING *
+        """
+        ...
+```
+
+**Retry Logic**: Failed tasks retry with exponential backoff (max 3 attempts).
+
+**Graceful Shutdown**: Worker completes current task before stopping.
+
+### PostgreSQL Schema
+
+```sql
+-- User profiles for Theory of Mind
+CREATE TABLE IF NOT EXISTS user_profiles (
+    user_id VARCHAR(255) PRIMARY KEY,
+    expertise_level VARCHAR(50) DEFAULT 'intermediate',
+    communication_style VARCHAR(50) DEFAULT 'detailed',
+    domain_interests JSONB DEFAULT '[]',
+    interaction_patterns JSONB DEFAULT '{}',
+    preferences JSONB DEFAULT '{}',
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Cross-conversation episodic memories
+CREATE TABLE IF NOT EXISTS episodic_memories (
+    memory_id VARCHAR(255) PRIMARY KEY,
+    user_id VARCHAR(255) NOT NULL,
+    conversation_id VARCHAR(255) NOT NULL,
+    summary TEXT NOT NULL,
+    outcome VARCHAR(50) NOT NULL,
+    topics JSONB DEFAULT '[]',
+    importance FLOAT DEFAULT 0.5,
+    access_count INT DEFAULT 0,
+    created_at TIMESTAMP DEFAULT NOW(),
+    last_accessed TIMESTAMP DEFAULT NOW()
+);
+
+-- System identity state
+CREATE TABLE IF NOT EXISTS identity_state (
+    id VARCHAR(50) PRIMARY KEY DEFAULT 'singleton',
+    learning_goals JSONB DEFAULT '[]',
+    knowledge_gaps JSONB DEFAULT '[]',
+    performance_metrics JSONB DEFAULT '{}',
+    core_values JSONB DEFAULT '{}',
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Background task queue
+CREATE TABLE IF NOT EXISTS cognition_tasks (
+    id VARCHAR(255) PRIMARY KEY,
+    task_type VARCHAR(100) NOT NULL,
+    payload JSONB NOT NULL,
+    status VARCHAR(50) DEFAULT 'pending',
+    attempts INT DEFAULT 0,
+    max_attempts INT DEFAULT 3,
+    scheduled_for TIMESTAMP DEFAULT NOW(),
+    created_at TIMESTAMP DEFAULT NOW(),
+    started_at TIMESTAMP,
+    completed_at TIMESTAMP,
+    error_message TEXT
+);
+
+-- Indexes for efficient queries
+CREATE INDEX idx_memories_user_id ON episodic_memories(user_id);
+CREATE INDEX idx_memories_topics ON episodic_memories USING GIN(topics);
+CREATE INDEX idx_tasks_status ON cognition_tasks(status, scheduled_for);
+```
+
+### Graph Integration
+
+The cognition service integrates with the graph at two points:
+
+**1. Initialize Node** (context loading):
+```python
+async def initialize_node(state: ChatState) -> dict[str, Any]:
+    # Load cognitive context if user_id provided
+    cognition_service = state.get("cognition_service")
+    user_id = state.get("user_id")
+
+    if cognition_service and user_id:
+        query = state.get("user_query", "")
+        cognitive_context = await cognition_service.get_context(user_id, query)
+        return {"cognitive_context": cognitive_context, ...}
+
+    return {...}
+```
+
+**2. Stream Node** (learning enqueue):
+```python
+async def stream_node(state: ChatState) -> dict[str, Any]:
+    # ... stream response ...
+
+    # Enqueue learning (non-blocking)
+    await _enqueue_cognitive_learning(state, outcome="success")
+
+    return {...}
+```
+
+### Supervisor Prompt Injection
+
+Cognitive context is injected into the supervisor prompt:
+
+```python
+# In supervisor_node
+cognitive_text = state.get("cognitive_context", CognitiveContext()).to_context_text()
+
+prompt = SUPERVISOR_DECISION_PROMPT.format(
+    query=user_query,
+    cognitive_context=cognitive_text,  # Injected here
+    conversation_context=conversation_context,
+    ...
+)
+```
+
+The context includes:
+- User profile (expertise, style, interests)
+- Relevant memories from past conversations
+- Identity summary (if applicable)
+
+### Configuration
+
+```python
+class CognitionSettings(BaseSettings):
+    # Enable/disable
+    cognition_enabled: bool = True
+    theory_of_mind_enabled: bool = True
+    episodic_memory_enabled: bool = True
+    identity_enabled: bool = True
+
+    # PostgreSQL connection
+    cognition_db_host: str = "localhost"
+    cognition_db_port: int = 5432
+    cognition_db_name: str = "cognition"
+    cognition_db_user: str = "postgres"
+    cognition_db_password: str = ""
+
+    # Memory limits
+    max_memories_per_user: int = 100
+    memory_ttl_days: int = 90
+    similarity_threshold: float = 0.7  # For deduplication
+    min_importance_threshold: float = 0.3  # For pruning
+
+    # Task queue
+    task_poll_interval_seconds: float = 1.0
+    task_max_retries: int = 3
+
+    # Performance
+    context_load_timeout_ms: int = 100  # Fast context loading
+```
+
+### API Changes
+
+The chat request now accepts `user_id`:
+
+```python
+class ChatRequest(BaseModel):
+    conversation_id: str
+    message: str
+    user_id: str | None = None  # For cognition features
+    context: dict[str, Any] | None = None
+    model: str | None = None
+```
+
+### FastAPI Lifespan Integration
+
+```python
+# In main.py
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    app_instance = Application()
+    await app_instance.startup()
+    app.state.cognition_service = app_instance.cognition_service
+
+    yield
+
+    # Shutdown (worker completes current task)
+    await app_instance.shutdown()
+```
+
+---
+
 ## Debugging Tips
 
 ### 1. Check Events in Browser
@@ -903,6 +1734,9 @@ print(result.get("final_response"))
 | Tool Provider | `tools/provider.py` | UnifiedToolProvider (local + remote) |
 | MCP | `mcp/` | External tool protocol |
 | Context | `context/` | DataChunk/DataSummary for citations |
+| Resilience | `core/resilience.py` | Fault tolerance (retry, circuit breaker, timeout) |
+| Documents | `documents/` | Document upload, chunking, summarization |
+| Cognition | `cognition/` | System 3 meta-cognitive layer (user modeling, memory) |
 
 ### New Features Summary
 
@@ -913,5 +1747,151 @@ print(result.get("final_response"))
 | **MessagingContext** | Allows operators to send progress, direct responses, elicit input |
 | **Direct Response** | Operators can bypass writer and send content directly to user |
 | **Context Optimization** | DataChunks for raw data, DataSummaries for supervisor decisions |
+| **Extended Thinking** | Supervisor, planner, and coder use thinking mode for complex reasoning |
+| **Token Tracking** | Full token usage tracking across all LLM calls (input, output, thinking) |
+| **Model Configuration** | Centralized model registry with aliases and thinking support |
+| **Fault Tolerance** | Retry, circuit breaker, timeout patterns via hyx for all remote calls |
+| **Document Context** | Upload documents with auto-summarization for conversation context |
+| **System 3 Cognition** | Meta-cognitive layer with user modeling, episodic memory, and identity |
 
-Start by reading `graph/state.py`, then `graph/nodes.py`, then `graph/builder.py`. This gives you the core flow. Then explore `api/routes.py` to see how it's exposed via HTTP. For self-awareness features, see `tools/builtin/`.
+---
+
+## Extended Thinking Mode
+
+**Files:** `src/agentic_chatbot/config/models.py`, `src/agentic_chatbot/utils/providers/`
+
+Extended thinking enables Claude models to "think" before responding, improving quality for complex reasoning tasks.
+
+### Model Configuration
+
+```python
+@dataclass
+class ModelConfig:
+    id: str                          # Full model ID (e.g., "claude-sonnet-4-20250514")
+    name: str                        # Human-readable name
+    aliases: list[str]               # Short aliases (e.g., ["sonnet", "claude-sonnet"])
+    supports_thinking: bool = False  # Whether model supports extended thinking
+    default_thinking_budget: int = 10000
+
+# Registry provides lookup by alias or ID
+config = ModelRegistry.get("thinking")  # Returns thinking-enabled model
+model_id = config.id  # "claude-sonnet-4-20250514"
+```
+
+### Using Extended Thinking
+
+The supervisor and planner nodes automatically use extended thinking:
+
+```python
+# In supervisor_node
+result = await caller.call_with_usage(
+    prompt=prompt,
+    response_model=SupervisorDecision,
+    system=system,
+    model="thinking",           # Alias for thinking-enabled model
+    enable_thinking=True,
+    thinking_budget=10000,      # Max thinking tokens
+)
+
+# Access thinking content and usage
+decision = result.data
+thinking_content = result.thinking_content  # Model's reasoning process
+usage = result.usage  # TokenUsage with thinking_tokens
+```
+
+### Conditional Thinking (Coder Operator)
+
+The coder operator conditionally uses thinking mode for complex tasks:
+
+```python
+class CoderOperator(BaseOperator):
+    def _should_use_thinking(self, query: str) -> bool:
+        """Detect complex tasks requiring extended thinking."""
+        # Keywords indicating complexity
+        COMPLEX_KEYWORDS = ["algorithm", "optimize", "debug", "security", ...]
+
+        query_lower = query.lower()
+        for keyword in COMPLEX_KEYWORDS:
+            if keyword in query_lower:
+                return True
+
+        # Long queries are likely complex
+        if len(query) > 300:
+            return True
+
+        return False
+
+    async def execute(self, context: OperatorContext):
+        use_thinking = self._should_use_thinking(context.query)
+
+        if use_thinking:
+            response = await client.complete(
+                prompt=prompt,
+                model="thinking",
+                enable_thinking=True,
+                thinking_budget=15000,
+            )
+        else:
+            response = await client.complete(
+                prompt=prompt,
+                model="sonnet",
+            )
+```
+
+### Token Tracking
+
+Token usage is tracked comprehensively across all LLM calls:
+
+```python
+@dataclass
+class TokenUsage:
+    input_tokens: int = 0
+    output_tokens: int = 0
+    thinking_tokens: int = 0      # Extended thinking tokens
+    cache_read_tokens: int = 0    # Prompt caching
+    cache_write_tokens: int = 0
+
+    @property
+    def total(self) -> int:
+        return self.input_tokens + self.output_tokens + self.thinking_tokens
+```
+
+The API returns total token usage in the response:
+
+```python
+# POST /api/v1/chat/sync response
+{
+    "conversation_id": "conv-123",
+    "response": "...",
+    "request_id": "req-456",
+    "usage": {
+        "input_tokens": 1500,
+        "output_tokens": 800,
+        "thinking_tokens": 5000,
+        "cache_read_tokens": 200,
+        "cache_write_tokens": 0,
+        "total_tokens": 7500
+    }
+}
+```
+
+### User Model Selection
+
+Users can specify their preferred model for response generation:
+
+```python
+# API request
+{
+    "conversation_id": "conv-123",
+    "message": "What is Python?",
+    "model": "opus"  # User preference for writer
+}
+
+# In write_node
+requested_model = state.get("requested_model") or "sonnet"
+response = await client.complete(prompt, model=requested_model)
+```
+
+---
+
+Start by reading `graph/state.py`, then `graph/nodes.py`, then `graph/builder.py`. This gives you the core flow. Then explore `api/routes.py` to see how it's exposed via HTTP. For self-awareness features, see `tools/builtin/`. For thinking mode, see `config/models.py`.
