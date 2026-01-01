@@ -436,13 +436,14 @@ class CognitionStorage:
                 SELECT * FROM episodic_memories
                 WHERE user_id = $1
                     AND topics ?| $2::text[]
-                    AND created_at > NOW() - INTERVAL '%s days'
+                    AND created_at > NOW() - $4::interval
                 ORDER BY created_at DESC
                 LIMIT $3
-                """ % days,
+                """,
                 user_id,
                 topics,
                 limit,
+                f"{days} days",
             )
             return [self._row_to_memory(row) for row in rows]
 
@@ -474,10 +475,11 @@ class CognitionStorage:
                 DELETE FROM episodic_memories
                 WHERE user_id = $1
                     AND importance < $2
-                    AND created_at < NOW() - INTERVAL '%s days'
-                """ % ttl_days,
+                    AND created_at < NOW() - $3::interval
+                """,
                 user_id,
                 low_importance_threshold,
+                f"{ttl_days} days",
             )
             deleted1 = int(result1.split()[-1]) if result1 else 0
 
@@ -685,12 +687,13 @@ class CognitionStorage:
                         """
                         UPDATE cognition_tasks
                         SET status = 'pending',
-                            scheduled_for = NOW() + INTERVAL '%s seconds',
+                            scheduled_for = NOW() + $3::interval,
                             error = $2
                         WHERE task_id = $1
-                        """ % backoff,
+                        """,
                         task_id,
                         error,
+                        f"{backoff} seconds",
                     )
                     return
 
@@ -712,8 +715,9 @@ class CognitionStorage:
                 """
                 DELETE FROM cognition_tasks
                 WHERE status IN ('completed', 'failed')
-                    AND completed_at < NOW() - INTERVAL '%s days'
-                """ % days
+                    AND completed_at < NOW() - $1::interval
+                """,
+                f"{days} days",
             )
             return int(result.split()[-1]) if result else 0
 

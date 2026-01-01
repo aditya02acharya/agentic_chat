@@ -308,6 +308,7 @@ async def chat(
 
     # Start graph execution
     task = asyncio.create_task(run_graph())
+    _track_background_task(task)
 
     return StreamingResponse(
         event_generator_with_task(event_queue, task),
@@ -404,17 +405,22 @@ async def chat_sync(
         # Get response from final state
         response = final_state.get("final_response", "")
 
-        # Extract token usage from final state
+        # Extract token usage from final state (with Level 1 + Level 2 breakdown)
         token_usage = final_state.get("token_usage")
         usage_response = None
         if token_usage:
             usage_response = TokenUsageResponse(
+                # Level 1: Conversation-level metrics (for UI)
+                user_input_tokens=token_usage.user_input_tokens,
+                final_output_tokens=token_usage.final_output_tokens,
+                intermediate_tokens=token_usage.intermediate_tokens,
+                total_tokens=token_usage.total_tokens,
+                # Level 2: Detailed breakdown
                 input_tokens=token_usage.input_tokens,
                 output_tokens=token_usage.output_tokens,
                 thinking_tokens=token_usage.thinking_tokens,
                 cache_read_tokens=token_usage.cache_read_tokens,
                 cache_write_tokens=token_usage.cache_write_tokens,
-                total_tokens=token_usage.total,
             )
 
         return ChatResponse(
