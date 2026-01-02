@@ -1,4 +1,16 @@
-"""Introspection tools for listing available tools and operators."""
+"""Introspection tools for progressive tool discovery.
+
+This module implements hierarchical tool discovery following the
+progressive disclosure pattern:
+
+1. browse_tools: Get catalog overview (categories + counts)
+2. explore_category: See groups and tool summaries in a category
+3. get_tool_info: Get full details for a specific tool
+4. search_tools: Search across all tools by keyword
+
+This design scales from 10 to 1000+ tools while keeping the
+supervisor's context manageable.
+"""
 
 from typing import Any
 
@@ -9,42 +21,55 @@ from agentic_chatbot.mcp.models import (
 )
 from agentic_chatbot.tools.base import LocalTool, LocalToolContext
 from agentic_chatbot.tools.registry import LocalToolRegistry
+from agentic_chatbot.tools.catalog import (
+    ToolCatalog,
+    ToolCategory,
+    get_catalog,
+    CATEGORY_DESCRIPTIONS,
+)
 
 
 @LocalToolRegistry.register
-class ListToolsTool(LocalTool):
+class BrowseToolsTool(LocalTool):
     """
-    List all available tools (local and remote).
+    Browse the tool catalog at various levels of detail.
 
-    Returns detailed information about each tool including:
-    - Name and description
-    - Input parameters
-    - Messaging capabilities (what it can return)
+    This is the ENTRY POINT for tool discovery. Use it to:
+    - See all categories and their tool counts (level: "overview")
+    - Explore a specific category's groups (level: "category")
+    - View tools in a specific group (level: "group")
 
-    Use this when users ask:
-    - "What tools do you have?"
-    - "How can you search?"
-    - "What external services can you use?"
+    The supervisor should start with "overview" and drill down as needed.
+
+    Examples:
+    - {"level": "overview"} -> See all categories
+    - {"level": "category", "category": "information_retrieval"} -> See groups
+    - {"level": "group", "category": "information_retrieval", "group": "web_search"} -> See tools
     """
 
-    name = "list_tools"
-    description = "List all available tools with their descriptions and capabilities"
+    name = "browse_tools"
+    description = "Browse available tools at different levels of detail (overview -> category -> group)"
 
     input_schema = {
         "type": "object",
         "properties": {
-            "filter": {
+            "level": {
                 "type": "string",
-                "enum": ["all", "local", "remote", "widget_capable", "image_capable"],
-                "description": "Filter tools by type or capability",
-                "default": "all",
+                "enum": ["overview", "category", "group"],
+                "description": "Detail level: overview (categories), category (groups), or group (tools)",
+                "default": "overview",
             },
-            "detailed": {
-                "type": "boolean",
-                "description": "Include detailed information (input schema, capabilities)",
-                "default": False,
+            "category": {
+                "type": "string",
+                "description": "Category to explore (required for 'category' and 'group' levels)",
+                "enum": [c.value for c in ToolCategory],
+            },
+            "group": {
+                "type": "string",
+                "description": "Group to explore (required for 'group' level)",
             },
         },
+        "required": [],
     }
 
     messaging = MessagingCapabilities(
@@ -58,81 +83,406 @@ class ListToolsTool(LocalTool):
     needs_introspection = True
 
     async def execute(self, context: LocalToolContext) -> ToolResult:
-        """List available tools based on filter."""
-        filter_type = context.params.get("filter", "all")
-        detailed = context.params.get("detailed", False)
+        """Browse tools at the specified level."""
+        level = context.params.get("level", "overview")
+        category_str = context.params.get("category")
+        group_id = context.params.get("group")
 
-        local_tools = []
-        remote_tools = []
+        # Get or build catalog
+        catalog = await self._get_catalog(context)
 
-        # Get local tools
-        if context.local_tool_registry:
+        if level == "overview":
+            return self._browse_overview(catalog)
+        elif level == "category":
+            if not category_str:
+                return self.error(
+                    f"local:{self.name}",
+                    "Parameter 'category' is required for level='category'"
+                )
+            try:
+                category = ToolCategory(category_str)
+            except ValueError:
+                valid = [c.value for c in ToolCategory]
+                return self.error(
+                    f"local:{self.name}",
+                    f"Invalid category: {category_str}. Valid: {valid}"
+                )
+            return self._browse_category(catalog, category)
+        elif level == "group":
+            if not category_str or not group_id:
+                return self.error(
+                    f"local:{self.name}",
+                    "Parameters 'category' and 'group' are required for level='group'"
+                )
+            try:
+                category = ToolCategory(category_str)
+            except ValueError:
+                return self.error(
+                    f"local:{self.name}",
+                    f"Invalid category: {category_str}"
+                )
+            return self._browse_group(catalog, category, group_id)
+        else:
+            return self.error(
+                f"local:{self.name}",
+                f"Invalid level: {level}. Use 'overview', 'category', or 'group'"
+            )
+
+    async def _get_catalog(self, context: LocalToolContext) -> ToolCatalog:
+        """Get or build the tool catalog from registries."""
+        catalog = get_catalog()
+
+        # Populate from local tools if empty
+        if not catalog._entries and context.local_tool_registry:
             for summary in context.local_tool_registry.get_all_summaries():
-                tool_info = {
-                    "name": summary.name,
-                    "description": summary.description,
-                    "type": "local",
-                }
-                if detailed:
-                    tool_info["messaging"] = {
-                        "output_types": [t.value for t in summary.messaging.output_types],
-                        "supports_progress": summary.messaging.supports_progress,
-                        "supports_direct_response": summary.messaging.supports_direct_response,
-                        "supports_elicitation": summary.messaging.supports_elicitation,
-                    }
-                local_tools.append(tool_info)
+                # Determine category based on tool name/description
+                category = self._categorize_tool(summary.name, summary.description)
+                catalog.register(
+                    name=summary.name,
+                    description=summary.description,
+                    category=category,
+                    group_id=self._get_group_id(summary.name, category),
+                    is_local=True,
+                )
 
-        # Get remote (MCP) tools
+        # Populate from operators
+        if context.operator_registry:
+            for summary in context.operator_registry.get_all_summaries():
+                category = self._categorize_tool(summary["name"], summary.get("description", ""))
+                catalog.register(
+                    name=summary["name"],
+                    description=summary.get("description", ""),
+                    category=category,
+                    group_id=self._get_group_id(summary["name"], category),
+                    is_local=False,
+                )
+
+        # Populate from MCP tools
         if context.mcp_registry:
             try:
                 summaries = await context.mcp_registry.get_all_tool_summaries()
                 for summary in summaries:
-                    tool_info = {
-                        "name": summary.name,
-                        "description": summary.description,
-                        "type": "remote",
-                        "server": summary.server_id,
-                    }
-                    if detailed:
-                        tool_info["messaging"] = {
-                            "output_types": [t.value for t in summary.messaging.output_types],
-                            "supports_progress": summary.messaging.supports_progress,
-                            "supports_direct_response": summary.messaging.supports_direct_response,
-                            "supports_elicitation": summary.messaging.supports_elicitation,
-                        }
-                    remote_tools.append(tool_info)
-            except Exception as e:
-                remote_tools.append({"error": f"Failed to fetch remote tools: {e}"})
+                    category = self._categorize_tool(summary.name, summary.description)
+                    catalog.register(
+                        name=summary.name,
+                        description=summary.description,
+                        category=category,
+                        group_id=self._get_group_id(summary.name, category),
+                        is_local=False,
+                        server_id=summary.server_id,
+                    )
+            except Exception:
+                pass  # MCP tools optional
 
-        # Apply filter
-        if filter_type == "local":
-            tools = local_tools
-        elif filter_type == "remote":
-            tools = remote_tools
-        elif filter_type == "widget_capable":
-            tools = [
-                t for t in (local_tools + remote_tools)
-                if t.get("messaging", {}).get("supports_direct_response")
-                and "widget" in str(t.get("messaging", {}).get("output_types", []))
-            ]
-        elif filter_type == "image_capable":
-            tools = [
-                t for t in (local_tools + remote_tools)
-                if "image" in str(t.get("messaging", {}).get("output_types", []))
-            ]
-        else:  # "all"
-            tools = local_tools + remote_tools
+        return catalog
+
+    def _categorize_tool(self, name: str, description: str) -> ToolCategory:
+        """Determine category based on tool name and description."""
+        name_lower = name.lower()
+        desc_lower = description.lower()
+
+        # System introspection
+        if any(kw in name_lower for kw in ["list", "browse", "self", "info", "capability"]):
+            return ToolCategory.SYSTEM_INTROSPECTION
+
+        # Document management
+        if any(kw in name_lower for kw in ["document", "load_doc", "file"]):
+            return ToolCategory.DOCUMENT_MANAGEMENT
+
+        # Information retrieval
+        if any(kw in name_lower or kw in desc_lower for kw in ["search", "retrieve", "fetch", "query", "rag"]):
+            return ToolCategory.INFORMATION_RETRIEVAL
+
+        # Code execution
+        if any(kw in name_lower or kw in desc_lower for kw in ["code", "execute", "run", "script", "compile"]):
+            return ToolCategory.CODE_EXECUTION
+
+        # Data analysis
+        if any(kw in name_lower or kw in desc_lower for kw in ["analyze", "data", "chart", "visualize", "stats"]):
+            return ToolCategory.DATA_ANALYSIS
+
+        # Content generation
+        if any(kw in name_lower or kw in desc_lower for kw in ["generate", "create", "write", "compose"]):
+            return ToolCategory.CONTENT_GENERATION
+
+        # Workflow
+        if any(kw in name_lower for kw in ["workflow", "pipeline", "orchestrate"]):
+            return ToolCategory.WORKFLOW_MANAGEMENT
+
+        return ToolCategory.UNCATEGORIZED
+
+    def _get_group_id(self, name: str, category: ToolCategory) -> str:
+        """Determine group within category."""
+        name_lower = name.lower()
+
+        if category == ToolCategory.INFORMATION_RETRIEVAL:
+            if "web" in name_lower:
+                return "web_search"
+            elif "rag" in name_lower:
+                return "knowledge_base"
+            elif "doc" in name_lower:
+                return "document_search"
+            return "general_search"
+
+        if category == ToolCategory.SYSTEM_INTROSPECTION:
+            if "tool" in name_lower:
+                return "tool_discovery"
+            elif "operator" in name_lower:
+                return "operator_info"
+            return "system_info"
+
+        if category == ToolCategory.CODE_EXECUTION:
+            if "python" in name_lower:
+                return "python"
+            elif "javascript" in name_lower or "js" in name_lower:
+                return "javascript"
+            return "general_execution"
+
+        return "default"
+
+    def _browse_overview(self, catalog: ToolCatalog) -> ToolResult:
+        """Return catalog overview."""
+        overview = catalog.get_overview()
 
         content = {
-            "tools": tools,
-            "count": len(tools),
-            "local_count": len(local_tools),
-            "remote_count": len(remote_tools),
+            "level": "overview",
+            "total_tools": overview.total_tools,
+            "total_categories": overview.total_categories,
+            "categories": [
+                {
+                    "id": cat.category.value,
+                    "description": cat.description,
+                    "tool_count": cat.tool_count,
+                    "groups": cat.groups,
+                }
+                for cat in overview.categories
+                if cat.tool_count > 0
+            ],
+            "hint": "Use browse_tools with level='category' and a category id to see its groups and tools",
         }
 
         return self.success(
             f"local:{self.name}",
             content,
+            content_type="application/json",
+        )
+
+    def _browse_category(self, catalog: ToolCatalog, category: ToolCategory) -> ToolResult:
+        """Return category details."""
+        details = catalog.get_category_details(category)
+
+        content = {
+            "level": "category",
+            "category": details["category"],
+            "description": details["description"],
+            "total_tools": details["total_tools"],
+            "groups": details["groups"],
+            "hint": "Use browse_tools with level='group' to see all tools in a group, or get_tool_info for a specific tool",
+        }
+
+        return self.success(
+            f"local:{self.name}",
+            content,
+            content_type="application/json",
+        )
+
+    def _browse_group(self, catalog: ToolCatalog, category: ToolCategory, group_id: str) -> ToolResult:
+        """Return group details with all tools."""
+        details = catalog.get_group_details(category, group_id)
+
+        if "error" in details:
+            return self.error(f"local:{self.name}", details["error"])
+
+        content = {
+            "level": "group",
+            "group_id": details["group_id"],
+            "name": details["name"],
+            "description": details["description"],
+            "category": details["category"],
+            "tools": details["tools"],
+            "hint": "Use get_tool_info for full details including input parameters",
+        }
+
+        return self.success(
+            f"local:{self.name}",
+            content,
+            content_type="application/json",
+        )
+
+
+@LocalToolRegistry.register
+class GetToolInfoTool(LocalTool):
+    """
+    Get complete information about a specific tool.
+
+    This returns the full tool schema including:
+    - Description
+    - Input parameters and their types
+    - Required vs optional parameters
+    - Category and group information
+
+    Use this BEFORE calling a tool to understand its parameters.
+    """
+
+    name = "get_tool_info"
+    description = "Get full details about a specific tool including input schema and parameters"
+
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "tool_name": {
+                "type": "string",
+                "description": "Name of the tool to get info about",
+            },
+        },
+        "required": ["tool_name"],
+    }
+
+    messaging = MessagingCapabilities(
+        output_types=[OutputDataType.TEXT, OutputDataType.JSON],
+        supports_progress=False,
+        supports_elicitation=False,
+        supports_direct_response=False,
+        supports_streaming=False,
+    )
+
+    needs_introspection = True
+
+    async def execute(self, context: LocalToolContext) -> ToolResult:
+        """Get full tool information."""
+        tool_name = context.params.get("tool_name")
+        if not tool_name:
+            return self.error(f"local:{self.name}", "Parameter 'tool_name' is required")
+
+        # Try catalog first
+        catalog = get_catalog()
+        details = catalog.get_tool_details(tool_name)
+
+        if "error" not in details:
+            return self.success(
+                f"local:{self.name}",
+                details,
+                content_type="application/json",
+            )
+
+        # Fallback: check local tool registry
+        if context.local_tool_registry:
+            schema = context.local_tool_registry.get_tool_schema(tool_name)
+            if schema:
+                return self.success(
+                    f"local:{self.name}",
+                    {
+                        "name": schema.name,
+                        "description": schema.description,
+                        "input_schema": schema.input_schema,
+                        "messaging": {
+                            "output_types": [t.value for t in schema.messaging.output_types],
+                            "supports_direct_response": schema.messaging.supports_direct_response,
+                        },
+                    },
+                    content_type="application/json",
+                )
+
+        # Try MCP registry
+        if context.mcp_registry:
+            try:
+                schema = await context.mcp_registry.get_tool_schema(tool_name)
+                if schema:
+                    return self.success(
+                        f"local:{self.name}",
+                        {
+                            "name": schema.name,
+                            "description": schema.description,
+                            "server_id": schema.server_id,
+                            "input_schema": schema.input_schema,
+                            "messaging": {
+                                "output_types": [t.value for t in schema.messaging.output_types],
+                            },
+                        },
+                        content_type="application/json",
+                    )
+            except Exception:
+                pass
+
+        return self.error(f"local:{self.name}", f"Tool not found: {tool_name}")
+
+
+@LocalToolRegistry.register
+class SearchToolsTool(LocalTool):
+    """
+    Search for tools by keyword.
+
+    Use this when you know what you want to do but not which tool does it.
+    Searches tool names and descriptions.
+
+    Examples:
+    - "search": Find tools related to searching
+    - "image": Find tools that work with images
+    - "python": Find Python-related tools
+    """
+
+    name = "search_tools"
+    description = "Search for tools by keyword in name or description"
+
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Search term to find relevant tools",
+            },
+            "category": {
+                "type": "string",
+                "description": "Optional: limit search to a specific category",
+                "enum": [c.value for c in ToolCategory],
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Maximum number of results (default: 10)",
+                "default": 10,
+            },
+        },
+        "required": ["query"],
+    }
+
+    messaging = MessagingCapabilities(
+        output_types=[OutputDataType.TEXT, OutputDataType.JSON],
+        supports_progress=False,
+        supports_elicitation=False,
+        supports_direct_response=False,
+        supports_streaming=False,
+    )
+
+    needs_introspection = True
+
+    async def execute(self, context: LocalToolContext) -> ToolResult:
+        """Search for tools."""
+        query = context.params.get("query")
+        if not query:
+            return self.error(f"local:{self.name}", "Parameter 'query' is required")
+
+        category_str = context.params.get("category")
+        limit = context.params.get("limit", 10)
+
+        category = None
+        if category_str:
+            try:
+                category = ToolCategory(category_str)
+            except ValueError:
+                pass
+
+        catalog = get_catalog()
+        results = catalog.search_tools(query, category=category, limit=limit)
+
+        return self.success(
+            f"local:{self.name}",
+            {
+                "query": query,
+                "category_filter": category_str,
+                "results": results,
+                "count": len(results),
+                "hint": "Use get_tool_info for full details about a specific tool",
+            },
             content_type="application/json",
         )
 

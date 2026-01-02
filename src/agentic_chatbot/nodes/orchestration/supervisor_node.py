@@ -1,4 +1,4 @@
-"""Supervisor node implementing ReACT loop."""
+"""Supervisor node implementing ReACT loop with progressive tool discovery."""
 
 from typing import Any
 
@@ -9,6 +9,7 @@ from agentic_chatbot.core.supervisor import SupervisorDecision, SupervisorState
 from agentic_chatbot.events.models import SupervisorThinkingEvent, SupervisorDecidedEvent
 from agentic_chatbot.nodes.base import AsyncBaseNode
 from agentic_chatbot.operators.registry import OperatorRegistry
+from agentic_chatbot.tools.catalog import get_catalog, ToolCategory
 from agentic_chatbot.utils.structured_llm import StructuredLLMCaller, StructuredOutputError
 from agentic_chatbot.utils.logging import get_logger
 
@@ -70,13 +71,15 @@ class SupervisorNode(AsyncBaseNode):
         """Execute supervisor decision-making."""
         caller = StructuredLLMCaller(max_retries=3)
 
-        # Build prompts
-        tool_summaries = prep_res["tool_summaries"]
-        system = SUPERVISOR_SYSTEM_PROMPT.format(tool_summaries=tool_summaries)
+        # Build prompts with catalog overview (not full tool dump)
+        tool_catalog_overview = prep_res["tool_summaries"]
+        system = SUPERVISOR_SYSTEM_PROMPT.format(tool_catalog_overview=tool_catalog_overview)
 
         prompt = SUPERVISOR_DECISION_PROMPT.format(
             query=prep_res["query"],
             conversation_context=prep_res["conversation_context"],
+            document_context=prep_res.get("document_context", "No documents uploaded."),
+            tool_results=prep_res.get("tool_results", "None yet."),
             actions_this_turn="\n".join(prep_res["actions_this_turn"]) or "None",
         )
 
@@ -150,11 +153,106 @@ class SupervisorNode(AsyncBaseNode):
         return "No previous conversation."
 
     def _get_tool_summaries(self, shared: dict[str, Any]) -> str:
-        """Get formatted tool summaries."""
-        # Try MCP registry
+        """Get catalog overview for progressive discovery.
+
+        Instead of dumping all tools (which doesn't scale), we provide:
+        1. A high-level overview of tool categories
+        2. Instructions on how to discover tools progressively
+
+        The supervisor uses browse_tools, search_tools, and get_tool_info
+        to discover and learn about specific tools as needed.
+        """
+        catalog = get_catalog()
+
+        # Populate catalog from registries if needed
+        self._populate_catalog(shared, catalog)
+
+        # Get overview (categories + counts, not individual tools)
+        overview = catalog.get_overview()
+
+        if overview.total_tools == 0:
+            return "No tools currently registered. Use browse_tools to check."
+
+        # Format as concise overview
+        lines = [
+            f"## Tool Catalog Overview ({overview.total_tools} tools)",
+            "",
+        ]
+
+        for cat in overview.categories:
+            if cat.tool_count > 0:
+                groups_preview = ", ".join(cat.groups[:3])
+                if len(cat.groups) > 3:
+                    groups_preview += f" +{len(cat.groups) - 3} more"
+                lines.append(
+                    f"- **{cat.category.value}** ({cat.tool_count} tools): "
+                    f"{cat.description[:60]}..."
+                )
+                lines.append(f"  Groups: {groups_preview}")
+
+        lines.append("")
+        lines.append("Use `browse_tools`, `search_tools`, or `get_tool_info` to discover specific tools.")
+
+        return "\n".join(lines)
+
+    def _populate_catalog(self, shared: dict[str, Any], catalog) -> None:
+        """Populate the catalog from available registries."""
+        if catalog._entries:
+            return  # Already populated
+
+        # Add operators
+        for summary in OperatorRegistry.get_all_summaries():
+            category = self._categorize_tool(summary["name"], summary.get("description", ""))
+            catalog.register(
+                name=summary["name"],
+                description=summary.get("description", ""),
+                category=category,
+                group_id=self._get_group_id(summary["name"], category),
+                is_local=False,
+            )
+
+        # Add MCP tools if available
         registry = shared.get("mcp", {}).get("server_registry")
         if registry and hasattr(registry, "get_tool_summaries_text"):
-            return registry.get_tool_summaries_text()
+            try:
+                # Note: This is sync, so we can't await. In practice,
+                # the catalog would be populated async elsewhere.
+                pass
+            except Exception as e:
+                logger.warning(f"Failed to populate MCP tools: {e}")
 
-        # Fallback: use operator registry
-        return OperatorRegistry.get_operators_text()
+    def _categorize_tool(self, name: str, description: str) -> ToolCategory:
+        """Determine category based on tool name and description."""
+        name_lower = name.lower()
+        desc_lower = description.lower()
+
+        if any(kw in name_lower for kw in ["list", "browse", "self", "info"]):
+            return ToolCategory.SYSTEM_INTROSPECTION
+        if any(kw in name_lower for kw in ["document", "load_doc", "file"]):
+            return ToolCategory.DOCUMENT_MANAGEMENT
+        if any(kw in name_lower or kw in desc_lower for kw in ["search", "retrieve", "fetch", "rag"]):
+            return ToolCategory.INFORMATION_RETRIEVAL
+        if any(kw in name_lower or kw in desc_lower for kw in ["code", "execute", "run"]):
+            return ToolCategory.CODE_EXECUTION
+        if any(kw in name_lower or kw in desc_lower for kw in ["analyze", "data", "chart"]):
+            return ToolCategory.DATA_ANALYSIS
+
+        return ToolCategory.UNCATEGORIZED
+
+    def _get_group_id(self, name: str, category: ToolCategory) -> str:
+        """Determine group within category."""
+        name_lower = name.lower()
+
+        if category == ToolCategory.INFORMATION_RETRIEVAL:
+            if "web" in name_lower:
+                return "web_search"
+            elif "rag" in name_lower:
+                return "knowledge_base"
+            return "general_search"
+
+        if category == ToolCategory.SYSTEM_INTROSPECTION:
+            if "tool" in name_lower:
+                return "tool_discovery"
+            return "system_info"
+
+        return "default"
