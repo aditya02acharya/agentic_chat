@@ -1,4 +1,11 @@
-"""Supervisor node implementing ReACT loop with progressive tool discovery."""
+"""Supervisor node implementing ReACT loop with progressive tool discovery.
+
+The supervisor coordinates with other agents (tools/operators) using intrinsic
+motivation to decide WHEN to engage them:
+- Simple queries: Answer directly, no agent coordination
+- Complex queries: Use progressive discovery to find right agents
+- Research queries: Required tool coordination
+"""
 
 from typing import Any
 
@@ -6,6 +13,11 @@ from pydantic import BaseModel, Field
 
 from agentic_chatbot.config.prompts import SUPERVISOR_SYSTEM_PROMPT, SUPERVISOR_DECISION_PROMPT
 from agentic_chatbot.core.supervisor import SupervisorDecision, SupervisorState
+from agentic_chatbot.cognition.engagement import (
+    EngagementDecider,
+    EngagementLevel,
+    create_engagement_context,
+)
 from agentic_chatbot.events.models import SupervisorThinkingEvent, SupervisorDecidedEvent
 from agentic_chatbot.nodes.base import AsyncBaseNode
 from agentic_chatbot.operators.registry import OperatorRegistry
@@ -37,7 +49,7 @@ class SupervisorNode(AsyncBaseNode):
     description = "ReACT supervisor for decision making"
 
     async def prep_async(self, shared: dict[str, Any]) -> dict[str, Any]:
-        """Prepare supervisor context."""
+        """Prepare supervisor context with engagement decision."""
         # Emit thinking event
         await self.emit_event(
             shared,
@@ -55,29 +67,89 @@ class SupervisorNode(AsyncBaseNode):
             state = SupervisorState()
             shared.setdefault("supervisor", {})["state"] = state
 
+        query = shared.get("user_query", "")
+
+        # Get cognitive context for intrinsic motivation
+        cognitive_context = shared.get("cognitive_context")
+        user_profile = None
+        identity = None
+        if cognitive_context:
+            user_profile = getattr(cognitive_context, "user_profile", None)
+            identity = getattr(cognitive_context, "identity", None)
+
+        # Get existing tool results
+        tool_results = shared.get("tool_results", [])
+        has_documents = bool(shared.get("document_summaries", []))
+
+        # Create engagement decision context
+        engagement_context = create_engagement_context(
+            query=query,
+            user_profile=user_profile,
+            identity=identity,
+            has_documents=has_documents,
+            tool_results=tool_results if tool_results else None,
+        )
+
         # Build context for decision
         context = {
-            "query": shared.get("user_query", ""),
+            "query": query,
             "conversation_context": self._format_conversation_context(shared),
             "tool_summaries": self._get_tool_summaries(shared),
+            "engagement_context": engagement_context,
             "actions_this_turn": state.actions_this_turn,
             "iteration": state.iteration,
             "state": state,
+            "document_context": self._format_document_context(shared),
+            "tool_results": self._format_tool_results(shared),
         }
 
         return context
 
+    def _format_document_context(self, shared: dict[str, Any]) -> str:
+        """Format document context for prompt."""
+        doc_summaries = shared.get("document_summaries", [])
+        if not doc_summaries:
+            return "No documents uploaded."
+
+        lines = [f"User has {len(doc_summaries)} document(s):"]
+        for doc in doc_summaries[:5]:
+            if isinstance(doc, dict):
+                lines.append(f"- {doc.get('name', 'Unknown')}: {doc.get('summary', 'No summary')[:100]}")
+            else:
+                lines.append(f"- {str(doc)[:100]}")
+        return "\n".join(lines)
+
+    def _format_tool_results(self, shared: dict[str, Any]) -> str:
+        """Format tool results for prompt."""
+        results = shared.get("tool_results", [])
+        if not results:
+            return "None yet."
+
+        lines = []
+        for i, result in enumerate(results[-5:], 1):  # Last 5 results
+            if isinstance(result, dict):
+                tool_name = result.get("tool_name", "Unknown")
+                status = result.get("status", "unknown")
+                content = str(result.get("contents", ""))[:200]
+                lines.append(f"{i}. [{tool_name}] ({status}): {content}...")
+            else:
+                lines.append(f"{i}. {str(result)[:200]}...")
+        return "\n".join(lines)
+
     async def exec_async(self, prep_res: dict[str, Any]) -> SupervisorDecision:
-        """Execute supervisor decision-making."""
+        """Execute supervisor decision-making with engagement guidance."""
         caller = StructuredLLMCaller(max_retries=3)
 
-        # Build prompts with catalog overview (not full tool dump)
+        # Build prompts with catalog overview and engagement context
         tool_catalog_overview = prep_res["tool_summaries"]
+        engagement_context = prep_res.get("engagement_context", "")
+
         system = SUPERVISOR_SYSTEM_PROMPT.format(tool_catalog_overview=tool_catalog_overview)
 
         prompt = SUPERVISOR_DECISION_PROMPT.format(
             query=prep_res["query"],
             conversation_context=prep_res["conversation_context"],
+            engagement_context=engagement_context,
             document_context=prep_res.get("document_context", "No documents uploaded."),
             tool_results=prep_res.get("tool_results", "None yet."),
             actions_this_turn="\n".join(prep_res["actions_this_turn"]) or "None",
