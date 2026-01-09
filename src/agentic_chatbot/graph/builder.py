@@ -30,10 +30,6 @@ from agentic_chatbot.graph.nodes import (
     route_supervisor_decision,
     route_reflection,
 )
-from agentic_chatbot.nodes.orchestration.understand_node import (
-    understand_query_node,
-    route_understanding,
-)
 from agentic_chatbot.utils.logging import get_logger
 
 
@@ -44,7 +40,6 @@ def create_chat_graph(
     checkpointer: Any | None = None,
     interrupt_before: list[str] | None = None,
     interrupt_after: list[str] | None = None,
-    enable_understanding: bool = True,
 ) -> CompiledStateGraph:
     """
     Create the main chat graph.
@@ -52,34 +47,31 @@ def create_chat_graph(
     This is the top-level graph that orchestrates the entire
     conversation handling process.
 
-    Flow Structure (with understanding enabled):
-        START → initialize → understand → [route]
-            ├── "clarify" → clarify → stream → END (if vague query)
-            └── "supervisor" → supervisor
-                ├── "answer" → write → stream → END
-                ├── "call_tool" → execute_tool → reflect
-                │                   ├── "satisfied" → synthesize → write → stream → END
-                │                   ├── "need_more" → supervisor (loop)
-                │                   ├── "blocked" → handle_blocked → write → stream → END
-                │                   └── "direct_response" → stream → END
-                ├── "create_workflow" → plan_workflow → execute_workflow → reflect
-                │                   ├── "satisfied" → synthesize → write → stream → END
-                │                   ├── "need_more" → supervisor (loop)
-                │                   ├── "blocked" → handle_blocked → write → stream → END
-                │                   └── "direct_response" → stream → END
-                └── "clarify" → clarify → stream → END
+    Flow Structure:
+        START → initialize → supervisor
+            ├── "answer" → write → stream → END
+            ├── "call_tool" → execute_tool → reflect
+            │                   ├── "satisfied" → synthesize → write → stream → END
+            │                   ├── "need_more" → supervisor (loop)
+            │                   ├── "blocked" → handle_blocked → write → stream → END
+            │                   └── "direct_response" → stream → END
+            ├── "create_workflow" → plan_workflow → execute_workflow → reflect
+            │                   ├── "satisfied" → synthesize → write → stream → END
+            │                   ├── "need_more" → supervisor (loop)
+            │                   ├── "blocked" → handle_blocked → write → stream → END
+            │                   └── "direct_response" → stream → END
+            └── "clarify" → clarify → stream → END
 
     Key Features:
-        - Query Understanding: Deep analysis before action (goals, scope, ecology)
+        - Supervisor uses extended thinking for deep query understanding
+        - Query analysis happens in supervisor's thinking (no extra LLM call)
         - Tool Selection: Efficient filtering to top N candidate tools
         - Event-Driven Communication: Agents communicate via events
-        - Delegation Control: Supervisor controls thinking budgets for delegates
 
     Args:
         checkpointer: Optional checkpointer for persistence
         interrupt_before: List of node names to interrupt before
         interrupt_after: List of node names to interrupt after
-        enable_understanding: Whether to include query understanding stage
 
     Returns:
         Compiled StateGraph ready for execution
@@ -94,11 +86,7 @@ def create_chat_graph(
     # Initialization
     builder.add_node("initialize", initialize_node)
 
-    # Query Understanding (optional but recommended)
-    if enable_understanding:
-        builder.add_node("understand", understand_query_node)
-
-    # Orchestration
+    # Orchestration (supervisor uses extended thinking for query understanding)
     builder.add_node("supervisor", supervisor_node)
 
     # Execution - Single tool
@@ -122,23 +110,9 @@ def create_chat_graph(
     # ADD EDGES
     # -------------------------------------------------------------------------
 
-    # Start -> Initialize
+    # Start -> Initialize -> Supervisor
     builder.add_edge(START, "initialize")
-
-    if enable_understanding:
-        # Initialize -> Understand -> Route
-        builder.add_edge("initialize", "understand")
-        builder.add_conditional_edges(
-            "understand",
-            route_understanding,
-            {
-                "clarify": "clarify",  # Query too vague, ask for clarification
-                "supervisor": "supervisor",  # Proceed with action
-            },
-        )
-    else:
-        # Initialize -> Supervisor (skip understanding)
-        builder.add_edge("initialize", "supervisor")
+    builder.add_edge("initialize", "supervisor")
 
     # Supervisor conditional routing
     builder.add_conditional_edges(
@@ -201,37 +175,29 @@ def create_chat_graph(
 
     graph = builder.compile(**compile_kwargs)
 
-    logger.info(
-        "Chat graph compiled successfully",
-        understanding_enabled=enable_understanding,
-    )
+    logger.info("Chat graph compiled successfully")
 
     return graph
 
 
-def create_chat_graph_with_memory(enable_understanding: bool = True) -> CompiledStateGraph:
+def create_chat_graph_with_memory() -> CompiledStateGraph:
     """
     Create chat graph with in-memory checkpointer.
 
     Useful for development and testing.
     """
     checkpointer = MemorySaver()
-    return create_chat_graph(
-        checkpointer=checkpointer,
-        enable_understanding=enable_understanding,
-    )
+    return create_chat_graph(checkpointer=checkpointer)
 
 
 async def create_chat_graph_with_sqlite(
     db_path: str = ":memory:",
-    enable_understanding: bool = True,
 ) -> CompiledStateGraph:
     """
     Create chat graph with SQLite checkpointer.
 
     Args:
         db_path: Path to SQLite database file, or ":memory:" for in-memory
-        enable_understanding: Whether to include query understanding stage
 
     Returns:
         Compiled graph with SQLite persistence
@@ -241,25 +207,20 @@ async def create_chat_graph_with_sqlite(
 
         checkpointer = AsyncSqliteSaver.from_conn_string(db_path)
         await checkpointer.setup()
-        return create_chat_graph(
-            checkpointer=checkpointer,
-            enable_understanding=enable_understanding,
-        )
+        return create_chat_graph(checkpointer=checkpointer)
     except ImportError:
         logger.warning("langgraph-checkpoint-sqlite not installed, using MemorySaver")
-        return create_chat_graph_with_memory(enable_understanding=enable_understanding)
+        return create_chat_graph_with_memory()
 
 
 async def create_chat_graph_with_sqlite_managed(
     db_path: str = ":memory:",
-    enable_understanding: bool = True,
 ) -> tuple[CompiledStateGraph, Any]:
     """
     Create chat graph with SQLite checkpointer, returning both for lifecycle management.
 
     Args:
         db_path: Path to SQLite database file, or ":memory:" for in-memory
-        enable_understanding: Whether to include query understanding stage
 
     Returns:
         Tuple of (compiled graph, checkpointer) - caller must close checkpointer
@@ -269,17 +230,11 @@ async def create_chat_graph_with_sqlite_managed(
 
         checkpointer = AsyncSqliteSaver.from_conn_string(db_path)
         await checkpointer.setup()
-        return create_chat_graph(
-            checkpointer=checkpointer,
-            enable_understanding=enable_understanding,
-        ), checkpointer
+        return create_chat_graph(checkpointer=checkpointer), checkpointer
     except ImportError:
         logger.warning("langgraph-checkpoint-sqlite not installed, using MemorySaver")
         checkpointer = MemorySaver()
-        return create_chat_graph(
-            checkpointer=checkpointer,
-            enable_understanding=enable_understanding,
-        ), checkpointer
+        return create_chat_graph(checkpointer=checkpointer), checkpointer
 
 
 # =============================================================================

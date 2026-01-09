@@ -40,8 +40,6 @@ from agentic_chatbot.data.directive import Directive, DirectiveType, DirectiveRe
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from agentic_chatbot.documents.models import DocumentSummary, LoadedDocument
-    from agentic_chatbot.cognition.models import CognitiveContext
-    from agentic_chatbot.cognition.service import CognitionService
 
 
 # =============================================================================
@@ -349,14 +347,6 @@ class ChatState(TypedDict, total=False):
     requested_model: str | None  # Model requested by user for response generation
 
     # -------------------------------------------------------------------------
-    # QUERY UNDERSTANDING
-    # Deep analysis of user query before action
-    # -------------------------------------------------------------------------
-    query_understanding: Any | None  # QueryUnderstanding object
-    needs_clarification: bool  # Whether to ask clarification before proceeding
-    clarification_questions: list[str]  # Questions to ask user
-
-    # -------------------------------------------------------------------------
     # CONVERSATION HISTORY
     # Using reducer to append messages rather than replace
     # -------------------------------------------------------------------------
@@ -506,11 +496,6 @@ def create_initial_state(
         user_id=user_id,
         user_context=user_context or {},
         requested_model=requested_model,
-
-        # Query understanding
-        query_understanding=None,
-        needs_clarification=False,
-        clarification_questions=[],
 
         # Conversation
         messages=[],
