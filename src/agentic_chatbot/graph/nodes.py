@@ -52,7 +52,6 @@ from agentic_chatbot.graph.state import (
     get_sourced_contents,
     get_citation_blocks,
     get_document_summaries_text,
-    get_cognitive_context_text,
 )
 from agentic_chatbot.operators.registry import OperatorRegistry
 from agentic_chatbot.operators.context import OperatorContext, MessagingContext
@@ -119,56 +118,6 @@ def format_tool_results(state: ChatState) -> str:
     return "\n".join(formatted)
 
 
-async def _enqueue_cognitive_learning(state: ChatState, outcome: str) -> None:
-    """
-    Enqueue cognitive learning task (non-blocking).
-
-    This runs after the response is sent to the user. It enqueues
-    a background task to:
-    - Update user profile based on interaction
-    - Create/merge episodic memory
-    - Update identity metrics
-
-    Args:
-        state: Current chat state
-        outcome: Interaction outcome (success, partial, failure)
-    """
-    cognition_service = state.get("cognition_service")
-    user_id = state.get("user_id")
-
-    if not cognition_service or not user_id:
-        return
-
-    try:
-        # Convert messages to serializable format
-        messages = state.get("messages", [])
-        serialized_messages = []
-        for msg in messages:
-            if hasattr(msg, "content"):
-                role = "user" if msg.__class__.__name__ == "HumanMessage" else "assistant"
-                serialized_messages.append({
-                    "role": role,
-                    "content": msg.content,
-                })
-
-        # Enqueue learning (non-blocking, returns immediately)
-        await cognition_service.enqueue_learning(
-            user_id=user_id,
-            conversation_id=state.get("conversation_id", ""),
-            messages=serialized_messages,
-            outcome=outcome,
-        )
-
-        logger.debug(
-            "Enqueued cognitive learning",
-            user_id=user_id,
-            outcome=outcome,
-        )
-    except Exception as e:
-        # Don't fail the response if learning fails
-        logger.warning(f"Failed to enqueue cognitive learning: {e}")
-
-
 def get_tool_summaries(state: ChatState) -> str:
     """
     Get formatted tool summaries.
@@ -204,7 +153,6 @@ async def initialize_node(state: ChatState) -> dict[str, Any]:
     - Sets up initial state values
     - Adds user message to conversation history
     - Tracks user input tokens (Level 1: conversation-level metric)
-    - Loads cognitive context (System 3) if available
     """
     logger.info("Initializing chat session", request_id=state.get("request_id"))
 
@@ -222,34 +170,11 @@ async def initialize_node(state: ChatState) -> dict[str, Any]:
     # Use simple heuristic: ~4 chars per token
     user_input_token_count = len(user_query) // 4
 
-    result: dict[str, Any] = {
+    return {
         "messages": [user_message],
         "iteration": 0,
         "token_usage": TokenUsage(user_input_tokens=user_input_token_count),
     }
-
-    # Load cognitive context (System 3) if available
-    cognition_service = state.get("cognition_service")
-    user_id = state.get("user_id")
-
-    if cognition_service and user_id:
-        try:
-            cognitive_context = await cognition_service.get_context(
-                user_id=user_id,
-                query=user_query,
-            )
-            if cognitive_context and cognitive_context.has_context():
-                result["cognitive_context"] = cognitive_context
-                logger.info(
-                    "Loaded cognitive context",
-                    user_id=user_id,
-                    has_profile=cognitive_context.user_profile is not None,
-                    memory_count=len(cognitive_context.relevant_memories),
-                )
-        except Exception as e:
-            logger.warning(f"Failed to load cognitive context: {e}")
-
-    return result
 
 
 # =============================================================================
@@ -306,11 +231,6 @@ async def supervisor_node(state: ChatState) -> dict[str, Any]:
 
     # Get document summaries (if any documents are uploaded)
     document_context = get_document_summaries_text(state)
-
-    # Get cognitive context (System 3 - user profile, memories, identity)
-    cognitive_context_text = get_cognitive_context_text(state)
-    if cognitive_context_text:
-        conversation_context = f"{conversation_context}\n\n{cognitive_context_text}"
 
     # Format action history
     action_history = state.get("action_history", [])
@@ -1310,8 +1230,6 @@ async def stream_node(state: ChatState) -> dict[str, Any]:
             state,
             ResponseDoneEvent.create(request_id=request_id),
         )
-        # Enqueue cognitive learning for direct response
-        await _enqueue_cognitive_learning(state, outcome="success")
         return {"response_chunks": ["[Direct response sent by operator]"]}
 
     # Normal flow: stream the final response
@@ -1331,9 +1249,6 @@ async def stream_node(state: ChatState) -> dict[str, Any]:
         state,
         ResponseDoneEvent.create(request_id=request_id),
     )
-
-    # Enqueue cognitive learning (non-blocking, background)
-    await _enqueue_cognitive_learning(state, outcome="success")
 
     return {"response_chunks": [response]}
 
@@ -1388,9 +1303,6 @@ async def handle_blocked_node(state: ChatState) -> dict[str, Any]:
 
     client = LLMClient()
     response = await client.generate(prompt, model="sonnet")
-
-    # Enqueue cognitive learning with failure outcome
-    await _enqueue_cognitive_learning(state, outcome="failure")
 
     return {"final_response": response}
 

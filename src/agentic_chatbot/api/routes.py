@@ -16,7 +16,6 @@ from agentic_chatbot.api.models import (
     ToolsResponse,
     ToolSummaryResponse,
     TokenUsageResponse,
-    ErrorResponse,
     ElicitationResponseRequest,
     ElicitationResponseResult,
     PendingElicitationResponse,
@@ -34,7 +33,6 @@ from agentic_chatbot.api.dependencies import (
     ElicitationManagerDep,
     ToolProviderDep,
     DocumentServiceDep,
-    CognitionServiceDep,
 )
 from agentic_chatbot.api.sse import event_generator_with_task
 from agentic_chatbot.events.emitter import EventEmitter
@@ -62,28 +60,22 @@ def _generate_request_id(conversation_id: str) -> str:
 
 
 def _sanitize_error_message(error: Exception) -> str:
-    """
-    Sanitize error message for client response.
-
-    Hides internal details while providing useful feedback.
-    """
+    """Sanitize error message for client response."""
     error_str = str(error).lower()
 
-    # Map known error patterns to user-friendly messages
     if "connection" in error_str or "network" in error_str:
         return "A network error occurred. Please try again."
     elif "timeout" in error_str:
         return "The request timed out. Please try again."
     elif "not found" in error_str:
-        return str(error)  # Keep "not found" messages
+        return str(error)
     elif "limit" in error_str or "exceeded" in error_str:
-        return str(error)  # Keep limit messages
+        return str(error)
     elif "validation" in error_str or "invalid" in error_str:
-        return str(error)  # Keep validation messages
+        return str(error)
     elif "permission" in error_str or "unauthorized" in error_str:
         return "You don't have permission to perform this action."
     else:
-        # Generic message for unexpected errors
         return "An unexpected error occurred. Please try again later."
 
 
@@ -94,28 +86,18 @@ def _track_background_task(task: asyncio.Task) -> None:
 
 
 async def cleanup_background_tasks(timeout: float = 5.0) -> int:
-    """
-    Wait for background tasks to complete during shutdown.
-
-    Args:
-        timeout: Maximum time to wait for tasks
-
-    Returns:
-        Number of tasks that were cancelled
-    """
+    """Wait for background tasks to complete during shutdown."""
     if not _background_tasks:
         return 0
 
     logger.info(f"Waiting for {len(_background_tasks)} background tasks...")
 
-    # Wait for tasks with timeout
     done, pending = await asyncio.wait(
         _background_tasks,
         timeout=timeout,
         return_when=asyncio.ALL_COMPLETED,
     )
 
-    # Cancel any tasks that didn't finish
     cancelled = 0
     for task in pending:
         task.cancel()
@@ -129,33 +111,15 @@ async def cleanup_background_tasks(timeout: float = 5.0) -> int:
 
 @router.get("/health", response_model=HealthResponse)
 async def health_check() -> HealthResponse:
-    """
-    Health check endpoint.
-
-    Returns application status and version.
-    """
-    return HealthResponse(
-        status="ok",
-        version=__version__,
-    )
+    """Health check endpoint."""
+    return HealthResponse(status="ok", version=__version__)
 
 
 @router.get("/tools", response_model=ToolsResponse)
-async def list_tools(
-    tool_provider: ToolProviderDep,
-) -> ToolsResponse:
-    """
-    List available tools.
-
-    Returns summaries of all registered tools:
-    - Local tools (self-awareness, introspection)
-    - Remote MCP tools (external servers)
-    - Operators (internal execution strategies)
-    """
+async def list_tools(tool_provider: ToolProviderDep) -> ToolsResponse:
+    """List available tools."""
     tools = []
 
-    # Get all tool summaries via UnifiedToolProvider
-    # This includes local tools, MCP tools, and can be extended
     try:
         all_summaries = await tool_provider.get_all_summaries()
         for summary in all_summaries:
@@ -167,12 +131,10 @@ async def list_tools(
                 )
             )
     except Exception as e:
-        logger.warning(f"Failed to get tool summaries from provider: {e}")
+        logger.warning(f"Failed to get tool summaries: {e}")
 
-    # Get operator summaries (operators are separate from tools)
     operator_summaries = OperatorRegistry.get_all_summaries()
     for summary in operator_summaries:
-        # Avoid duplicates
         if not any(t.name == summary["name"] for t in tools):
             tools.append(
                 ToolSummaryResponse(
@@ -192,51 +154,27 @@ async def chat(
     mcp_session_manager: MCPSessionManagerDep,
     elicitation_manager: ElicitationManagerDep,
     tool_provider: ToolProviderDep,
-    cognition_service: CognitionServiceDep,
 ) -> StreamingResponse:
     """
     Main chat endpoint with SSE streaming.
 
-    Returns Server-Sent Events stream with progress updates
-    and response chunks.
-
-    Events include:
-    - supervisor.thinking: Agent is analyzing the query
-    - supervisor.decided: Agent made a decision
-    - tool.start/progress/complete/error: Tool execution status
-    - mcp.progress/content/elicitation/error: MCP-specific events
-    - workflow.*: Workflow execution events
-    - response.chunk/done: Response streaming
-    - clarify.request: Clarification needed from user
-    - error: General errors
-
-    For elicitation events (mcp.elicitation), the UI should:
-    1. Display the prompt to the user
-    2. Collect user input
-    3. Submit response via POST /elicitation/respond
+    Returns Server-Sent Events stream with progress updates and response chunks.
     """
-    # Check rate limit
     await get_rate_limiter().check(request)
 
-    # Check if shutdown is in progress
     if getattr(request.app.state, "is_shutting_down", False):
         raise HTTPException(status_code=503, detail="Service is shutting down")
 
-    # Create request context
     event_queue: asyncio.Queue[Event] = asyncio.Queue()
     request_id = _generate_request_id(chat_request.conversation_id)
-
-    # Create event emitter for this request
     emitter = EventEmitter(event_queue)
 
-    # Create MCP callbacks wired to the event emitter
     mcp_callbacks = create_mcp_callbacks(
         emitter=emitter,
         elicitation_manager=elicitation_manager,
         request_id=request_id,
     )
 
-    # Create initial state for LangGraph
     initial_state = create_initial_state(
         user_query=chat_request.message,
         conversation_id=chat_request.conversation_id,
@@ -251,37 +189,24 @@ async def chat(
         user_context=chat_request.context,
         requested_model=chat_request.model,
         user_id=chat_request.user_id,
-        cognition_service=cognition_service,
     )
 
-    # Track request
     active_requests = getattr(request.app.state, "active_requests", set())
     active_requests.add(request_id)
 
     async def run_graph() -> None:
         """Run the LangGraph in background with timeout protection."""
         try:
-            # Create the chat graph
             graph = create_chat_graph()
+            config = {"configurable": {"thread_id": chat_request.conversation_id}}
 
-            # Configuration for LangGraph
-            config = {
-                "configurable": {
-                    "thread_id": chat_request.conversation_id,
-                }
-            }
-
-            # Run the graph with timeout protection
             await asyncio.wait_for(
                 graph.ainvoke(initial_state, config),
                 timeout=GRAPH_EXECUTION_TIMEOUT,
             )
 
         except asyncio.TimeoutError:
-            logger.warning(
-                f"Graph execution timeout after {GRAPH_EXECUTION_TIMEOUT}s",
-                request_id=request_id,
-            )
+            logger.warning(f"Graph execution timeout after {GRAPH_EXECUTION_TIMEOUT}s")
             await event_queue.put(
                 ErrorEvent.create(
                     error=f"Request timed out after {GRAPH_EXECUTION_TIMEOUT} seconds",
@@ -299,14 +224,9 @@ async def chat(
                 )
             )
         finally:
-            # Ensure done event is sent
-            await event_queue.put(
-                ResponseDoneEvent.create(request_id=request_id)
-            )
-            # Untrack request
+            await event_queue.put(ResponseDoneEvent.create(request_id=request_id))
             active_requests.discard(request_id)
 
-    # Start graph execution
     task = asyncio.create_task(run_graph())
     _track_background_task(task)
 
@@ -329,38 +249,23 @@ async def chat_sync(
     mcp_session_manager: MCPSessionManagerDep,
     elicitation_manager: ElicitationManagerDep,
     tool_provider: ToolProviderDep,
-    cognition_service: CognitionServiceDep,
 ) -> ChatResponse:
-    """
-    Non-streaming chat endpoint.
-
-    Alternative to SSE streaming for simpler integrations.
-    Waits for complete response before returning.
-
-    Note: Elicitation requests cannot be handled in sync mode
-    as they require interactive user input.
-    """
-    # Check rate limit
+    """Non-streaming chat endpoint."""
     await get_rate_limiter().check(request)
 
-    # Check if shutdown is in progress
     if getattr(request.app.state, "is_shutting_down", False):
         raise HTTPException(status_code=503, detail="Service is shutting down")
 
     request_id = _generate_request_id(chat_request.conversation_id)
-
-    # Create event emitter (events go to queue but aren't streamed)
     event_queue: asyncio.Queue[Event] = asyncio.Queue()
     emitter = EventEmitter(event_queue)
 
-    # Create MCP callbacks
     mcp_callbacks = create_mcp_callbacks(
         emitter=emitter,
         elicitation_manager=elicitation_manager,
         request_id=request_id,
     )
 
-    # Create initial state
     initial_state = create_initial_state(
         user_query=chat_request.message,
         conversation_id=chat_request.conversation_id,
@@ -375,17 +280,11 @@ async def chat_sync(
         user_context=chat_request.context,
         requested_model=chat_request.model,
         user_id=chat_request.user_id,
-        cognition_service=cognition_service,
     )
 
     try:
-        # Create and run graph with timeout protection
         graph = create_chat_graph()
-        config = {
-            "configurable": {
-                "thread_id": chat_request.conversation_id,
-            }
-        }
+        config = {"configurable": {"thread_id": chat_request.conversation_id}}
 
         try:
             final_state = await asyncio.wait_for(
@@ -393,29 +292,20 @@ async def chat_sync(
                 timeout=GRAPH_EXECUTION_TIMEOUT,
             )
         except asyncio.TimeoutError:
-            logger.warning(
-                f"Sync graph execution timeout after {GRAPH_EXECUTION_TIMEOUT}s",
-                request_id=request_id,
-            )
             raise HTTPException(
                 status_code=504,
                 detail=f"Request timed out after {GRAPH_EXECUTION_TIMEOUT} seconds",
             )
 
-        # Get response from final state
         response = final_state.get("final_response", "")
-
-        # Extract token usage from final state (with Level 1 + Level 2 breakdown)
         token_usage = final_state.get("token_usage")
         usage_response = None
         if token_usage:
             usage_response = TokenUsageResponse(
-                # Level 1: Conversation-level metrics (for UI)
                 user_input_tokens=token_usage.user_input_tokens,
                 final_output_tokens=token_usage.final_output_tokens,
                 intermediate_tokens=token_usage.intermediate_tokens,
                 total_tokens=token_usage.total_tokens,
-                # Level 2: Detailed breakdown
                 input_tokens=token_usage.input_tokens,
                 output_tokens=token_usage.output_tokens,
                 thinking_tokens=token_usage.thinking_tokens,
@@ -430,6 +320,8 @@ async def chat_sync(
             usage=usage_response,
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Chat error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=_sanitize_error_message(e))
@@ -445,54 +337,25 @@ async def submit_elicitation_response(
     elicitation_request: ElicitationResponseRequest,
     elicitation_manager: ElicitationManagerDep,
 ) -> ElicitationResponseResult:
-    """
-    Submit user response to a pending elicitation request.
-
-    When an MCP tool needs user input, it emits an mcp.elicitation event
-    with an elicitation_id. The UI should:
-    1. Display the prompt to the user
-    2. Collect the user's input
-    3. Call this endpoint with the elicitation_id and value
-
-    This unblocks the waiting tool and allows it to continue execution.
-
-    Args:
-        elicitation_id: ID from the mcp.elicitation event
-        value: User's response (string, choice value, or boolean for confirm)
-        cancelled: Set to true if user cancelled/dismissed the prompt
-    """
+    """Submit user response to a pending elicitation request."""
     success = await elicitation_manager.submit_response(
         elicitation_id=elicitation_request.elicitation_id,
         value=elicitation_request.value,
         cancelled=elicitation_request.cancelled,
     )
 
-    if success:
-        return ElicitationResponseResult(
-            success=True,
-            elicitation_id=elicitation_request.elicitation_id,
-            message="Response accepted",
-        )
-    else:
-        return ElicitationResponseResult(
-            success=False,
-            elicitation_id=elicitation_request.elicitation_id,
-            message="Elicitation not found or already responded",
-        )
+    return ElicitationResponseResult(
+        success=success,
+        elicitation_id=elicitation_request.elicitation_id,
+        message="Response accepted" if success else "Elicitation not found or already responded",
+    )
 
 
 @router.get("/elicitation/pending", response_model=PendingElicitationsResponse)
 async def list_pending_elicitations(
     elicitation_manager: ElicitationManagerDep,
 ) -> PendingElicitationsResponse:
-    """
-    List all pending elicitation requests.
-
-    Useful for:
-    - Debugging to see what's waiting for user input
-    - Reconnecting after page refresh to see pending prompts
-    - Admin dashboards monitoring tool activity
-    """
+    """List all pending elicitation requests."""
     pending = elicitation_manager.get_all_pending()
     elicitations = [
         PendingElicitationResponse(
@@ -507,10 +370,7 @@ async def list_pending_elicitations(
         )
         for p in pending
     ]
-    return PendingElicitationsResponse(
-        elicitations=elicitations,
-        count=len(elicitations),
-    )
+    return PendingElicitationsResponse(elicitations=elicitations, count=len(elicitations))
 
 
 @router.delete("/elicitation/{elicitation_id}")
@@ -518,27 +378,14 @@ async def cancel_elicitation(
     elicitation_id: str,
     elicitation_manager: ElicitationManagerDep,
 ) -> ElicitationResponseResult:
-    """
-    Cancel a pending elicitation request.
-
-    The tool will receive a cancelled response and should
-    handle it gracefully (e.g., use a default value or skip
-    the operation).
-    """
+    """Cancel a pending elicitation request."""
     success = await elicitation_manager.cancel_elicitation(elicitation_id)
 
-    if success:
-        return ElicitationResponseResult(
-            success=True,
-            elicitation_id=elicitation_id,
-            message="Elicitation cancelled",
-        )
-    else:
-        return ElicitationResponseResult(
-            success=False,
-            elicitation_id=elicitation_id,
-            message="Elicitation not found or already responded",
-        )
+    return ElicitationResponseResult(
+        success=success,
+        elicitation_id=elicitation_id,
+        message="Elicitation cancelled" if success else "Elicitation not found or already responded",
+    )
 
 
 # =============================================================================
@@ -552,33 +399,13 @@ async def upload_document(
     upload_request: DocumentUploadRequest,
     document_service: DocumentServiceDep,
 ) -> DocumentUploadResponse:
-    """
-    Upload a document for conversation context.
-
-    Documents are processed asynchronously:
-    1. Document is saved and chunked
-    2. Each chunk is summarized by LLM
-    3. Overall summary is generated
-
-    The supervisor can use summaries to decide which documents
-    to load into context for answering questions.
-
-    Limits:
-    - Maximum 5 documents per conversation
-    - Maximum 1MB per document
-    - Text files only (text/plain, text/markdown)
-    """
-    # Check rate limit
+    """Upload a document for conversation context."""
     await get_rate_limiter().check(request)
 
     if not document_service:
-        raise HTTPException(
-            status_code=503,
-            detail="Document service not available",
-        )
+        raise HTTPException(status_code=503, detail="Document service not available")
 
     try:
-        # Create document
         document_id = await document_service.create_document(
             conversation_id=upload_request.conversation_id,
             filename=upload_request.filename,
@@ -586,13 +413,11 @@ async def upload_document(
             content_type=upload_request.content_type,
         )
 
-        # Get metadata for response
         metadata = await document_service.get_metadata(
             upload_request.conversation_id,
             document_id,
         )
 
-        # Start background processing with task tracking
         task = asyncio.create_task(
             document_service.process_document(
                 upload_request.conversation_id,
@@ -615,24 +440,14 @@ async def upload_document(
         raise HTTPException(status_code=400, detail=_sanitize_error_message(e))
 
 
-@router.get(
-    "/documents/{conversation_id}",
-    response_model=DocumentListResponse,
-)
+@router.get("/documents/{conversation_id}", response_model=DocumentListResponse)
 async def list_documents(
     conversation_id: str,
     document_service: DocumentServiceDep,
 ) -> DocumentListResponse:
-    """
-    List all documents for a conversation.
-
-    Returns summaries and processing status for each document.
-    """
+    """List all documents for a conversation."""
     if not document_service:
-        raise HTTPException(
-            status_code=503,
-            detail="Document service not available",
-        )
+        raise HTTPException(status_code=503, detail="Document service not available")
 
     try:
         summaries = await document_service.get_summaries(conversation_id)
@@ -664,31 +479,18 @@ async def list_documents(
         raise HTTPException(status_code=500, detail=_sanitize_error_message(e))
 
 
-@router.get(
-    "/documents/{conversation_id}/{document_id}/status",
-    response_model=DocumentStatusResponse,
-)
+@router.get("/documents/{conversation_id}/{document_id}/status", response_model=DocumentStatusResponse)
 async def get_document_status(
     conversation_id: str,
     document_id: str,
     document_service: DocumentServiceDep,
 ) -> DocumentStatusResponse:
-    """
-    Get processing status for a specific document.
-
-    Useful for polling during processing.
-    """
+    """Get processing status for a specific document."""
     if not document_service:
-        raise HTTPException(
-            status_code=503,
-            detail="Document service not available",
-        )
+        raise HTTPException(status_code=503, detail="Document service not available")
 
     try:
-        metadata = await document_service.get_metadata(
-            conversation_id,
-            document_id,
-        )
+        metadata = await document_service.get_metadata(conversation_id, document_id)
 
         return DocumentStatusResponse(
             document_id=document_id,
@@ -705,23 +507,15 @@ async def get_document_status(
         raise HTTPException(status_code=500, detail=_sanitize_error_message(e))
 
 
-@router.delete(
-    "/documents/{conversation_id}/{document_id}",
-    response_model=DocumentDeleteResponse,
-)
+@router.delete("/documents/{conversation_id}/{document_id}", response_model=DocumentDeleteResponse)
 async def delete_document(
     conversation_id: str,
     document_id: str,
     document_service: DocumentServiceDep,
 ) -> DocumentDeleteResponse:
-    """
-    Delete a document from a conversation.
-    """
+    """Delete a document from a conversation."""
     if not document_service:
-        raise HTTPException(
-            status_code=503,
-            detail="Document service not available",
-        )
+        raise HTTPException(status_code=503, detail="Document service not available")
 
     try:
         await document_service.delete_document(conversation_id, document_id)

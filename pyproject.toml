@@ -32,10 +32,13 @@ dependencies = [
     "langchain-core>=0.3.0",
     "langchain-anthropic>=0.3.0",
     "langgraph-checkpoint>=2.0.0",
+    # AG-UI Protocol for agent-user interaction
+    "ag-ui-langgraph>=0.0.22",
+    # Observability with Langfuse (OTEL-based)
+    "langfuse>=3.0.0",
     # Utilities
     "structlog>=24.1.0",
     "tenacity>=8.2.0",
-    "sse-starlette>=1.8.0",
     "aiosqlite>=0.20.0",
 ]
 
