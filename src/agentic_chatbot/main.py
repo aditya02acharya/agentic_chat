@@ -11,6 +11,7 @@ from agentic_chatbot.api.routes import router
 from agentic_chatbot.app import app_instance, setup_signal_handlers
 from agentic_chatbot.config.settings import get_settings
 from agentic_chatbot.utils.logging import configure_logging, get_logger
+from agentic_chatbot.graph import create_chat_graph
 
 # Import operators to trigger registration
 from agentic_chatbot.operators.llm import (  # noqa: F401
@@ -47,7 +48,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.mcp_server_registry = app_instance.mcp_server_registry
     app.state.mcp_client_manager = app_instance.mcp_client_manager
     app.state.document_service = app_instance.document_service
-    app.state.cognition_service = app_instance.cognition_service
     app.state.active_requests = app_instance.active_requests
     app.state.is_shutting_down = False
 
@@ -73,7 +73,7 @@ def create_app() -> FastAPI:
 
     app = FastAPI(
         title="Agentic Chatbot API",
-        description="ReACT-based agentic chatbot with MCP integration",
+        description="ReACT-based agentic chatbot with MCP integration and AG-UI protocol support",
         version=__version__,
         lifespan=lifespan,
     )
@@ -87,8 +87,25 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
-    # Include routes
+    # Include existing API routes
     app.include_router(router, prefix="/api/v1")
+
+    # Add AG-UI protocol endpoint
+    # This provides a standard interface for agent-frontend communication
+    try:
+        from ag_ui_langgraph import add_langgraph_fastapi_endpoint
+
+        # Create the chat graph for AG-UI
+        graph = create_chat_graph()
+
+        # Add AG-UI endpoint at /api/v1/agent
+        # This endpoint supports AG-UI protocol events (RUN_STARTED, TEXT_MESSAGE_*, etc.)
+        add_langgraph_fastapi_endpoint(app, graph, "/api/v1/agent")
+        logger.info("AG-UI protocol endpoint enabled at /api/v1/agent")
+    except ImportError:
+        logger.warning("ag-ui-langgraph not installed, AG-UI endpoint disabled")
+    except Exception as e:
+        logger.warning(f"Failed to add AG-UI endpoint: {e}")
 
     # Root endpoint
     @app.get("/")
@@ -97,6 +114,13 @@ def create_app() -> FastAPI:
             "name": "Agentic Chatbot API",
             "version": __version__,
             "docs": "/docs",
+            "endpoints": {
+                "chat_sse": "/api/v1/chat",
+                "chat_sync": "/api/v1/chat/sync",
+                "agent_agui": "/api/v1/agent",
+                "health": "/api/v1/health",
+                "tools": "/api/v1/tools",
+            },
         }
 
     return app

@@ -8,6 +8,7 @@ from agentic_chatbot.config.settings import get_settings
 from agentic_chatbot.mcp.manager import MCPClientManager
 from agentic_chatbot.mcp.registry import MCPServerRegistry
 from agentic_chatbot.utils.logging import get_logger, configure_logging
+from agentic_chatbot.utils.observability import configure_observability, flush_observability
 from agentic_chatbot.api.rate_limit import get_rate_limiter
 
 
@@ -40,6 +41,9 @@ class Application:
 
         # Configure logging
         configure_logging(settings.log_level)
+
+        # Configure observability (Langfuse)
+        configure_observability()
 
         logger.info("Starting application...")
 
@@ -123,6 +127,9 @@ class Application:
         # Close MCP registry
         if self.mcp_server_registry:
             await self.mcp_server_registry.close()
+
+        # Flush observability traces
+        flush_observability()
 
         logger.info("Shutdown complete")
 
