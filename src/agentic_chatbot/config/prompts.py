@@ -60,7 +60,22 @@ When delegating to operators, provide:
 - task_scope: What's in/out of scope (optional)
 
 The operator will only see your task description, not the full conversation.
-Be specific and include all necessary context in the task_description."""
+Be specific and include all necessary context in the task_description.
+
+## CHAIN OF DRAFT (for reasoning field)
+
+Use Chain of Draft style for your "reasoning" output - keep it minimal and concise:
+- Each reasoning step should be ≤5 words
+- Capture only essential insights, like shorthand notes
+- Skip obvious details and filler words
+
+Example reasoning formats:
+- "User wants weather → ANSWER directly"
+- "Need live data → web_search → stock prices"
+- "Multi-step: research → analyze → summarize"
+- "Ambiguous scope → CLARIFY first"
+
+This keeps reasoning efficient while your extended thinking handles deep analysis."""
 
 SUPERVISOR_DECISION_PROMPT = """User Query: {query}
 
@@ -100,6 +115,13 @@ Consider:
 2. Completeness: Is there enough information to provide a good answer?
 3. Quality: Are the results accurate and useful?
 
+## CHAIN OF DRAFT (for reasoning)
+
+Use minimal reasoning - each step ≤5 words:
+- "Results complete → satisfied"
+- "Missing price data → need_more"
+- "API blocked → blocked"
+
 You MUST respond with valid JSON matching the ReflectionResult schema."""
 
 REFLECT_PROMPT = """Original Query: {query}
@@ -111,9 +133,9 @@ Current Iteration: {iteration} of {max_iterations}
 
 Evaluate these results and determine:
 1. assessment: One of "satisfied", "need_more", or "blocked"
-2. reasoning: Explain your assessment
+2. reasoning: Use Chain of Draft style (≤5 words per step, shorthand notes)
 3. suggested_action (optional): What action to take next if need_more
-4. missing_info (list[str]): What information is still missing
+4. missing_info (list[str]): What information is still missing (brief keywords only)
 
 "satisfied" - Results are good enough, proceed to response
 "need_more" - Need additional information, continue the loop
@@ -273,6 +295,12 @@ Your job is to:
 Available operators:
 {operator_summaries}
 
+## CHAIN OF DRAFT (for step descriptions)
+
+Keep step names and descriptions minimal:
+- Step names: 2-3 words max (e.g., "fetch_data", "analyze_results")
+- Descriptions: ≤10 words capturing the essence
+
 You MUST respond with valid JSON matching the WorkflowDefinition schema."""
 
 WORKFLOW_PLANNER_PROMPT = """User Query: {query}
@@ -282,12 +310,13 @@ Context:
 
 Create a workflow to accomplish this task.
 Each step should:
-- Have a clear, unique ID
+- Have a clear, unique ID (2-3 words)
 - Use an appropriate operator
 - Define input mappings (use {{step_id.output}} for dependencies)
 - List dependencies on other steps
 
-Consider which steps can run in parallel (no shared dependencies)."""
+Consider which steps can run in parallel (no shared dependencies).
+Use Chain of Draft: keep descriptions brief and essential."""
 
 # =============================================================================
 # CODER PROMPTS
