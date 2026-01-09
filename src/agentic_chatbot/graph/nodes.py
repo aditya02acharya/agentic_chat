@@ -58,7 +58,6 @@ from agentic_chatbot.operators.registry import OperatorRegistry
 from agentic_chatbot.operators.context import OperatorContext, MessagingContext
 from agentic_chatbot.utils.structured_llm import StructuredLLMCaller, StructuredOutputError
 from agentic_chatbot.utils.llm import LLMClient
-from agentic_chatbot.config.models import get_earliest_knowledge_cutoff
 from agentic_chatbot.utils.logging import get_logger
 from agentic_chatbot.config.models import TokenUsage
 
@@ -320,38 +319,10 @@ async def supervisor_node(state: ChatState) -> dict[str, Any]:
         or "None"
     )
 
-    # Get knowledge cutoff info for downstream models
-    # The writer/synthesizer may use a different model than the supervisor
-    # We need to ensure the supervisor doesn't use ANSWER for topics beyond their knowledge cutoff
-    writer_model = state.get("requested_model") or "sonnet"
-    supervisor_model = "thinking"
-    synthesizer_model = "sonnet"
-
-    # Get the earliest knowledge cutoff among all models in the pipeline
-    earliest_cutoff = get_earliest_knowledge_cutoff(
-        supervisor_model, writer_model, synthesizer_model
-    )
-
-    # Build knowledge cutoff info for the supervisor prompt
-    if earliest_cutoff:
-        knowledge_cutoff_info = (
-            f"- The effective knowledge cutoff date for this system is: {earliest_cutoff}\n"
-            f"- The writer/response model ({writer_model}) has knowledge up to this date"
-        )
-    else:
-        knowledge_cutoff_info = "- Knowledge cutoff information not available. Use web_search for current events."
-
-    # Get current date for time-sensitive queries
-    current_date = datetime.now().strftime("%Y-%m-%d")
-
-    # Build prompts with summaries and knowledge cutoff awareness
-    system = SUPERVISOR_SYSTEM_PROMPT.format(
-        tool_summaries=tool_summaries,
-        knowledge_cutoff_info=knowledge_cutoff_info,
-    )
+    # Build prompts with summaries
+    system = SUPERVISOR_SYSTEM_PROMPT.format(tool_summaries=tool_summaries)
     prompt = SUPERVISOR_DECISION_PROMPT.format(
         query=state.get("user_query", ""),
-        current_date=current_date,
         conversation_context=conversation_context,
         document_context=document_context,  # Document summaries
         tool_results=data_summaries_text,  # Summaries, not raw data

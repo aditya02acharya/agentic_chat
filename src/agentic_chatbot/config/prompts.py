@@ -23,12 +23,6 @@ Guidelines:
 - For complex multi-step tasks with known steps, use CREATE_WORKFLOW
 - When the request is ambiguous or needs clarification, use CLARIFY
 
-IMPORTANT - Knowledge Cutoff Awareness:
-{knowledge_cutoff_info}
-- If a query asks about events, information, or facts that may have occurred AFTER the knowledge cutoff date, you MUST use CALL_TOOL with web_search to get current information
-- Do NOT use ANSWER for time-sensitive queries (current events, recent releases, latest versions, etc.) without first gathering up-to-date information
-- When in doubt about whether information is current, prefer using web_search over answering from internal knowledge
-
 Document Context:
 - The user may have uploaded documents for this conversation
 - Use the "list_documents" tool to see document summaries
@@ -48,8 +42,6 @@ Be specific and include all necessary context in the task_description.
 Always explain your reasoning before making a decision."""
 
 SUPERVISOR_DECISION_PROMPT = """User Query: {query}
-
-Current Date: {current_date}
 
 Conversation Context:
 {conversation_context}
@@ -71,7 +63,6 @@ Remember:
 - If this requires multiple coordinated steps, use CREATE_WORKFLOW
 - If the request is unclear, use CLARIFY
 - PRIORITY: Check document summaries first - if relevant documents exist, load them before using external tools
-- For queries about events after the knowledge cutoff date, use web_search first
 
 Respond with valid JSON matching the SupervisorDecision schema."""
 
