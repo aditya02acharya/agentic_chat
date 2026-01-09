@@ -30,6 +30,10 @@ from agentic_chatbot.graph.nodes import (
     route_supervisor_decision,
     route_reflection,
 )
+from agentic_chatbot.nodes.orchestration.understand_node import (
+    understand_query_node,
+    route_understanding,
+)
 from agentic_chatbot.utils.logging import get_logger
 
 
@@ -40,6 +44,7 @@ def create_chat_graph(
     checkpointer: Any | None = None,
     interrupt_before: list[str] | None = None,
     interrupt_after: list[str] | None = None,
+    enable_understanding: bool = True,
 ) -> CompiledStateGraph:
     """
     Create the main chat graph.
@@ -47,38 +52,34 @@ def create_chat_graph(
     This is the top-level graph that orchestrates the entire
     conversation handling process.
 
-    Flow Structure:
-        START → initialize → supervisor
-            ├── "answer" → write → stream → END
-            ├── "call_tool" → execute_tool → reflect
-            │                   ├── "satisfied" → synthesize → write → stream → END
-            │                   ├── "need_more" → supervisor (loop)
-            │                   ├── "blocked" → handle_blocked → write → stream → END
-            │                   └── "direct_response" → stream → END (operator bypassed writer)
-            ├── "create_workflow" → plan_workflow → execute_workflow → reflect
-            │                   ├── "satisfied" → synthesize → write → stream → END
-            │                   ├── "need_more" → supervisor (loop)
-            │                   ├── "blocked" → handle_blocked → write → stream → END
-            │                   └── "direct_response" → stream → END (operator bypassed writer)
-            └── "clarify" → clarify → stream → END
+    Flow Structure (with understanding enabled):
+        START → initialize → understand → [route]
+            ├── "clarify" → clarify → stream → END (if vague query)
+            └── "supervisor" → supervisor
+                ├── "answer" → write → stream → END
+                ├── "call_tool" → execute_tool → reflect
+                │                   ├── "satisfied" → synthesize → write → stream → END
+                │                   ├── "need_more" → supervisor (loop)
+                │                   ├── "blocked" → handle_blocked → write → stream → END
+                │                   └── "direct_response" → stream → END
+                ├── "create_workflow" → plan_workflow → execute_workflow → reflect
+                │                   ├── "satisfied" → synthesize → write → stream → END
+                │                   ├── "need_more" → supervisor (loop)
+                │                   ├── "blocked" → handle_blocked → write → stream → END
+                │                   └── "direct_response" → stream → END
+                └── "clarify" → clarify → stream → END
 
-    Workflow Execution Features:
-        - plan_workflow: LLM creates WorkflowDefinition with steps & dependencies
-        - execute_workflow: WorkflowExecutor runs steps with parallel batching
-        - Dependency resolution via topological sort
-        - Input mapping with {{step_id.output}} templates
-        - Per-step event emission for progress tracking
-
-    Direct Response Feature:
-        - Operators/tools can send content directly to users (bypass writer)
-        - Used for widgets, images, and other rich content
-        - When direct response is sent, flow skips synthesize/write nodes
-        - Operators set supports_direct_response=True in their capabilities
+    Key Features:
+        - Query Understanding: Deep analysis before action (goals, scope, ecology)
+        - Tool Selection: Efficient filtering to top N candidate tools
+        - Event-Driven Communication: Agents communicate via events
+        - Delegation Control: Supervisor controls thinking budgets for delegates
 
     Args:
-        checkpointer: Optional checkpointer for persistence (MemorySaver, SqliteSaver, etc.)
-        interrupt_before: List of node names to interrupt before (for human-in-the-loop)
+        checkpointer: Optional checkpointer for persistence
+        interrupt_before: List of node names to interrupt before
         interrupt_after: List of node names to interrupt after
+        enable_understanding: Whether to include query understanding stage
 
     Returns:
         Compiled StateGraph ready for execution
@@ -92,6 +93,10 @@ def create_chat_graph(
 
     # Initialization
     builder.add_node("initialize", initialize_node)
+
+    # Query Understanding (optional but recommended)
+    if enable_understanding:
+        builder.add_node("understand", understand_query_node)
 
     # Orchestration
     builder.add_node("supervisor", supervisor_node)
@@ -117,9 +122,23 @@ def create_chat_graph(
     # ADD EDGES
     # -------------------------------------------------------------------------
 
-    # Start -> Initialize -> Supervisor
+    # Start -> Initialize
     builder.add_edge(START, "initialize")
-    builder.add_edge("initialize", "supervisor")
+
+    if enable_understanding:
+        # Initialize -> Understand -> Route
+        builder.add_edge("initialize", "understand")
+        builder.add_conditional_edges(
+            "understand",
+            route_understanding,
+            {
+                "clarify": "clarify",  # Query too vague, ask for clarification
+                "supervisor": "supervisor",  # Proceed with action
+            },
+        )
+    else:
+        # Initialize -> Supervisor (skip understanding)
+        builder.add_edge("initialize", "supervisor")
 
     # Supervisor conditional routing
     builder.add_conditional_edges(
@@ -128,7 +147,7 @@ def create_chat_graph(
         {
             "answer": "write",
             "call_tool": "execute_tool",
-            "create_workflow": "plan_workflow",  # Multi-step workflow planning
+            "create_workflow": "plan_workflow",
             "clarify": "clarify",
         },
     )
@@ -141,16 +160,14 @@ def create_chat_graph(
     builder.add_edge("execute_workflow", "reflect")
 
     # Reflection conditional routing
-    # Note: "direct_response" route is for operators that already sent content
-    # directly to the user (bypassing the writer), so we skip to stream
     builder.add_conditional_edges(
         "reflect",
         route_reflection,
         {
             "satisfied": "synthesize",
-            "need_more": "supervisor",  # Loop back
+            "need_more": "supervisor",
             "blocked": "handle_blocked",
-            "direct_response": "stream",  # Skip synthesis/write, response already sent
+            "direct_response": "stream",
         },
     )
 
@@ -184,33 +201,37 @@ def create_chat_graph(
 
     graph = builder.compile(**compile_kwargs)
 
-    logger.info("Chat graph compiled successfully")
+    logger.info(
+        "Chat graph compiled successfully",
+        understanding_enabled=enable_understanding,
+    )
 
     return graph
 
 
-def create_chat_graph_with_memory() -> CompiledStateGraph:
+def create_chat_graph_with_memory(enable_understanding: bool = True) -> CompiledStateGraph:
     """
     Create chat graph with in-memory checkpointer.
 
     Useful for development and testing.
     """
     checkpointer = MemorySaver()
-    return create_chat_graph(checkpointer=checkpointer)
+    return create_chat_graph(
+        checkpointer=checkpointer,
+        enable_understanding=enable_understanding,
+    )
 
 
-async def create_chat_graph_with_sqlite(db_path: str = ":memory:") -> CompiledStateGraph:
+async def create_chat_graph_with_sqlite(
+    db_path: str = ":memory:",
+    enable_understanding: bool = True,
+) -> CompiledStateGraph:
     """
     Create chat graph with SQLite checkpointer.
 
-    WARNING: This function creates a graph with an async checkpointer.
-    The checkpointer connection is established but the caller is responsible
-    for managing its lifecycle. For production use, prefer
-    `create_chat_graph_with_sqlite_managed()` which returns both the graph
-    and checkpointer for proper cleanup.
-
     Args:
         db_path: Path to SQLite database file, or ":memory:" for in-memory
+        enable_understanding: Whether to include query understanding stage
 
     Returns:
         Compiled graph with SQLite persistence
@@ -218,35 +239,27 @@ async def create_chat_graph_with_sqlite(db_path: str = ":memory:") -> CompiledSt
     try:
         from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
-        # NOTE: Using setup() instead of context manager since we return the graph
-        # The checkpointer will be closed when the application shuts down
         checkpointer = AsyncSqliteSaver.from_conn_string(db_path)
         await checkpointer.setup()
-        return create_chat_graph(checkpointer=checkpointer)
+        return create_chat_graph(
+            checkpointer=checkpointer,
+            enable_understanding=enable_understanding,
+        )
     except ImportError:
         logger.warning("langgraph-checkpoint-sqlite not installed, using MemorySaver")
-        return create_chat_graph_with_memory()
+        return create_chat_graph_with_memory(enable_understanding=enable_understanding)
 
 
 async def create_chat_graph_with_sqlite_managed(
     db_path: str = ":memory:",
+    enable_understanding: bool = True,
 ) -> tuple[CompiledStateGraph, Any]:
     """
     Create chat graph with SQLite checkpointer, returning both for lifecycle management.
 
-    Use this for production to ensure proper cleanup:
-
-    ```python
-    graph, checkpointer = await create_chat_graph_with_sqlite_managed("chat.db")
-    try:
-        # Use graph...
-        await graph.ainvoke(state, config)
-    finally:
-        await checkpointer.conn.close()  # Cleanup
-    ```
-
     Args:
         db_path: Path to SQLite database file, or ":memory:" for in-memory
+        enable_understanding: Whether to include query understanding stage
 
     Returns:
         Tuple of (compiled graph, checkpointer) - caller must close checkpointer
@@ -256,11 +269,17 @@ async def create_chat_graph_with_sqlite_managed(
 
         checkpointer = AsyncSqliteSaver.from_conn_string(db_path)
         await checkpointer.setup()
-        return create_chat_graph(checkpointer=checkpointer), checkpointer
+        return create_chat_graph(
+            checkpointer=checkpointer,
+            enable_understanding=enable_understanding,
+        ), checkpointer
     except ImportError:
         logger.warning("langgraph-checkpoint-sqlite not installed, using MemorySaver")
         checkpointer = MemorySaver()
-        return create_chat_graph(checkpointer=checkpointer), checkpointer
+        return create_chat_graph(
+            checkpointer=checkpointer,
+            enable_understanding=enable_understanding,
+        ), checkpointer
 
 
 # =============================================================================
@@ -269,7 +288,7 @@ async def create_chat_graph_with_sqlite_managed(
 
 
 async def run_chat_graph(
-    graph: CompiledGraph,
+    graph: CompiledStateGraph,
     state: ChatState,
     config: dict[str, Any] | None = None,
 ) -> ChatState:
@@ -297,7 +316,7 @@ async def run_chat_graph(
 
 
 async def stream_chat_graph(
-    graph: CompiledGraph,
+    graph: CompiledStateGraph,
     state: ChatState,
     config: dict[str, Any] | None = None,
 ):

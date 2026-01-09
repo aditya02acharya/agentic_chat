@@ -344,9 +344,17 @@ class ChatState(TypedDict, total=False):
     user_query: str  # The user's message
     conversation_id: str  # Unique conversation identifier
     request_id: str  # Unique request identifier
-    user_id: str | None  # User identifier for cognition/personalization
+    user_id: str | None  # User identifier for personalization
     user_context: dict[str, Any]  # Additional context from the user
     requested_model: str | None  # Model requested by user for response generation
+
+    # -------------------------------------------------------------------------
+    # QUERY UNDERSTANDING
+    # Deep analysis of user query before action
+    # -------------------------------------------------------------------------
+    query_understanding: Any | None  # QueryUnderstanding object
+    needs_clarification: bool  # Whether to ask clarification before proceeding
+    clarification_questions: list[str]  # Questions to ask user
 
     # -------------------------------------------------------------------------
     # CONVERSATION HISTORY
@@ -498,6 +506,11 @@ def create_initial_state(
         user_id=user_id,
         user_context=user_context or {},
         requested_model=requested_model,
+
+        # Query understanding
+        query_understanding=None,
+        needs_clarification=False,
+        clarification_questions=[],
 
         # Conversation
         messages=[],
