@@ -56,6 +56,10 @@ class ModelConfig:
     default_thinking_budget: int = 10000  # Default thinking tokens if enabled
     max_thinking_budget: int = 50000  # Maximum thinking tokens
 
+    # Knowledge cutoff date (format: "YYYY-MM-DD")
+    # This is the date up to which the model has training data
+    knowledge_cutoff: str = ""
+
     # Cost (relative units for optimization)
     cost_per_input_token: float = 1.0
     cost_per_output_token: float = 1.0
@@ -186,6 +190,7 @@ class ModelRegistry:
             max_output_tokens=4096,
             context_window=200000,
             supports_thinking=False,
+            knowledge_cutoff="2023-08-01",  # Claude 3 Haiku training cutoff
             cost_per_input_token=0.25,
             cost_per_output_token=1.25,
         ),
@@ -208,6 +213,7 @@ class ModelRegistry:
             supports_thinking=True,
             default_thinking_budget=10000,
             max_thinking_budget=100000,
+            knowledge_cutoff="2024-04-01",  # Claude 3.5 Sonnet training cutoff
             cost_per_input_token=3.0,
             cost_per_output_token=15.0,
         ),
@@ -222,6 +228,7 @@ class ModelRegistry:
             max_output_tokens=4096,
             context_window=200000,
             supports_thinking=False,
+            knowledge_cutoff="2023-08-01",  # Claude 3 Sonnet training cutoff
             cost_per_input_token=3.0,
             cost_per_output_token=15.0,
         ),
@@ -237,6 +244,7 @@ class ModelRegistry:
             max_output_tokens=4096,
             context_window=200000,
             supports_thinking=False,
+            knowledge_cutoff="2023-08-01",  # Claude 3 Opus training cutoff
             cost_per_input_token=15.0,
             cost_per_output_token=75.0,
         ),
@@ -259,6 +267,7 @@ class ModelRegistry:
             supports_thinking=True,
             default_thinking_budget=20000,
             max_thinking_budget=100000,
+            knowledge_cutoff="2024-04-01",  # Claude 3.5 Sonnet training cutoff
             cost_per_input_token=3.0,
             cost_per_output_token=15.0,
         ),
@@ -368,3 +377,45 @@ def get_thinking_config(
     budget = min(budget, config.max_thinking_budget)
 
     return ThinkingConfig(enabled=True, budget_tokens=budget)
+
+
+def get_knowledge_cutoff(model_id_or_alias: str) -> str:
+    """
+    Get the knowledge cutoff date for a model.
+
+    Args:
+        model_id_or_alias: Model ID or alias (e.g., "sonnet", "haiku", "thinking")
+
+    Returns:
+        Knowledge cutoff date string (e.g., "2024-04-01") or empty string if unknown
+    """
+    config = ModelRegistry.get(model_id_or_alias)
+    if config:
+        return config.knowledge_cutoff
+    return ""
+
+
+def get_earliest_knowledge_cutoff(*model_ids: str) -> str:
+    """
+    Get the earliest knowledge cutoff date among multiple models.
+
+    This is useful for determining the effective knowledge cutoff when
+    multiple models are involved in a pipeline (e.g., supervisor + writer).
+
+    Args:
+        *model_ids: One or more model IDs or aliases
+
+    Returns:
+        The earliest knowledge cutoff date, or empty string if none found
+    """
+    cutoffs = []
+    for model_id in model_ids:
+        cutoff = get_knowledge_cutoff(model_id)
+        if cutoff:
+            cutoffs.append(cutoff)
+
+    if not cutoffs:
+        return ""
+
+    # Return the earliest date (lexicographic comparison works for YYYY-MM-DD format)
+    return min(cutoffs)
